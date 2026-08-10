@@ -5,6 +5,11 @@ Software and Hardware to create full length color movie + audio cartridges for s
 
 [How to encode your own:](https://www.youtube.com/watch?v=WSy6kNrYDSo&list=PLHJZWs7or3edcvVHDeNzGSZABx2JN1WZH)
 
+## Firmware targets
+
+- **dsPIC33CK** (original cart PCB): `firmware/` — MPLAB / XC16
+- **STM32F407VGT6 DevEBox**: [`firmware/stm32/`](firmware/stm32/README.md) — A0–A12 on PE0–PE12, D0–D7 on PD8–PD15, onboard microSD via SDIO (same map as UnoCart-2600 DevEBox)
+
 Pre-Order Kits at:
 
 https://www.tindie.com/products/lodefmode/moviecart-atari-2600/
