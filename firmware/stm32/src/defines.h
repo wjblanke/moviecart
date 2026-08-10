@@ -19,11 +19,15 @@
 #define FATFS_SDIO_4BIT			1
 #define FATFS_USE_DETECT_PIN		0
 #define FATFS_USE_WRITEPROTECT_PIN	0
-#define SDIO_TRANSFER_CLK_DIV		((uint8_t)0x04)
+#define SDIO_TRANSFER_CLK_DIV		((uint8_t)0x08)
 
-/* Cart selected in upper 2K of slot space: A12 and A11 high (matches dsPIC CLC). */
-#define CART_ADDR_MASK			0x1800u
-#define CART_ADDR_SELECT		0x1800u
+/* UnoCart DevEBox: A12 high selects cart; kernel indexed by A0-A8. */
+#define CART_ADDR_MASK			0x1000u
+#define CART_ADDR_SELECT		0x1000u
+
+/* Bus-serving code must run from zero-wait-state SRAM: flash wait states in
+ * the EXTI entry path blow the ~600 ns first-fetch budget of the 2600 bus. */
+#define RAMFUNC __attribute__((section(".ramfunc"), noinline))
 
 /* Optional status LED on PA1 (DevEBox has LEDs on PA1/PA2/PA3 on many boards). */
 #define STATUS_LED_GPIO			GPIOA

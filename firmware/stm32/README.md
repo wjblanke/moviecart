@@ -20,7 +20,17 @@ Onboard microSD (SDIO 4-bit):
 | CK | PC12 |
 | CMD | PD2 |
 
-Cart select matches the dsPIC CLC: respond only when **A11 and A12 are high** (upper 2K of the slot). Data pins are driven on PD8–PD15; PD0–PD7 (including SDIO CMD) are left alone.
+**Power:** DevEBox is powered from the Atari (same power-up).
+
+The current build is deliberately **title-only** to validate the display bus
+independently of SD. After initialization it enters UnoCart's infinite bus loop
+and never leaves; therefore **no LED blinks are expected**. SD initialization
+and movie playback are temporarily disabled.
+
+The serving loop is copied in shape from UnoCart-2600's `emulate_cartridge()` (`source/STM32firmware/standalone/src/driver_4k.c`), which is known good on this exact board and wiring: converge on a stable address (spin until two consecutive reads agree), write the byte to ODR **while the pins are still inputs**, then switch to output, then tristate the moment the address changes (not when A12 falls, so a following 6502 write cycle never meets our drivers). GPIO config for PD8-15 also matches UnoCart exactly: no pull, reset-default slew.
+
+The bus loop runs in main with interrupts disabled, exactly like UnoCart. There
+is no TIM1 or EXTI bus server in this validation build.
 
 ## Build
 
@@ -38,7 +48,7 @@ Flash with ST-Link (`make flash` / `st-flash`) or DFU (BOOT0) on the DevEBox.
 ## Runtime notes
 
 - System clock: HSI → PLL @ 168 MHz (same as UnoCart DevEBox fork); SDIOCLK 48 MHz.
-- Bus servicing runs from main and from an **EXTI on PE12 (A12)** so SDIO block reads can be preempted.
+- Bus servicing: UnoCart stable-address polling loop, main thread, IRQs disabled.
 - Content: FAT/FAT32 card with MovieCart field files (same as stock). Select advances to the next file; joystick/console controls match the original.
 - Status LED bit-bang uses **PA1** (optional).
 - In-field FIRMWARE.FRM flash update from the dsPIC build is not ported.

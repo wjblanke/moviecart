@@ -11,7 +11,7 @@
 #define ADDR_END_LINES			0xb7
 
 /* Data on PD8-PD15 (high byte). Address PE0-PE12. */
-#define SET_DATA(X)     DATA_OUT_SET(((uint16_t)(uint8_t)(X)) << 8)
+#define SET_DATA(X)     do { DATA_OUT = ((uint16_t)(uint8_t)(X)) << 8; } while (0)
 #define READ_DATA()     ((uint8_t)(DATA_IN >> 8))
 #define DATA_OUTPUT     SET_DATA_MODE_OUT
 #define DATA_INPUT      SET_DATA_MODE_IN
@@ -34,7 +34,15 @@ coreInit(void)
 	r_coreInfo.peekBus = 0xff;
 	r_coreInfo.storeAddress = &r_coreInfo.peekBus;
 
-	r_coreInfo.breakLoops = 255;
+	/*
+	 * Original dsPIC value is 255 (settle through 255 BRK loops before the
+	 * kernel starts). On this breadboard port that multiplies the number of
+	 * window-first-fetches before anything runs — each one a chance for the
+	 * 6502 to swallow a JAM opcode and halt for good. Every build that ever
+	 * reached the blue title had 0 here: start the kernel on the first
+	 * vector fetch, then rely on BRK recovery.
+	 */
+	r_coreInfo.breakLoops = 0;
 
 	r_coreInfo.lines = 190;
 
@@ -45,14 +53,16 @@ coreInit(void)
 	r_coreInfo.nextLineJump = ADDR_RIGHT_LINE;
 	r_coreInfo.data = 0;
 
-	SET_DATA_MODE_OUT;
+	SET_DATA_MODE_IN;
 }
 
 
-void
+RAMFUNC void
 bus_dispatch(uint16_t lo_address, uint8_t addr_low8)
 {
-	static const void* const romData[512] = 
+	/* In SRAM: a flash-resident table costs wait states per lookup, right
+	 * on the data-valid critical path. */
+	static const void* const romData[512] __attribute__((section(".ramfunc.romtable"))) = 
 	{
 		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
 		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,

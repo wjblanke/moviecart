@@ -54,7 +54,7 @@ MAP = $(BUILDDIR)/firmware.map
 
 CFLAGS = \
 	-MT $@ -MMD -MP -MF $(DEPDIR)/$*.d \
-	-O2 -g \
+	-O2 -fno-tree-vrp -g \
 	-mcpu=cortex-m4 -mthumb \
 	-mfpu=fpv4-sp-d16 -mhard-float \
 	-DSTM32F4XX \
@@ -90,6 +90,18 @@ $(HEX): $(ELF)
 
 $(ELF): $(OBJECTS) $(LDSCRIPT)
 	$(LD) $(LDFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
+
+$(BUILDDIR)/src/core.o: src/core.c
+	mkdir -p $(dir $@)
+	mkdir -p .depend/build/src
+	$(CC) -c -MT $@ -MMD -MP -MF .depend/build/src/core.d \
+		-O2 -fno-tree-vrp -fno-gcse -fno-crossjumping -fno-toplevel-reorder -g \
+		-mcpu=cortex-m4 -mthumb \
+		-mfpu=fpv4-sp-d16 -mhard-float \
+		-DSTM32F4XX -DSTM32F40XX -DUSE_STM32F4_DISCOVERY \
+		-DHSE_VALUE=8000000 -DUSE_STDPERIPH_DRIVER \
+		-ffunction-sections -fdata-sections \
+		$(INCLUDES) $< -o $@
 
 $(BUILDDIR)/%.o: %.c
 	mkdir -p $(dir $@)

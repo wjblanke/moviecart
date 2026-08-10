@@ -3,27 +3,49 @@
 #include "cartridge_io.h"
 #include "core.h"
 
+#include "stm32f4xx.h"
+
 /*
- * Serve the Atari bus when A11+A12 select the upper cart window.
- * Must be called often (including from SD wait loops) so side-effectful
- * kernel addresses are only handled once per address change.
+ * Verbatim UnoCart-2600 driver_4k.c control flow. The only substitution is
+ * MovieCart's dynamic dispatch in place of cart_rom[addr & 0xfff].
+ * This function intentionally never returns.
  */
-void
-bus_service(void)
+RAMFUNC __attribute__((noreturn)) void
+emulate_cartridge(void)
 {
-	static uint32_t last_raw = 0xffffffffu;
-	uint32_t raw = ADDR_IN;
+	__disable_irq();
 
-	if ((raw & CART_ADDR_MASK) != CART_ADDR_SELECT) {
-		SET_DATA_MODE_IN;
-		last_raw = raw;
-		return;
+	uint16_t addr, addr_prev = 0;
+	while (1)
+	{
+		while ((addr = ADDR_IN) != addr_prev)
+			addr_prev = addr;
+		/* got a stable address */
+		if (addr & 0x1000)
+		{ /* A12 high */
+			bus_dispatch((uint16_t)(addr & 0x1ffu),
+				     (uint8_t)(addr & 0xffu));
+			SET_DATA_MODE_OUT
+			/* wait for address bus to change */
+			while (ADDR_IN == addr) ;
+			SET_DATA_MODE_IN
+		}
 	}
+}
 
-	if (raw == last_raw)
-		return;
+RAMFUNC void
+bus_serve_cycle(void)
+{
+	static uint16_t addr_prev;
+	uint16_t addr;
 
-	last_raw = raw;
-	SET_DATA_MODE_OUT;
-	bus_dispatch((uint16_t)(raw & 0x1ffu), (uint8_t)(raw & 0xffu));
+	while ((addr = ADDR_IN) != addr_prev)
+		addr_prev = addr;
+	if (addr & 0x1000) {
+		bus_dispatch((uint16_t)(addr & 0x1ffu),
+			     (uint8_t)(addr & 0xffu));
+		SET_DATA_MODE_OUT
+		while (ADDR_IN == addr) ;
+		SET_DATA_MODE_IN
+	}
 }

@@ -1,10 +1,9 @@
 /**
- * MovieCart firmware for MCUDEV DevEBox STM32F407VGT6
+ * MovieCart on DevEBox STM32F407VGT6
  *
- * Wiring (same as UnoCart-2600 DevEBox fork):
- *   A0–A12 → PE0–PE12
- *   D0–D7  → PD8–PD15
- *   microSD → SDIO (PC8–PC12, PD2)
+ * Title-only validation build. The bus is served by the exact polling pattern
+ * from UnoCart-2600's proven driver_4k.c, continuously in main with IRQs off.
+ * SD is intentionally disabled until the title display works.
  */
 
 #include <string.h>
@@ -14,10 +13,7 @@
 #include "stm32f4xx.h"
 #include "stm32f4xx_rcc.h"
 #include "stm32f4xx_gpio.h"
-#include "stm32f4xx_exti.h"
-#include "stm32f4xx_syscfg.h"
 #include "misc.h"
-#include "tm_stm32f4_delay.h"
 
 #include "defines.h"
 #include "cartridge_io.h"
@@ -39,22 +35,36 @@ uint8_t mr_buffer2[FIELD_SIZE] __attribute__((aligned(4)));
 void updateInit(void);
 
 static void
+dwt_init(void)
+{
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+	DWT->CYCCNT = 0;
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+/* Blink without ever abandoning the UnoCart bus loop. */
+static void
+led_wait_serving(uint32_t ms)
+{
+	uint32_t start = DWT->CYCCNT;
+	uint32_t limit = (SystemCoreClock / 1000u) * ms;
+
+	while ((DWT->CYCCNT - start) < limit)
+		bus_serve_cycle();
+}
+
+static void
 flash_led(uint8_t num)
 {
+	TESTA0_HIGH;
 	for (uint8_t i = 0; i < num; i++) {
 		TESTA0_LOW;
-		for (volatile uint32_t d = 0; d < 800000; d++)
-			bus_service();
+		led_wait_serving(150);
 		TESTA0_HIGH;
-		for (volatile uint32_t d = 0; d < 800000; d++)
-			bus_service();
+		led_wait_serving(150);
 	}
-	if (!num) {
-		for (volatile uint32_t d = 0; d < 2000000; d++)
-			bus_service();
-	}
-	for (volatile uint32_t d = 0; d < 2000000; d++)
-		bus_service();
+	TESTA0_HIGH;
+	led_wait_serving(300);
 }
 
 static void
@@ -68,6 +78,13 @@ config_gpio_data(void)
 			GPIO_Pin_12 | GPIO_Pin_13 | GPIO_Pin_14 | GPIO_Pin_15;
 	gpio.GPIO_Mode = GPIO_Mode_IN;
 	gpio.GPIO_OType = GPIO_OType_PP;
+	/*
+	 * Identical to UnoCart's config_gpio_data(), which is proven on this
+	 * board: no pull, and GPIO_Speed is deliberately left ineffective —
+	 * GPIO_Init only programs OSPEEDR for OUT/AF modes, so these pins keep
+	 * the 2 MHz reset-default slew even when flipped to output at runtime.
+	 * Forcing 100 MHz here rings and cross-talks on breadboard wiring.
+	 */
 	gpio.GPIO_Speed = GPIO_Speed_25MHz;
 	gpio.GPIO_PuPd = GPIO_PuPd_NOPULL;
 	GPIO_Init(GPIOD, &gpio);
@@ -107,43 +124,6 @@ config_status_led(void)
 	TESTA0_HIGH;
 }
 
-/*
- * A12 (PE12) rising edge preempts SD/main work and serves the cart window
- * until A11+A12 drop — required because SDIO block reads exceed a 6502 cycle.
- */
-static void
-config_exti_a12(void)
-{
-	EXTI_InitTypeDef exti;
-	NVIC_InitTypeDef nvic;
-
-	RCC_APB2PeriphClockCmd(RCC_APB2Periph_SYSCFG, ENABLE);
-	SYSCFG_EXTILineConfig(EXTI_PortSourceGPIOE, EXTI_PinSource12);
-
-	exti.EXTI_Line = EXTI_Line12;
-	exti.EXTI_Mode = EXTI_Mode_Interrupt;
-	exti.EXTI_Trigger = EXTI_Trigger_Rising;
-	exti.EXTI_LineCmd = ENABLE;
-	EXTI_Init(&exti);
-
-	nvic.NVIC_IRQChannel = EXTI15_10_IRQn;
-	nvic.NVIC_IRQChannelPreemptionPriority = 0;
-	nvic.NVIC_IRQChannelSubPriority = 0;
-	nvic.NVIC_IRQChannelCmd = ENABLE;
-	NVIC_Init(&nvic);
-}
-
-void
-EXTI15_10_IRQHandler(void)
-{
-	if (EXTI_GetITStatus(EXTI_Line12) != RESET) {
-		EXTI_ClearITPendingBit(EXTI_Line12);
-		while ((ADDR_IN & CART_ADDR_MASK) == CART_ADDR_SELECT)
-			bus_service();
-		SET_DATA_MODE_IN;
-	}
-}
-
 static void
 copy_title(uint8_t *dst, const uint8_t *src, int size)
 {
@@ -151,7 +131,7 @@ copy_title(uint8_t *dst, const uint8_t *src, int size)
 }
 
 static void
-setupTitle(void)
+setupTitleBuffers(void)
 {
 	r_coreInfo.frameInfo.buffer = mr_buffer1;
 	r_coreInfo.mr_frameInfo1.buffer = mr_buffer1;
@@ -164,6 +144,12 @@ setupTitle(void)
 	memset(mr_buffer1, 0, sizeof(mr_buffer1));
 	memset(mr_buffer2, 0, sizeof(mr_buffer2));
 
+	r_coreInfo.frameInfo = r_coreInfo.mr_frameInfo1;
+}
+
+static void
+loadTitlePixels(void)
+{
 	int lineTotal = r_coreInfo.mr_frameInfo1.visibleLines * 5;
 
 	copy_title(r_coreInfo.mr_frameInfo1.graphBuf, TitleGraph1, lineTotal);
@@ -177,18 +163,58 @@ setupTitle(void)
 		   r_coreInfo.mr_frameInfo2.visibleLines);
 }
 
+/*
+ * Main has nothing to do here, so it becomes the (faster) bus server:
+ * IRQs masked, tight drain — ~100-150 ns response vs ~300+ ns via EXTI.
+ * DWT keeps time (it counts with IRQs masked).
+ */
+static int
+wait_title_sync(uint32_t timeout_ms)
+{
+	uint32_t start = DWT->CYCCNT;
+	uint32_t limit = (SystemCoreClock / 1000u) * timeout_ms;
+	int ok = 0;
+
+	r_coreInfo.mr_endFrame = 0;
+
+	__disable_irq();
+	while ((DWT->CYCCNT - start) < limit) {
+		bus_serve_cycle();
+		if (r_coreInfo.mr_endFrame) {
+			r_coreInfo.mr_endFrame = 0;
+			ok = 1;
+			break;
+		}
+	}
+	__enable_irq();
+	return ok;
+}
+
+/* Main-thread drain while waiting — lowest latency during display. */
+static void
+waitEndFrame(void)
+{
+	__disable_irq();
+	while (!r_coreInfo.mr_endFrame)
+		bus_serve_cycle();
+	r_coreInfo.mr_endFrame = 0;
+	__enable_irq();
+}
+
 static void
 setupDisk(void)
 {
-	while (!pf_mount()) {
+	flash_led(5);
+
+	while (!pf_mount())
 		flash_led(4);
-	}
 
 	state.io_frameNumber = 1;
 	state.io_bits &= ~STATE_PLAYING;
-	while (!pf_open_file(&state.i_numFrames, 1)) {
+	while (!pf_open_file(&state.i_numFrames, 1))
 		flash_led(3);
-	}
+
+	flash_led(2);
 }
 
 static void
@@ -204,9 +230,8 @@ prepareNextFrame(void)
 	uint8_t *dst = fInfo->buffer;
 	uint32_t offset = (uint32_t)(state.io_frameNumber * FIELD_NUM_BLOCKS);
 
-	while (!pf_seek_block(offset)) {
+	while (!pf_seek_block(offset))
 		flash_led(4);
-	}
 
 	pf_read_block(dst);
 	dst += 512;
@@ -217,30 +242,21 @@ prepareNextFrame(void)
 		pf_read_block(dst);
 		dst += 512;
 		nb--;
-		bus_service();
 	}
 
 	updateBuffer(&state, fInfo);
 }
 
 static void
-waitEndFrame(void)
-{
-	while (!r_coreInfo.mr_endFrame)
-		bus_service();
-	r_coreInfo.mr_endFrame = 0;
-}
-
-static void
 coreInfoToState(void)
 {
-	state.i_swcha = r_coreInfo.mr_swcha;
-	state.i_swchb = r_coreInfo.mr_swchb;
-	state.i_inpt4 = r_coreInfo.mr_inpt4;
-	state.i_inpt5 = r_coreInfo.mr_inpt5;
+	state.i_swcha = (uint8_t)r_coreInfo.mr_swcha;
+	state.i_swchb = (uint8_t)r_coreInfo.mr_swchb;
+	state.i_inpt4 = (uint8_t)r_coreInfo.mr_inpt4;
+	state.i_inpt5 = (uint8_t)r_coreInfo.mr_inpt5;
 
 	state.i_swcha = ((state.i_swcha << 4) | (state.i_swcha & 0x0f)) & state.i_swcha;
-	state.i_inpt4 &= r_coreInfo.mr_inpt5;
+	state.i_inpt4 &= state.i_inpt5;
 }
 
 static void
@@ -289,13 +305,12 @@ static void
 checkSelectVideo(int *which)
 {
 	if ((state.io_bits & STATE_END) ||
-	    ((state.i_swchb & 0x02) && !(r_coreInfo.mr_swchb & 0x02))) {
+	    ((state.i_swchb & 0x02) && !((uint8_t)r_coreInfo.mr_swchb & 0x02))) {
 		state.io_bits &= ~STATE_END;
 
 		(*which)++;
-		while (!pf_open_file(&state.i_numFrames, *which)) {
+		while (!pf_open_file(&state.i_numFrames, *which))
 			*which = 1;
-		}
 
 		qinfo.head = 0;
 		for (int i = 0; i < QUEUE_SIZE; i++) {
@@ -345,22 +360,22 @@ runFrameLoop(void)
 int
 main(void)
 {
-	SystemInit();
-	TM_DELAY_Init();
-
-	config_gpio_addr();
 	config_gpio_data();
+	config_gpio_addr();
 	config_status_led();
-	config_exti_a12();
+	dwt_init();
 
+	/* Everything the kernel dispatch touches must be valid before serving
+	 * starts, but nothing slow may run before the drain: the console's RC
+	 * reset releases the 6507 a few tens of ms after power-on, and its
+	 * very first vector fetches decide whether it lives or jams. */
 	coreInit();
-	SET_DATA_MODE_IN;
+	setupTitleBuffers();
+	loadTitlePixels();
 
-	setupTitle();
-	setupDisk();
-	updateInit();
-	runTitle();
-	runFrameLoop();
-
-	return 0;
+	/*
+	 * Enter UnoCart's infinite IRQ-disabled bus loop verbatim. No LEDs,
+	 * timeout, frame checks, EXTI, or SD code execute beyond this point.
+	 */
+	emulate_cartridge();
 }

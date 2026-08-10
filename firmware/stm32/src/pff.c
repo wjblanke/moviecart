@@ -382,8 +382,9 @@ pf_open_file( uint32_t *numFrames, int num)
 
 		if (c != 0xe5)	// not deleted
 		{
-			// regular archive file
-			if (dir[DIR_Attr] == AM_ARC)
+			/* Regular file: allow ARC plus optional RDO/HID (Windows often sets those). */
+			if (!(dir[DIR_Attr] & (AM_DIR | AM_VOL | AM_LFN)) &&
+			    ((dir[DIR_Attr] & AM_ARC) || (dir[DIR_Attr] == 0x00)))
 			{
 				// File start cluster 
 				uint8_t	*b = (uint8_t*)&fsInfo.org_clust;

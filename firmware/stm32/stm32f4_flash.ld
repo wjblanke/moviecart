@@ -119,6 +119,8 @@ SECTIONS
   {
     . = ALIGN(4);
     _sdata = .;        /* create a global symbol at data start */
+    *(.ramfunc)        /* code executed from zero-wait-state SRAM */
+    *(.ramfunc*)
     *(.data)           /* .data sections */
     *(.data*)          /* .data* sections */
 

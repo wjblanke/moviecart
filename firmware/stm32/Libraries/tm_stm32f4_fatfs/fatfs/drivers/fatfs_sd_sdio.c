@@ -288,15 +288,15 @@ DSTATUS TM_FATFS_SD_SDIO_disk_initialize(void) {
 	TM_GPIO_Init(FATFS_USE_WRITEPROTECT_PIN_PORT, FATFS_USE_WRITEPROTECT_PIN_PIN, TM_GPIO_Mode_IN, TM_GPIO_OType_PP, TM_GPIO_PuPd_UP, TM_GPIO_Speed_Low);
 #endif
 	
-	// Configure the NVIC Preemption Priority Bits 
-	NVIC_PriorityGroupConfig (NVIC_PriorityGroup_1);
+	/* Do not touch NVIC_PriorityGroupConfig here — main owns Group_4.
+	 * SDIO/DMA below cart EXTI (0) and TIM1 bus (1). */
 	NVIC_InitStructure.NVIC_IRQChannel = SDIO_IRQn;
-	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
+	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 2;
 	NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
 	NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
 	NVIC_Init (&NVIC_InitStructure);
 	NVIC_InitStructure.NVIC_IRQChannel = SD_SDIO_DMA_IRQn;
-	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
+	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 2;
 	NVIC_Init (&NVIC_InitStructure);
 	
 	SD_LowLevel_DeInit();
@@ -1493,6 +1493,7 @@ SD_Error SD_WaitReadOperation (void)
 
 	while ((DMAEndOfTransfer == 0x00) && (TransferEnd == 0) && (TransferError == SD_OK) && (timeout > 0)) {
 		timeout--;
+		/* Cart served by A12 EXTI while IRQs are enabled. */
 	}
 	
 	DMAEndOfTransfer = 0x00;
