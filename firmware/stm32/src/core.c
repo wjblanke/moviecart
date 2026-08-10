@@ -10,15 +10,90 @@
 #define ADDR_RIGHT_LINE			0x3e
 #define ADDR_END_LINES			0xb7
 
-/* Data on PD8-PD15 (high byte). Address PE0-PE12. */
-#define SET_DATA(X)     do { DATA_OUT = ((uint16_t)(uint8_t)(X)) << 8; } while (0)
+/*
+ * Data on PD8-PD15 (high byte). Address PE0-PE12.
+ *
+ * Enabling the drivers here, rather than after bus_dispatch() returns, is what
+ * keeps the heavy cases legal. Every case opens with SET_DATA and only then does
+ * its side-effect work — advancing pointers, stepping the end-of-frame machine,
+ * reloading frameInfo — and while that work runs, bus_dispatch() has not
+ * returned, so a SET_DATA_MODE_OUT placed in the caller would still be waiting.
+ * The 6502 would be handed its byte tens or hundreds of nanoseconds late on
+ * exactly the cycles that matter most. Driving one instruction after the byte
+ * reaches ODR takes every case's workload off the critical path; the exposure
+ * to a stale value is the same zero as UnoCart's write-then-enable pair.
+ */
+#define SET_DATA(X)     do { DATA_OUT = ((uint16_t)(uint8_t)(X)) << 8; \
+			     SET_DATA_MODE_OUT } while (0)
 #define READ_DATA()     ((uint8_t)(DATA_IN >> 8))
 #define DATA_OUTPUT     SET_DATA_MODE_OUT
 #define DATA_INPUT      SET_DATA_MODE_IN
 
 #define EMULATE_DONE    do { return; } while (0);
 
+/*
+ * The line counter is stepped by the 6502's own fetches, so a single dispatch
+ * that never happens (or happens twice) leaves it with the wrong parity, and
+ * `lines -= 2` then steps straight past zero and wraps. Nothing in the kernel
+ * would ever end the frame again: the buffer pointers advance every line
+ * forever, the picture becomes a scroll through SRAM, and the read eventually
+ * walks off the end of it and faults the CPU. Treat any impossibly large
+ * counter as "end of section" so the frame closes and every pointer is
+ * reloaded from mr_frameInfo1/2, which costs nothing in normal operation —
+ * the real values are at most visibleLines.
+ */
+#define LINES_EXHAUSTED(n)	((n) == 0 || (n) > 250)
+
 struct coreInfo r_coreInfo;
+
+/*
+ * Frame-driven diagnostics. The bus loop owns the CPU with interrupts off, so
+ * the status LED is the only channel out; it is driven entirely from the
+ * kernel's own end-of-frame, one slot per frame. The blink count reports the
+ * worst thing seen since the last report:
+ *
+ *   1 flash  nominal - frames closing normally, scanline count in range
+ *   2        line counter wrapped in the visible section (missed dispatch)
+ *   3        line counter wrapped in the end-lines section
+ *   4        frame was not 250-275 scanlines long
+ *
+ * A frozen LED means the kernel stopped completing frames altogether.
+ */
+#define DIAG_NOMINAL		1
+#define DIAG_WRAP_VISIBLE	2
+#define DIAG_WRAP_ENDLINES	3
+#define DIAG_FRAME_LENGTH	4
+
+#define DIAG_SLOT_FRAMES	8	/* one flash: 4 frames on, 4 off */
+#define DIAG_GAP_FRAMES		30	/* silence between repeats */
+
+#define DIAG_NOTE(code)	do { \
+		if ((code) > diagWorst) \
+			diagWorst = (code); \
+	} while (0)
+
+static uint8_t  diagWorst;	/* worst code seen since the last report */
+static uint8_t  diagShowing;	/* code currently being blinked out */
+static uint16_t diagTick;	/* frames into the current blink cycle */
+static uint16_t frameLines;	/* scanlines counted in this frame */
+
+static inline void
+diagFrameTick(void)
+{
+	uint16_t flashing = (uint16_t)diagShowing * DIAG_SLOT_FRAMES;
+
+	if (diagTick < flashing && (diagTick & (DIAG_SLOT_FRAMES - 1)) <
+				   (DIAG_SLOT_FRAMES / 2))
+		TESTA0_LOW	/* LED on */
+	else
+		TESTA0_HIGH
+
+	if (++diagTick >= flashing + DIAG_GAP_FRAMES) {
+		diagTick = 0;
+		diagShowing = diagWorst ? diagWorst : DIAG_NOMINAL;
+		diagWorst = 0;
+	}
+}
 
 void
 coreInit(void)
@@ -842,12 +917,16 @@ g0xae:
 g0xaf:
 	SET_DATA(0x80);	// lda #$80 	// 2
 	r_coreInfo.lines -= 2;
+	frameLines += 2;
 	EMULATE_DONE
 
 g0xb0:
 	SET_DATA(0x85);	// sta HMP0 	// 3
-	if (r_coreInfo.lines == 0)
+	if (LINES_EXHAUSTED(r_coreInfo.lines))
 	{
+		if (r_coreInfo.lines)	/* wrapped, not a clean zero */
+			DIAG_NOTE(DIAG_WRAP_VISIBLE);
+
 		r_coreInfo.nextLineJump = ADDR_END_LINES;
 
 		if (!r_coreInfo.frameInfo.odd)
@@ -1033,9 +1112,13 @@ g0xd8:
 
 g0xd9:
 	SET_DATA(0xa2); // ldx   #0 
+	frameLines++;
 	r_coreInfo.lines--;
-	if (r_coreInfo.lines == 0)
+	if (LINES_EXHAUSTED(r_coreInfo.lines))
 	{
+		if (r_coreInfo.lines)	/* wrapped, not a clean zero */
+			DIAG_NOTE(DIAG_WRAP_ENDLINES);
+
 		switch (r_coreInfo.endState)
 		{
 			case 0:
@@ -1185,6 +1268,11 @@ g0xe3:
 		r_coreInfo.endState = 0;
 		r_coreInfo.mr_endFrame = true;
 		TESTA1_LOW
+
+		if (frameLines < 250 || frameLines > 275)
+			DIAG_NOTE(DIAG_FRAME_LENGTH);
+		frameLines = 0;
+		diagFrameTick();
 	}
 	EMULATE_DONE
 

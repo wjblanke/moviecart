@@ -8,13 +8,24 @@
 /*
  * Verbatim UnoCart-2600 driver_4k.c control flow. The only substitution is
  * MovieCart's dynamic dispatch in place of cart_rom[addr & 0xfff].
- * This function intentionally never returns.
+ *
+ * Nothing may be added between the address read and the ODR write: an earlier
+ * experiment that inserted a ~60 ns settle window here to reject transient
+ * addresses killed the display outright, so the path is already close to the
+ * 6502's data-valid deadline.
  */
 RAMFUNC __attribute__((noreturn)) void
 emulate_cartridge(void)
 {
 	__disable_irq();
 
+	/*
+	 * Do not try to suppress a repeated address here. It looks free and it
+	 * is not: skipping the dispatch on a repeat means skipping a dispatch
+	 * the kernel needed, which breaks the line counter far more often than
+	 * the doubling it was meant to prevent. Measured on hardware — it turned
+	 * an occasional glitch into a permanent one.
+	 */
 	uint16_t addr, addr_prev = 0;
 	while (1)
 	{

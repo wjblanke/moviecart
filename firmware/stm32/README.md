@@ -24,10 +24,52 @@ Onboard microSD (SDIO 4-bit):
 
 The current build is deliberately **title-only** to validate the display bus
 independently of SD. After initialization it enters UnoCart's infinite bus loop
-and never leaves; therefore **no LED blinks are expected**. SD initialization
-and movie playback are temporarily disabled.
+and never leaves. SD initialization and movie playback are temporarily disabled,
+so the only LED activity is the ~1 Hz kernel heartbeat described below.
 
-The serving loop is copied in shape from UnoCart-2600's `emulate_cartridge()` (`source/STM32firmware/standalone/src/driver_4k.c`), which is known good on this exact board and wiring: converge on a stable address (spin until two consecutive reads agree), write the byte to ODR **while the pins are still inputs**, then switch to output, then tristate the moment the address changes (not when A12 falls, so a following 6502 write cycle never meets our drivers). GPIO config for PD8-15 also matches UnoCart exactly: no pull, reset-default slew.
+The serving loop is copied in shape from UnoCart-2600's `emulate_cartridge()` (`source/STM32firmware/standalone/src/driver_4k.c`), which is known good on this exact board and wiring: converge on a stable address, write the byte to ODR **while the pins are still inputs**, then switch to output, then tristate once the address changes (not when A12 falls, so a following 6502 write cycle never meets our drivers). GPIO config for PD8-15 also matches UnoCart exactly: no pull, reset-default slew.
+
+Do not add work between the address read and the moment the drivers turn on.
+Inserting a ~60 ns settle window there — to reject the composite addresses that
+appear while the lines slew, which MovieCart's stateful dispatch cannot shrug
+off the way a plain ROM cart can — killed the display completely.
+
+Do not add a "don't dispatch the same address twice in a row" filter either. It
+was tried on the reasoning that the 6502 never fetches one cart address on
+consecutive cycles, so a repeat must be our own data pins coupling into the
+address lines. On hardware it made things strictly worse — a permanent black
+screen and a constant 3-blink code — because it also suppresses dispatches the
+kernel genuinely needed.
+
+`SET_DATA()` in `core.c` enables the output drivers itself,
+immediately after writing ODR, instead of leaving it to the caller. A dispatch
+case runs its side effects *before* returning, so a `SET_DATA_MODE_OUT` in the
+bus loop would be delayed by that case's entire workload. Light cases cost a few
+cycles and survive; the end-of-frame chain at `$FFdb`–`$FFe3`, which reloads
+every `frameInfo` pointer and restarts the line counter, does not — and those
+are precisely the cycles that set up VSYNC.
+
+The bus loop owns the CPU with interrupts off, so the status LED is the only
+channel out. `core.c` drives it from the kernel's own end-of-frame, one slot per
+frame, blinking the worst condition seen since the last report:
+
+| Flashes | Meaning |
+| --- | --- |
+| 1 | nominal — frames closing normally, scanline count in range |
+| 2 | line counter wrapped in the visible section (a dispatch was missed) |
+| 3 | line counter wrapped in the end-lines section |
+| 4 | frame was not 250–275 scanlines |
+
+A frozen LED means the kernel stopped completing frames altogether.
+
+The kernel's line counter is stepped by the 6502's fetches, so one missed or
+duplicated dispatch flips its parity, `lines -= 2` steps past zero and wraps,
+and the frame never ends: buffer pointers advance forever, the picture becomes a
+scroll through SRAM, and the read finally leaves SRAM and faults the CPU (which
+looks like the console dying a few seconds in). `LINES_EXHAUSTED()` treats an
+impossibly large counter as end-of-section, so the frame closes, every pointer
+is reloaded from `mr_frameInfo1/2`, and the kernel resyncs instead of running
+away.
 
 The bus loop runs in main with interrupts disabled, exactly like UnoCart. There
 is no TIM1 or EXTI bus server in this validation build.
