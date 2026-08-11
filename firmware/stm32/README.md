@@ -62,6 +62,12 @@ frame, blinking the worst condition seen since the last report:
 
 A frozen LED means the kernel stopped completing frames altogether.
 
+Case 2 of the `$FFd9` state machine leaves `lines` at zero for the rest of that
+scanline, until `$FFe3` loads `visibleLines`. Setting it to 1 there, to absorb a
+spurious extra decrement, is functionally a no-op — and it still blacked out the
+display. **The end-of-frame cases will not tolerate a single extra store.** Treat
+`$FFd9` through `$FFe3` as closed to new work of any kind.
+
 The kernel's line counter is stepped by the 6502's fetches, so one missed or
 duplicated dispatch flips its parity, `lines -= 2` steps past zero and wraps,
 and the frame never ends: buffer pointers advance forever, the picture becomes a
@@ -73,6 +79,111 @@ away.
 
 The bus loop runs in main with interrupts disabled, exactly like UnoCart. There
 is no TIM1 or EXTI bus server in this validation build.
+
+## Known issue: intermittent garbled display / 3-blink code
+
+### Symptom
+
+The MovieCart logo renders correctly most of the time. Intermittently the
+picture garbles and the status LED shows **3 flashes** (`DIAG_WRAP_ENDLINES`).
+Sometimes a clean frame recovers on its own and the code drops back to 1. The
+failure is timing-dependent, not deterministic: the same binary alternates
+between a good display and the 3-blink garble across power cycles and within a
+single run.
+
+### What the 3-blink code means
+
+The kernel's scanline counter (`r_coreInfo.lines`) is stepped by the 6502's own
+fetches — `lines -= 2` per line pair at `$FFaf`, `lines--` per line at `$FFd9`,
+tested for exactly zero. If a single dispatch is **missed or doubled**, the
+counter's parity flips, the `== 0` test is skipped, and the counter decrements
+past zero and wraps. `LINES_EXHAUSTED()` catches the wrap and force-closes the
+frame so the kernel resyncs (this is why it recovers), but the wrapped frame is
+already corrupt on screen and the LED latches code 3 for that reporting window.
+
+So code 3 is a **report that a dispatch went wrong**, not the root cause. The
+root cause is why a dispatch is occasionally missed or doubled.
+
+### Root cause (current best understanding)
+
+The breadboard bus has no timing margin, and MovieCart's dispatch is stateful in
+a way a plain ROM cart is not. Two concrete mechanisms are known:
+
+1. **Doubled dispatch from address-line coupling.** After driving data, the loop
+   spins in `while (ADDR_IN == addr)` and tristates when the address "changes."
+   Our own data pins switching couple into the nearby address lines; a glitch
+   reads as a change, we tristate, then re-acquire the *same* address the 6502
+   is still holding and dispatch it twice. A doubled `$FFd9` costs one extra
+   `lines--`; a doubled `$FFaf` costs two.
+
+2. **The one-scanline zero window.** Case 2 of the `$FFd9` state machine leaves
+   `lines == 0` for the remainder of that scanline until `$FFe3` reloads
+   `visibleLines`. Any spurious `$FFd9` in that window decrements from zero and
+   wraps. This is the single most exposed line in the frame and is consistent
+   with the observed rate (≈ one vulnerable line per frame).
+
+The dsPIC original does not see either problem: its change-notification
+interrupt latency naturally debounces the address bus, and its data port is
+driven through a hardware-gated transceiver so `SET_DATA` takes effect instantly
+with no dependence on when the C code finishes.
+
+### What has been ruled out (do not retry without new information)
+
+Each of these was tried on hardware and made things **the same or worse**; the
+reasoning that motivated them is recorded so it is not repeated:
+
+- **Settle window before dispatch** (sample the address, wait ~60 ns, re-read,
+  dispatch only if stable). Intended to reject transient composite addresses.
+  Result: total black screen. The path from address-valid to data-driven has no
+  spare time. Any future attempt must be measured in the disassembly (target
+  ≈ 24 ns / a known instruction count), not a hand-guessed loop — the loop that
+  killed the display was ~4× the intended length, applied twice per cycle.
+- **Repeat suppression** (`if (addr != served) dispatch;`). Intended to kill the
+  doubled dispatch from mechanism 1 above. Result: permanent black screen and
+  constant code 3 — it also suppresses genuine consecutive fetches the kernel
+  needs, so it breaks more dispatches than it saves.
+- **`lines = 1` in `$FFd9` case 2** to absorb the extra decrement from mechanism
+  2. Functionally a no-op (`$FFe3` overwrites it the same scanline) yet still
+  blacked out the display: **one extra store anywhere in `$FFd9`–`$FFe3` is over
+  budget.** Treat the end-of-frame chain as closed to new work of any kind.
+
+### Candidate fixes (not yet tried)
+
+Roughly in order of expected value-to-risk. The safe direction is to *buy back
+timing margin* or *increase the kernel's tolerance without adding stores to the
+hot chain* — not to add filtering to the bus loop.
+
+1. **Strip the diagnostics/counters out of the hot dispatch cases.** `frameLines++`
+   at `$FFaf`/`$FFd9` and the per-frame `diagFrameTick()` add work to exactly the
+   cases with no margin. Move all instrumentation behind a compile-time
+   `DIAG_ENABLE` flag and confirm whether the garble rate drops with it off. This
+   also tells us whether the diagnostics are themselves part of the problem.
+2. **Confirm the blink actually correlates with the garble.** Restrict
+   `DIAG_NOTE(DIAG_WRAP_ENDLINES)` to wraps that occur *outside* the known
+   harmless zero-window, so code 3 only fires on real corruption. If the garble
+   persists while code 3 goes quiet, the LED and the picture are two different
+   events and we've been chasing the wrong signal.
+3. **Debounce the tristate, not the dispatch.** Mechanism 1 is a false *change*
+   detection, not a false address. Require the address to read changed on two
+   consecutive samples before tristating (`while (ADDR_IN == addr)` → confirm the
+   exit). This adds time only *after* data is already driven, where there is
+   slack, instead of before it, where there is none.
+4. **Reduce data→address coupling in hardware.** Series resistors (≈ 100–330 Ω)
+   on PD8–PD15, tighter grounding, or shorter data leads attack mechanism 1 at
+   the source and cost nothing in firmware timing.
+5. **Settle window, done right.** Only if 1–4 are insufficient: an explicitly
+   unrolled, disassembly-verified ≈ 24 ns delay, enabled now that `SET_DATA`
+   drives data early and has freed response budget.
+
+### Diagnosing on hardware
+
+- Watch the LED at the instant the picture garbles. Steady 1 = kernel healthy,
+  problem is downstream (data/timing). 2/3 = counter parity broke (missed or
+  doubled dispatch). 4 = frame geometry wrong. Frozen = kernel stopped closing
+  frames.
+- The heartbeat/diag path lives entirely inside the `endState == 3` block in
+  `core.c`, runs once per frame, and is the only output channel while IRQs are
+  disabled.
 
 ## Build
 

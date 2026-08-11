@@ -1142,6 +1142,14 @@ g0xd9:
 			case 2:
 				r_coreInfo.endState++;
 				r_coreInfo.vblankState = ST_OFF;
+				/*
+				 * Deliberately leaves lines at zero; $FFe3
+				 * loads visibleLines later in this same
+				 * scanline. Adding `lines = 1` here to absorb a
+				 * spurious extra decrement was tried and blacked
+				 * out the display: the end-of-frame cases have
+				 * no room for even one more store.
+				 */
 				r_coreInfo.nextLineJump = ADDR_RIGHT_LINE;
 				EMULATE_DONE
 		}
