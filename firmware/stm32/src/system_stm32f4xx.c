@@ -378,7 +378,10 @@ static void SetSysClock(void)
   }
 
   /* Configure Flash prefetch, Instruction cache, Data cache and wait state */
-  FLASH->ACR = FLASH_ACR_ICEN |FLASH_ACR_DCEN |FLASH_ACR_LATENCY_5WS;
+  /* PRFTEN added: the cartridge bus loop executes from flash, so the ART
+     accelerator's prefetch and instruction cache are what hide the 5 wait
+     states on the critical address-to-data path. */
+  FLASH->ACR = FLASH_ACR_PRFTEN |FLASH_ACR_ICEN |FLASH_ACR_DCEN |FLASH_ACR_LATENCY_5WS;
 
   /* Select the main PLL as system clock source */
   RCC->CFGR &= (uint32_t)((uint32_t)~(RCC_CFGR_SW));

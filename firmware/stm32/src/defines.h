@@ -25,9 +25,25 @@
 #define CART_ADDR_MASK			0x1000u
 #define CART_ADDR_SELECT		0x1000u
 
-/* Bus-serving code must run from zero-wait-state SRAM: flash wait states in
- * the EXTI entry path blow the ~600 ns first-fetch budget of the 2600 bus. */
-#define RAMFUNC __attribute__((section(".ramfunc"), noinline))
+/*
+ * Bus-serving code runs from FLASH, not SRAM — the same as UnoCart, which has no
+ * RAM-relocated code at all and is stable on this board.
+ *
+ * SRAM placement was inherited from the abandoned EXTI design, where flash wait
+ * states on interrupt entry were the problem. It is actively harmful for a
+ * polling loop: on the STM32F407 the Cortex-M4 reaches SRAM over the system bus,
+ * so instruction fetches there contend with every data access the loop makes —
+ * the romData table, r_coreInfo, the frame buffers, and the GPIO registers
+ * themselves. There is no instruction cache on that path either, so each fetch
+ * is a fresh bus transaction whose cost depends on where the code happens to
+ * land. From flash the fetches go over the I-bus through the ART cache, leaving
+ * the system bus entirely to data. That decoupling is also the likely reason
+ * this build has been so absurdly sensitive to adding a single instruction.
+ *
+ * romData stays in SRAM (see core.c): a table read over the system bus now runs
+ * in parallel with instruction fetch rather than competing with it.
+ */
+#define RAMFUNC __attribute__((noinline))
 
 /* Optional status LED on PA1 (DevEBox has LEDs on PA1/PA2/PA3 on many boards). */
 #define STATUS_LED_GPIO			GPIOA

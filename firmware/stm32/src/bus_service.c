@@ -6,6 +6,14 @@
 #include "stm32f4xx.h"
 
 /*
+ * No address settle here. Tried twice: ~240 ns via a counted loop applied on
+ * both the acquisition and release paths, and ~54 ns (4 NOPs plus a confirming
+ * re-read, verified in the disassembly) on the acquisition path alone. Both
+ * blacked out the display completely. Delay before the drivers turn on is not
+ * available at any size — reject transients some other way, or not at all.
+ */
+
+/*
  * Verbatim UnoCart-2600 driver_4k.c control flow. The only substitution is
  * MovieCart's dynamic dispatch in place of cart_rom[addr & 0xfff].
  *
@@ -31,6 +39,7 @@ emulate_cartridge(void)
 	{
 		while ((addr = ADDR_IN) != addr_prev)
 			addr_prev = addr;
+
 		/* got a stable address */
 		if (addr & 0x1000)
 		{ /* A12 high */

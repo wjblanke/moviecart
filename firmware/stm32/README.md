@@ -91,6 +91,12 @@ failure is timing-dependent, not deterministic: the same binary alternates
 between a good display and the 3-blink garble across power cycles and within a
 single run.
 
+A second observed symptom is decisive: **during the garble, movie/logo pixels
+appear outside the viewer window** (in the border / overscan region that should
+be blanked). That is not "wrong pixels inside a correct frame" — it is the
+kernel still drawing `right_line` (GRP/COLUP updates, VBLANK off) on scanlines
+where the TIA should be blanked or in overscan.
+
 ### What the 3-blink code means
 
 The kernel's scanline counter (`r_coreInfo.lines`) is stepped by the 6502's own
@@ -104,6 +110,36 @@ already corrupt on screen and the LED latches code 3 for that reporting window.
 So code 3 is a **report that a dispatch went wrong**, not the root cause. The
 root cause is why a dispatch is occasionally missed or doubled.
 
+### What "pixels outside the viewer window" implies
+
+The viewer window is gated by kernel state, not by the pixel buffers:
+
+| State | `nextLineJump` | `vblankState` | Effect on the CRT |
+| --- | --- | --- | --- |
+| Visible section | `right_line` (`$3e`) | off | Sprites/colors update every line — the movie window |
+| Overscan / blank | `end_lines` (`$b7`) | on | Drawing stopped; beam outside the window |
+
+Pixels outside the window therefore mean at least one of:
+
+1. **Visible section ran too long.** A missed `$FFaf` (`lines -= 2` skipped)
+   leaves the counter high, so `right_line` keeps running past `visibleLines`
+   into what should be overscan — with VBLANK still off. The beam is in the
+   border; the kernel is still writing GRP/COLUP. That is exactly "movie pixels
+   outside the viewer."
+2. **Visible section restarted too early.** The `$FFd9` end-state machine
+   (especially case 2) sets `nextLineJump = right_line` and clears VBLANK before
+   overscan/blank has finished on the CRT. Drawing resumes while the beam is
+   still outside the window. A wrap/corruption in the end-lines section (code 3)
+   is a plausible path into this: `endState` and `lines` get out of phase, case 2
+   fires on the wrong scanline.
+3. **Wrong pixel data alone does not do this.** Corrupted `graphBuf`/`colorBuf`
+   only changes what appears *inside* the window. Drawing outside requires the
+   section machine (`nextLineJump` / `vblankState` / `lines`) to be wrong.
+
+So this symptom promotes the fault from "sometimes a bad byte on the bus" to
+**scanline-section desync** — the same class of bug `LINES_EXHAUSTED()` was
+added to recover from, and the same class the 3-blink code reports.
+
 ### Root cause (current best understanding)
 
 The breadboard bus has no timing margin, and MovieCart's dispatch is stateful in
@@ -115,8 +151,12 @@ a way a plain ROM cart is not. Two concrete mechanisms are known:
    reads as a change, we tristate, then re-acquire the *same* address the 6502
    is still holding and dispatch it twice. A doubled `$FFd9` costs one extra
    `lines--`; a doubled `$FFaf` costs two.
-
-2. **The one-scanline zero window.** Case 2 of the `$FFd9` state machine leaves
+2. **Missed `$FFaf` / end-state desync** (favoured by the outside-window
+   symptom). Skipping the visible-section decrement, or advancing `$FFd9` case 2
+   while still in overscan, leaves VBLANK off and `right_line` active outside
+   the viewer. Code 3 (end-lines wrap) is consistent with the end-state half of
+   this; a pure visible-section overrun would more often report code 2.
+3. **The one-scanline zero window.** Case 2 of the `$FFd9` state machine leaves
    `lines == 0` for the remainder of that scanline until `$FFe3` reloads
    `visibleLines`. Any spurious `$FFd9` in that window decrements from zero and
    wraps. This is the single most exposed line in the frame and is consistent
@@ -132,12 +172,12 @@ with no dependence on when the C code finishes.
 Each of these was tried on hardware and made things **the same or worse**; the
 reasoning that motivated them is recorded so it is not repeated:
 
-- **Settle window before dispatch** (sample the address, wait ~60 ns, re-read,
-  dispatch only if stable). Intended to reject transient composite addresses.
-  Result: total black screen. The path from address-valid to data-driven has no
-  spare time. Any future attempt must be measured in the disassembly (target
-  ≈ 24 ns / a known instruction count), not a hand-guessed loop — the loop that
-  killed the display was ~4× the intended length, applied twice per cycle.
+- **Any settle window before the drivers turn on — at any size.** Tried twice:
+  ~240 ns via a counted loop on both the acquisition and release paths, then
+  ~54 ns (4 explicit NOPs plus a confirming re-read, count verified in the
+  disassembly) on the acquisition path alone. **Both blacked out the display
+  completely.** Delay ahead of the data drive is simply not available, so
+  transients have to be rejected some other way or tolerated.
 - **Repeat suppression** (`if (addr != served) dispatch;`). Intended to kill the
   doubled dispatch from mechanism 1 above. Result: permanent black screen and
   constant code 3 — it also suppresses genuine consecutive fetches the kernel
@@ -171,9 +211,47 @@ hot chain* — not to add filtering to the bus loop.
 4. **Reduce data→address coupling in hardware.** Series resistors (≈ 100–330 Ω)
    on PD8–PD15, tighter grounding, or shorter data leads attack mechanism 1 at
    the source and cost nothing in firmware timing.
-5. **Settle window, done right.** Only if 1–4 are insufficient: an explicitly
-   unrolled, disassembly-verified ≈ 24 ns delay, enabled now that `SET_DATA`
-   drives data early and has freed response budget.
+5. ~~**Settle window, done right.**~~ Ruled out above — no size works.
+
+### The sensitivity clue, and the current fix: execute from flash
+
+Five separate changes blacked out the display, and one of them —
+`lines = 1` in `$FFd9` case 2 — is *provably* a functional no-op that runs
+**after** the data is already driven. Latency alone cannot explain that. What all
+five share is that they shift where the bus code lands and how many bus
+transactions it makes.
+
+The cause is where that code was executing. `RAMFUNC` put `bus_dispatch()` and
+`emulate_cartridge()` in SRAM, inherited from the abandoned EXTI design where
+flash wait states on interrupt entry were the problem. For a polling loop it is
+the wrong trade: on the STM32F407 the Cortex-M4 reaches SRAM over the **system
+bus**, so instruction fetches there contend with every data access the loop makes
+— the `romData` table, `r_coreInfo`, the frame buffers, and the GPIO registers
+themselves. There is no instruction cache on that path, so every fetch is a
+fresh bus transaction whose cost depends on where the code happens to land, which
+is exactly the alignment sensitivity observed.
+
+**UnoCart has no RAM-relocated code at all** and is stable on this board. So:
+
+- `RAMFUNC` is now just `noinline`; the bus loop and dispatch execute from flash
+  over the I-bus through the ART cache, leaving the system bus to data.
+- `romData` stays in SRAM, so the table read now runs *in parallel* with
+  instruction fetch instead of competing with it.
+- `FLASH->ACR` gains `PRFTEN`; prefetch and the instruction cache are what hide
+  the 5 wait states on the address-to-data path.
+
+Verify placement after building — code in flash, table in SRAM:
+
+```
+$ arm-none-eabi-nm -n build/firmware.elf | grep -E "bus_dispatch|emulate_cartridge|romData"
+08000844 T bus_dispatch
+080025a8 T emulate_cartridge
+20000000 d romData.0
+```
+
+If this is the real cause, the payoff is not just a stabler picture but a build
+that stops rejecting every change — which is the precondition for finishing the
+SD work.
 
 ### Diagnosing on hardware
 
@@ -181,6 +259,9 @@ hot chain* — not to add filtering to the bus loop.
   problem is downstream (data/timing). 2/3 = counter parity broke (missed or
   doubled dispatch). 4 = frame geometry wrong. Frozen = kernel stopped closing
   frames.
+- **Pixels outside the viewer window** = section machine desync (`right_line` /
+  VBLANK wrong), not merely corrupt buffer contents. Prefer fixes that protect
+  `$FFaf` / `$FFd9` / `nextLineJump` over ones that only harden the data bus.
 - The heartbeat/diag path lives entirely inside the `endState == 3` block in
   `core.c`, runs once per frame, and is the only output channel while IRQs are
   disabled.
