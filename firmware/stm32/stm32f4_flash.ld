@@ -70,13 +70,17 @@ SECTIONS
   /*
    * Atari bus critical path, before optional SD/driver code.
    *
-   * Preserve the control image's exact hot-path addresses and make them
-   * invariant when --gc-sections removes an unrelated optional helper.
+   * Placed immediately after the fixed-size vector table so no optional code can
+   * precede it, and every input function is ART-line aligned (see HOTFUNC), so
+   * these addresses do not move when --gc-sections drops an unrelated helper or
+   * when one hot function changes size.
    */
-  .hottext 0x08001f48 :
+  .hottext :
   {
+    . = ALIGN(16);
     KEEP(*(.hottext))
-    KEEP(*(.hottext.pump))
+    KEEP(*(.hottext*))
+    . = ALIGN(16);
   } >FLASH
 
   /* The program code and other data goes into FLASH */

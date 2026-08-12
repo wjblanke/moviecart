@@ -220,7 +220,7 @@ moviecart_bus_yield(void)
 static uint16_t pump_work_addr = 0xffffu;
 #endif
 
-HOTPUMP void
+HOTFUNC void
 moviecart_bus_pump(void (*work)(void))
 {
 	uint16_t addr;

@@ -49,4 +49,10 @@ struct coreInfo
 
 extern void			coreInit();
 
+/*
+ * Non-zero while main.c is blinking a code on the status LED, telling the
+ * kernel's once-per-frame heartbeat to leave the LED alone. See core.c.
+ */
+extern volatile uint8_t		mc_led_host;
+
 #endif

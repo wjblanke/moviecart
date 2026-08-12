@@ -134,12 +134,21 @@
  * helper shifted bus_dispatch and every serve loop by 104 bytes. On F407 flash,
  * that changes where branches and dispatch targets fall across the ART
  * accelerator's 128-bit lines, so a logically harmless SD edit can change bus
- * reliability. The linker pins .hottext at the exact address used by the
- * reference image, making its layout invariant across SD build flags.
+ * reliability.
+ *
+ * Two things are needed to make that stop. The linker places .hottext directly
+ * after the fixed-size vector table, so nothing optional can precede it; and each
+ * function is aligned to a 128-bit ART line, so its own position does not move
+ * when a *preceding hot function* changes size either (adding one flag test to
+ * bus_dispatch moved the serve loops by 24 bytes and would otherwise have been
+ * the next confound).
+ *
+ * Line alignment is chosen on principle, not tuned: a loop starting mid-line
+ * needlessly spans an extra flash line. Do not "restore" some previously lucky
+ * offset — the build that appeared to prefer one changed SD behaviour at the same
+ * time, so it never showed which offset was better.
  */
-#define HOTDISPATCH __attribute__((noinline, section(".hottext")))
-#define HOTFUNC __attribute__((noinline, section(".hottext")))
-#define HOTPUMP __attribute__((noinline, section(".hottext.pump"), aligned(16)))
+#define HOTFUNC __attribute__((noinline, section(".hottext"), aligned(16)))
 
 /*
  * Bus stall budget measurement builds (make STALL_TEST=N). See README

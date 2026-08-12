@@ -551,6 +551,44 @@ Verified across reference, `NO_CARD_READY`, and `DOUBLE_READ` builds:
 
 This removes firmware layout as a confound from every subsequent SD experiment.
 
+### Two owners of one LED: why the codes were unreadable
+
+Wall-clock timing fixed the *rate* of the failure codes but they still came out
+"overlapped or faster" and uncountable. The cause was not timing at all: there is
+one status LED and two writers. `diagFrameTick()` drives TESTA0 once per frame from
+inside `bus_dispatch`, and blinking any code necessarily keeps serving the bus — so
+the kernel's heartbeat kept stamping on the code mid-flash. What reached the LED was
+two superimposed patterns, which is why no amount of slowing the blinks helped.
+
+`mc_led_host` now marks the LED as claimed; the heartbeat returns early while it is
+set, and a `fatalBlink` leaves it set for good so repeats are never interleaved.
+
+Worth generalising: this is the third instrument in this project to be broken by the
+system it observes (the probe's phantom first sample, the probe's per-cycle cost,
+and now heartbeat contention). Before trusting *any* future diagnostic here, ask what
+else touches the channel it reports on.
+
+### Making the layout invariant is not the same as pinning one address
+
+The first attempt pinned `.hottext` to the old control image's absolute address.
+That fixes only the section *start*: adding a single flag test to `bus_dispatch`
+grew it and pushed the serve loops 24 bytes, changing their ART-line offsets and
+re-introducing the confound in the very next measurement.
+
+Both halves are required — `.hottext` immediately after the fixed-size vector
+table so nothing optional precedes it, *and* `aligned(16)` on each hot function so
+one growing does not move the others. Verified across `NO_SD`, `SD_STAGE=2`, full
+playback, `NO_CARD_READY`, `DOUBLE_READ` and `PUMP_ALIGN` builds: `bus_dispatch`,
+`emulate_cartridge`, `bus_serve_cycle` and `moviecart_bus_pump` sit at identical,
+line-aligned addresses in all of them.
+
+Note also what *cannot* be concluded from the earlier layout discovery: because the
+`NO_CARD_READY` image changed SD behaviour and layout together, it never showed
+which ART offset is preferable. Line alignment here is a principled default (a loop
+starting mid-line spans an extra flash line for no reason), not a restoration of a
+lucky offset. Resist the urge to tune offsets by trial — that is a search space with
+no end and no theory.
+
 ### Failure codes must not be timed by the kernel they are reporting on
 
 `fatalBlink` was frame-timed, which is only calibrated while the kernel is healthy —

@@ -131,6 +131,7 @@ led_wait_ms(uint32_t ms)
 static void
 flash_led_slow(uint8_t num)
 {
+	mc_led_host = 1;	/* keep the kernel heartbeat off this LED */
 	TESTA0_HIGH;
 	led_wait_ms(1200);
 	for (uint8_t i = 0; i < num; i++) {
@@ -141,11 +142,14 @@ flash_led_slow(uint8_t num)
 	}
 	TESTA0_HIGH;
 	led_wait_ms(1200);
+	/* mc_led_host stays set: a failure code repeats forever and must never
+	 * be interleaved with the heartbeat between repeats. */
 }
 
 static void
 flash_led(uint8_t num)
 {
+	mc_led_host = 1;	/* keep the kernel heartbeat off this LED */
 	TESTA0_HIGH;
 	for (uint8_t i = 0; i < num; i++) {
 		TESTA0_LOW;
@@ -155,6 +159,7 @@ flash_led(uint8_t num)
 	}
 	TESTA0_HIGH;
 	led_wait_frames(LED_FRAMES_GAP);
+	mc_led_host = 0;
 }
 
 #if MOVIECART_GAP_PROBE

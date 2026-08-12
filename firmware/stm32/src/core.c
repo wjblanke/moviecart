@@ -77,10 +77,28 @@ static uint8_t  diagShowing;	/* code currently being blinked out */
 static uint16_t diagTick;	/* frames into the current blink cycle */
 static uint16_t frameLines;	/* scanlines counted in this frame */
 
+/*
+ * Set while main.c is blinking a code of its own on the same LED.
+ *
+ * There is exactly one status LED and two things that want to drive it. Blinking
+ * a boot or failure code necessarily keeps serving the bus, and serving runs
+ * bus_dispatch, which lands here once per frame and drove TESTA0 unconditionally —
+ * so the heartbeat kept stamping on the code mid-flash. That is what made the
+ * codes unreadable ("some of the led blinks are overlapped or faster"): they were
+ * two patterns superimposed, not one pattern mistimed. Whoever is deliberately
+ * blinking wins; the heartbeat resumes when it is done.
+ */
+volatile uint8_t mc_led_host;
+
 static inline void
 diagFrameTick(void)
 {
 	uint16_t flashing = (uint16_t)diagShowing * DIAG_SLOT_FRAMES;
+
+	if (mc_led_host) {		/* main.c owns the LED right now */
+		diagTick = 0;
+		return;
+	}
 
 	if (diagTick < flashing && (diagTick & (DIAG_SLOT_FRAMES - 1)) <
 				   (DIAG_SLOT_FRAMES / 2))
@@ -132,7 +150,7 @@ coreInit(void)
 }
 
 
-HOTDISPATCH void
+HOTFUNC void
 bus_dispatch(uint16_t lo_address, uint8_t addr_low8)
 {
 	/* In SRAM: a flash-resident table costs wait states per lookup, right
