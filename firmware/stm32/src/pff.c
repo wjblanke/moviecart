@@ -41,6 +41,9 @@
 #include "pff.h"		// Petit FatFs configurations and declarations 
 #include "sd_reader.h"	// Declarations of low level disk I/O functions 
 #include "core.h"
+#include "moviecart_yield.h"
+#include "defines.h"
+#include "bus_service.h"	// emulate_cartridge() for MOUNT_PHASE bisection
 
 
 //--------------------------------------------------------------------------
@@ -158,11 +161,21 @@ bool pf_mount()
 	if (!mc_disk_initialize())
 		return false;
 
+#if MOVIECART_MOUNT_PHASE == 1
+#if MOVIECART_GAP_PROBE
+	mc_probe_report();	/* blink out the worst gap and where it was */
+#else
+	emulate_cartridge();	/* card init only — no sector DMA yet */
+#endif
+#endif
+
 	qinfo.head = 0;
 	for (int i=0; i<QUEUE_SIZE; i++)
 	{
 		qinfo.block[i] = -1;
 		qinfo.clust[i] = -1;
+		if (!(i & 7))
+			moviecart_bus_yield();
 	}
 
 	// Search FAT partition on the drive 
@@ -172,6 +185,10 @@ bool pf_mount()
 	while(1)
 	{
 		buf = disk_read_block1(bsect);	// Read the boot record 
+
+#if MOVIECART_MOUNT_PHASE == 2
+		emulate_cartridge();	/* one 512-byte sector DMA has now run */
+#endif
 
 		// Check record signature 
 		if (ld_word(&buf[510]) != 0xAA55)
@@ -213,11 +230,15 @@ bool pf_mount()
 	fsInfo.csize = buf[BPB_SecPerClus];
 	fsInfo.csize_bits = -1;
 
+	moviecart_bus_yield();
+
 	while(fsInfo.csize)
 	{
 		fsInfo.csize_bits++;
 		fsInfo.csize >>= 1;
 	}
+
+	moviecart_bus_yield();
 
 	fsInfo.csize = 1 << fsInfo.csize_bits;
 	fsInfo.csize_mask = fsInfo.csize - 1;
@@ -276,6 +297,8 @@ bool pf_seek_block (
 
 		check--;
 		check &= QUEUE_MASK;
+		if (!(i & 15u))
+			moviecart_bus_yield();
 	}
 
 	if (fsInfo.block > block)
@@ -327,6 +350,7 @@ bool pf_seek_block (
 
 		fsInfo.curr_clust = get_fat(fsInfo.curr_clust);
 		fsInfo.block += fsInfo.csize;
+		moviecart_bus_yield();
 	}
 
 
@@ -409,6 +433,8 @@ pf_open_file( uint32_t *numFrames, int num)
 					break;
 			}
 		}
+
+		moviecart_bus_yield();
 
 		// Next entry 
 		dir_index++;

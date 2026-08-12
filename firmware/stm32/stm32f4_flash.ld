@@ -30,8 +30,17 @@
 /* Entry Point */
 ENTRY(Reset_Handler)
 
-/* Highest address of the user mode stack */
-_estack = 0x20020000;    /* end of 128K RAM */
+/*
+ * Stack lives at the top of SRAM1, NOT the top of the 128 K.
+ *
+ * SRAM1 (0x20000000, 112 K) and SRAM2 (0x2001C000, 16 K) are separate slaves on
+ * the bus matrix. The SD DMA target is placed in SRAM2 so a sector transfer can
+ * run concurrently with the CPU driving the Atari data bus out of SRAM1 (kernel
+ * buffers, stack) without either stalling the other. Keeping the stack in SRAM1
+ * matters: bus_dispatch pushes/pops every cycle, and a stack in SRAM2 would
+ * re-introduce exactly the contention this split removes.
+ */
+_estack = 0x2001C000;    /* top of SRAM1 (112 K) */
 
 /* Generate a link error if heap and stack don't fit into RAM */
 _Min_Heap_Size = 0;      /* required amount of heap  */
@@ -41,7 +50,8 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 MEMORY
 {
   FLASH (rx)      : ORIGIN = 0x08000000, LENGTH = 64K
-  RAM (xrw)       : ORIGIN = 0x20000000, LENGTH = 128K
+  RAM (xrw)       : ORIGIN = 0x20000000, LENGTH = 112K
+  RAM2 (xrw)      : ORIGIN = 0x2001C000, LENGTH = 16K
   MEMORY_B1 (rx)  : ORIGIN = 0x60000000, LENGTH = 0K
   CCMRAM (rw)     : ORIGIN = 0x10000000, LENGTH = 64K
 }
@@ -55,6 +65,18 @@ SECTIONS
     . = ALIGN(4);
     KEEP(*(.isr_vector)) /* Startup code */
     . = ALIGN(4);
+  } >FLASH
+
+  /*
+   * Atari bus critical path, before optional SD/driver code.
+   *
+   * Preserve the control image's exact hot-path addresses and make them
+   * invariant when --gc-sections removes an unrelated optional helper.
+   */
+  .hottext 0x08001f48 :
+  {
+    KEEP(*(.hottext))
+    KEEP(*(.hottext.pump))
   } >FLASH
 
   /* The program code and other data goes into FLASH */
@@ -173,6 +195,22 @@ SECTIONS
     . = . + _Min_Stack_Size;
     . = ALIGN(4);
   } >RAM
+
+  /*
+   * DMA-target buffers live in SRAM2, a different bus-matrix slave than the
+   * SRAM1 that holds the kernel buffers and stack. This lets an SD sector DMA
+   * run without stalling the per-cycle bus_dispatch. NOLOAD: uninitialized,
+   * the DMA fills it before it is read.
+   */
+  .sram2 (NOLOAD) :
+  {
+    . = ALIGN(4);
+    _ssram2 = .;
+    *(.sram2)
+    *(.sram2*)
+    . = ALIGN(4);
+    _esram2 = .;
+  } >RAM2
 
   /* MEMORY_bank1 section, code must be located here explicitly            */
   /* Example: extern int foo(void) __attribute__ ((section (".mb1text"))); */

@@ -52,8 +52,73 @@ HEX = $(BUILDDIR)/firmware.hex
 BIN = $(BUILDDIR)/firmware.bin
 MAP = $(BUILDDIR)/firmware.map
 
+# Bus stall budget measurement builds (see README):
+#   make STALL_TEST=1   coarse sweep, 0-64 us
+#   make STALL_TEST=2   fine sweep, 0-1000 ns (sub-cycle)
+#   make STALL_TEST=3   interleave proof: 100 ns step every cart cycle
+ifneq ($(STALL_TEST),)
+DEFS += -DMOVIECART_STALL_TEST=$(STALL_TEST)
+endif
+
+# Bisect SD bring-up: make SD_STAGE=1|2|3 (see defines.h)
+ifneq ($(SD_STAGE),)
+DEFS += -DMOVIECART_SD_STAGE=$(SD_STAGE)
+endif
+
+# Bisect *inside* the mount: make MOUNT_PHASE=1|2 (see defines.h)
+ifneq ($(MOUNT_PHASE),)
+DEFS += -DMOVIECART_MOUNT_PHASE=$(MOUNT_PHASE)
+endif
+
+# Title-only baseline, no SD at all: make NO_SD=1. This is the reference build —
+# perfect intro screen and a once-per-second heartbeat. Re-check it whenever a
+# change touches the serving code, so "did I break the base?" is never a guess.
+ifneq ($(NO_SD),)
+DEFS += -DMOVIECART_ENABLE_SD=0
+endif
+
+# Worst serve-to-serve gap probe, reported on the LED: make GAP_PROBE=1
+ifneq ($(GAP_PROBE),)
+DEFS += -DMOVIECART_GAP_PROBE=$(GAP_PROBE)
+endif
+
+# DMA-free read path: make POLL_READ=1 (see defines.h). Drains the SDIO FIFO one
+# word per free Atari cycle instead of using DMA. Optionally override the transfer
+# clock divider: make POLL_READ=1 POLL_CLKDIV=0x4E for ~0.6 MHz.
+ifneq ($(POLL_READ),)
+DEFS += -DMOVIECART_SD_POLL_READ=$(POLL_READ)
+endif
+ifneq ($(POLL_CLKDIV),)
+DEFS += -DMOVIECART_SD_POLL_CLKDIV=$(POLL_CLKDIV)
+endif
+
+# SDIO transfer clock for the DMA path: make DMA_CLKDIV=0x00 (24 MHz), 0x02 (12 MHz),
+# 0x08 (4.8 MHz, the old default). Faster shortens the window in which a sector read
+# can starve the Atari — see defines.h.
+ifneq ($(DMA_CLKDIV),)
+DEFS += -DMOVIECART_SD_DMA_CLKDIV=$(DMA_CLKDIV)
+endif
+
+# One pumped work step per Atari cycle, aligned to the cycle boundary: make PUMP_ALIGN=1
+ifneq ($(PUMP_ALIGN),)
+DEFS += -DMOVIECART_PUMP_ALIGN=$(PUMP_ALIGN)
+endif
+
+# Ablations for locating the per-sector cost (see defines.h). Timing probes are
+# unusable here — GAP_PROBE's own per-cycle cost kills the picture — so we add and
+# remove work instead of measuring it.
+#   make NO_CARD_READY=1   drop the post-read CMD13 poll
+#   make DOUBLE_READ=1     positive control: read every sector twice
+ifneq ($(NO_CARD_READY),)
+DEFS += -DMOVIECART_SD_SKIP_CARD_READY=$(NO_CARD_READY)
+endif
+ifneq ($(DOUBLE_READ),)
+DEFS += -DMOVIECART_SD_DOUBLE_READ=$(DOUBLE_READ)
+endif
+
 CFLAGS = \
 	-MT $@ -MMD -MP -MF $(DEPDIR)/$*.d \
+	$(DEFS) \
 	-O2 -fno-tree-vrp -g \
 	-mcpu=cortex-m4 -mthumb \
 	-mfpu=fpv4-sp-d16 -mhard-float \
@@ -95,6 +160,7 @@ $(BUILDDIR)/src/core.o: src/core.c
 	mkdir -p $(dir $@)
 	mkdir -p .depend/build/src
 	$(CC) -c -MT $@ -MMD -MP -MF .depend/build/src/core.d \
+		$(DEFS) \
 		-O2 -fno-tree-vrp -fno-gcse -fno-crossjumping -fno-toplevel-reorder -g \
 		-mcpu=cortex-m4 -mthumb \
 		-mfpu=fpv4-sp-d16 -mhard-float \

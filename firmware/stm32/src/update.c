@@ -3,6 +3,7 @@
 #include "defines.h"
 #include "osd.h"
 #include "update.h"
+#include "moviecart_yield.h"
 
 // transport controls
 
@@ -286,6 +287,8 @@ updateVolume(struct stateVars* state, struct frameInfo* fInfo)
 		*dst = volumeScale[*dst & 0x0F];
 		dst++;
 		t--;
+		if (!(t & 3u))
+			moviecart_bus_yield();
 	};
 }
 
@@ -344,15 +347,53 @@ updateColor(struct stateVars* state, struct frameInfo* fInfo)
 		const uint_fast16_t	offset1 = (fInfo->visibleLines - (LABEL_HEIGHT+LEVEL_HEIGHT))*1;
 
 		// background
-		memset(fInfo->colorBuf + offset22, COLOR_BLUE, (LABEL_HEIGHT+LEVEL_HEIGHT)*5);
-		memset(fInfo->colorBKBuf + offset1, COLOR_BLACK, (LABEL_HEIGHT+LEVEL_HEIGHT)*1);
+		{
+			uint8_t *p = fInfo->colorBuf + offset22;
+			uint_fast16_t n = (LABEL_HEIGHT+LEVEL_HEIGHT)*5;
+			while (n) {
+				*p++ = COLOR_BLUE;
+				n--;
+				if (!(n & 7u))
+					moviecart_bus_yield();
+			}
+		}
+		{
+			uint8_t *p = fInfo->colorBKBuf + offset1;
+			uint_fast16_t n = (LABEL_HEIGHT+LEVEL_HEIGHT)*1;
+			while (n) {
+				*p++ = COLOR_BLACK;
+				n--;
+				if (!(n & 7u))
+					moviecart_bus_yield();
+			}
+		}
 
 		// label
-		memcpy(fInfo->graphBuf + offset22, srcLabel, LABEL_HEIGHT*5);
+		{
+			uint8_t *d = fInfo->graphBuf + offset22;
+			const uint8_t *s = srcLabel;
+			uint_fast16_t n = LABEL_HEIGHT*5;
+			while (n) {
+				*d++ = *s++;
+				n--;
+				if (!(n & 7u))
+					moviecart_bus_yield();
+			}
+		}
 
 		// level
 		const uint_fast16_t offsetG = (fInfo->visibleLines - LEVEL_HEIGHT)*5;
-		memcpy(fInfo->graphBuf + offsetG, srcLevel,  LEVEL_HEIGHT*5);
+		{
+			uint8_t *d = fInfo->graphBuf + offsetG;
+			const uint8_t *s = srcLevel;
+			uint_fast16_t n = LEVEL_HEIGHT*5;
+			while (n) {
+				*d++ = *s++;
+				n--;
+				if (!(n & 7u))
+					moviecart_bus_yield();
+			}
+		}
 	}
 	else if (uInfo.drawTimeCode)
 	{
@@ -361,9 +402,37 @@ updateColor(struct stateVars* state, struct frameInfo* fInfo)
 
 		const uint_fast16_t	offset1 = (fInfo->visibleLines - TIMECODE_HEIGHT)*1;
 
-		memcpy(fInfo->graphBuf + offsetTC, fInfo->timecodeBuf, TIMECODE_HEIGHT*5);
-		memset(fInfo->colorBuf + offsetTC, COLOR_BLUE, TIMECODE_HEIGHT*5);
-		memset(fInfo->colorBKBuf + offset1, COLOR_BLACK, TIMECODE_HEIGHT*1);
+		{
+			uint8_t *d = fInfo->graphBuf + offsetTC;
+			const uint8_t *s = fInfo->timecodeBuf;
+			uint_fast16_t n = TIMECODE_HEIGHT*5;
+			while (n) {
+				*d++ = *s++;
+				n--;
+				if (!(n & 7u))
+					moviecart_bus_yield();
+			}
+		}
+		{
+			uint8_t *p = fInfo->colorBuf + offsetTC;
+			uint_fast16_t n = TIMECODE_HEIGHT*5;
+			while (n) {
+				*p++ = COLOR_BLUE;
+				n--;
+				if (!(n & 7u))
+					moviecart_bus_yield();
+			}
+		}
+		{
+			uint8_t *p = fInfo->colorBKBuf + offset1;
+			uint_fast16_t n = TIMECODE_HEIGHT*1;
+			while (n) {
+				*p++ = COLOR_BLACK;
+				n--;
+				if (!(n & 7u))
+					moviecart_bus_yield();
+			}
+		}
 	}
 
 	// foreground
@@ -375,6 +444,8 @@ updateColor(struct stateVars* state, struct frameInfo* fInfo)
 		uint8_t r_data = *dst;
 		*dst++ = ((r_data & 0xf0) | shiftBright[(r_data & 0x0f) + uInfo.bright]) & colorMask;
 		t--;
+		if (!(t & 3u))
+			moviecart_bus_yield();
 	};
 
 	// background
@@ -385,6 +456,8 @@ updateColor(struct stateVars* state, struct frameInfo* fInfo)
 		uint8_t r_data = *dst;
 		*dst++ = ((r_data & 0xf0) | shiftBright[(r_data & 0x0f) + uInfo.bright]) & colorMask;
 		t--;
+		if (!(t & 3u))
+			moviecart_bus_yield();
 	};
 
 	// square off edges

@@ -132,7 +132,7 @@ coreInit(void)
 }
 
 
-RAMFUNC void
+HOTDISPATCH void
 bus_dispatch(uint16_t lo_address, uint8_t addr_low8)
 {
 	/* In SRAM: a flash-resident table costs wait states per lookup, right
@@ -1280,7 +1280,9 @@ g0xe3:
 		if (frameLines < 250 || frameLines > 275)
 			DIAG_NOTE(DIAG_FRAME_LENGTH);
 		frameLines = 0;
+#if MOVIECART_STALL_TEST != 1 && MOVIECART_STALL_TEST != 2
 		diagFrameTick();
+#endif
 	}
 	EMULATE_DONE
 
