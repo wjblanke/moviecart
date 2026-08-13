@@ -589,6 +589,250 @@ starting mid-line spans an extra flash line for no reason), not a restoration of
 lucky offset. Resist the urge to tune offsets by trial — that is a search space with
 no end and no theory.
 
+### Code 7 meant three different things; split it
+
+With the LED finally readable, playback failed as "7 blinks" — but code 7 was fired
+for every `prepareNextFrame` reject, and a *read* error did not reach it at all
+(`disk_read_block_raw` retried forever, wedging on the last good frame: one of the
+"black screen" cases). One code was hiding three distinct layers, so they are now
+separated:
+
+- **7** field header wrong (`MVC\0` missing): the bytes are wrong but full-length.
+- **9** field geometry invalid (`visibleLines`/`numBlocks` out of range): header fine,
+  contents not.
+- **10** sector read failed after `DISK_READ_RETRIES`: the card/read path itself, not
+  the data. The unbounded retry is now bounded so this shows a code instead of hanging.
+- **long 2 s strobe** (not a count) the field's bytes were found in the scratch buffer:
+  the read succeeded but went to the previous DMA destination.
+
+The next playback failure now says which layer to look at instead of collapsing all
+three into one number. Header/geometry (7/9) point at *what the read returned*; 10
+points at *the read*.
+
+### Read cache keyed on the sector alone could serve stale bytes
+
+`disk_read_block2` skipped the read when the sector matched its last one — but its
+destination is the ping-pong field buffer, so the *same* sector can legitimately be
+wanted in a *different* buffer on a later frame. Keyed on the sector alone, that read
+was skipped and the new buffer kept whatever it held. The key now includes `dst`, so
+a repeat only counts when the exact (sector, buffer) pair is already satisfied. Field
+stride (`FIELD_NUM_BLOCKS` = 8) exceeds max used (`FIELD_MAX_BLOCKS` = 6), so forward
+playback does not alias — but pause/replay and buffer ping-pong can, and this closes
+that hole regardless.
+
+### Code 7 persists: separating "wrong sector" from "data never landed"
+
+Playback still reports 7 (header wrong) with a corrupted picture, and never 10, so
+the read *succeeds* — DMA completes and the CRC passes — yet the bytes are wrong.
+That narrows it to two shapes, which need opposite fixes:
+
+1. **Wrong sector.** `pf_seek_block` walks the FAT chain with `get_fat`, and nothing
+   validates the cluster it returns. One bad FAT sector yields a bogus cluster, and
+   `clust2sect` then points at a real but wrong sector — a successful read of the
+   wrong data.
+2. **Right sector, data did not land.** Note the asymmetry that makes this
+   plausible: mount reads always target the same `diskBuffer`, so the per-sector DMA
+   fast path never has to change `M0AR`; playback targets a new address every sector.
+   A destination that failed to take effect leaves the buffer holding stale bytes,
+   which is what a wrong header looks like.
+
+`prepareNextFrame` now retries a failed field up to `FIELD_LOAD_ATTEMPTS` times
+after calling `disk_read_invalidate()`. The invalidation is the whole point: keyed on
+(sector, dst), the caches would otherwise satisfy the retry from the same bytes that
+just failed, so the retry would prove nothing. Dropping sector1 too means the retry
+re-walks the FAT, covering both shapes at once.
+
+The outcome distinguishes them without any new instrumentation:
+
+- **playback continues, heartbeat shows 5** — transient; a re-read fixes it, so the
+  bytes were at fault, not the arithmetic. Attention goes to the read path
+  (`M0AR` handling in the DMA fast path first).
+- **still code 7 after all attempts** — the computed sector is wrong every time: a
+  deterministic seek/FAT-walk fault, and the read path is exonerated.
+
+Retry also has standalone value: a transient bad field currently kills playback
+outright, which is a harsh response to one recoverable sector.
+
+### The buffer was read before the DMA had written it
+
+Retrying a failed field (with the caches invalidated) never helped — still code 7,
+never 10. That looked like "deterministic wrong sector", but that reading assumed a
+data-landing fault would be *transient*. A **systematic** completion bug fails every
+retry identically, so the retry never distinguished the two. The completion path had
+two such bugs.
+
+**1. The wait exits on the wrong completion.** The stock loop was
+
+```c
+while (!DMAEndOfTransfer && !TransferEnd && !TransferError && timeout) ...
+```
+
+which returns as soon as *either* completion appears. `TransferEnd` comes from
+`DATAEND`, which only means the SDIO peripheral clocked in the last byte — up to a
+full SDIO FIFO (32 words) plus the DMA's own FIFO may still be unwritten. `DATAEND`
+always precedes the DMA's transfer-complete, so the wait effectively *always*
+returned early. The follow-up wait only drains `RXACT`, which is again the
+peripheral, not memory. Nothing ever waited for the DMA to write the buffer.
+
+It is worse than data merely arriving late: the next `SD_ReadBlock` immediately
+disables the stream to retarget `M0AR`, discarding whatever was still in flight, so
+the tail of each sector was silently *dropped*.
+
+**2. A sticky flag could skip the wait entirely.** `SD_ReadBlock` reset
+`TransferError`, `TransferEnd` and `StopCondition`, but not `DMAEndOfTransfer`, which
+is only cleared inside `SD_WaitReadOperation`. A leftover value makes the next wait
+exit immediately, before *any* of that sector has landed, and the caller then
+validates a wholly stale buffer — which presents as a corrupt field header, not as an
+error. That is a direct path to code 7.
+
+The wait is now two explicit phases — peripheral done (`DATAEND`), then memory
+coherent (DMA transfer-complete, bounded by `SD_DMA_DONE_MAX` rather than the
+0xFFFFFFFF `SD_DATATIMEOUT`) — and `DMAEndOfTransfer` is reset at the start of every
+read.
+
+Generalising, since this is the second instance: a "wait for completion" that ORs
+together two different completions waits for neither. And the reason this was slow to
+find is that both bugs corrupt data while every status check reports success, so the
+read path looked innocent from the outside.
+
+### Abandoning interleaving: the WaitCart handoff
+
+Every approach up to here tried to fit SD work *between* Atari cycles, and the
+measurements never supported it. The fine sweep put the entire per-cycle budget near
+100 ns; a field is hundreds of sectors; and each of DMA clock, pump alignment, poll
+draining, SRAM banking and per-sector DMA setup changed the failure rate without
+fixing it. That pattern — many variables all mattering a little, none decisive — is
+what a fundamentally insufficient budget looks like.
+
+UnoCart solves the same problem from the opposite side, and it runs reliably on this
+board. `PrepareWaitCartRoutine` copies a routine into Atari RAM and the 6502 executes
+it *from there*, so it issues no cartridge fetches at all. With nothing to serve, the
+ARM has no deadline and does its SD work as ordinary blocking code
+(`emulate_firmware_cartridge` literally breaks out of its serve loop and returns).
+The console keeps a stable picture because it is generating its own VSYNC/VBLANK and
+WSYNC timing, and it polls the cart once a frame to ask whether the firmware is back.
+
+The reason this had not been tried here is a false constraint: UnoCart blanks for
+whole seconds while listing a directory, whereas MovieCart needs a field *every*
+frame. But MovieCart does not have to surrender the frame — only the part of it where
+nothing is displayed. The vertical blank is ~37 scanlines, about 2.8 ms, in which the
+kernel is purely marking time. A field read is roughly 1 ms. **The read fits inside
+the interval that was already being wasted.**
+
+Two facts about this port make the mechanism cheap to build:
+
+1. **`core.c` is the kernel ROM.** Each `g0xNN` case emits one hardcoded 6502 opcode
+   byte, so the instruction stream the console executes is defined in C. Changing what
+   the Atari runs needs no assembler and no rebuild of `movie_ntsc.bin`.
+2. **`$FFEC`-`$FFF9` were dead.** Fourteen dispatch indices emitted `0x00` (BRK), so
+   there was room for a loader without moving anything.
+
+The protocol:
+
+- `$FFEC` is a 7-byte loader — `lda #<byte>` / `sta <dest>` / `jmp $ffec` — where the
+  ARM supplies both operands and advances a pointer each pass. Seven ROM bytes move an
+  arbitrary routine into zero page at ~8 cycles per byte, so the whole copy costs a
+  couple of scanlines, once, at boot.
+- Zero page is free to use: the kernel touches only `$80` (DUMMY) and `$81` (FIELD),
+  and the emulated program contains **no JSR/RTS at all**, so the stack is never
+  pushed and cannot collide with the routine. It loads at `$84`.
+- Each frame needing a read, the `JMP` at `$FFE9` (the end_lines path, reached only
+  during blanking) is diverted to `$0084`. The routine counts `MC_WAIT_LINES` blank
+  lines with `STA WSYNC`, entirely from RAM.
+- It then polls `$FFF3` once per line. While the ARM is away the bus floats and the
+  compare fails, so **a missed poll costs one scanline instead of jamming** — the
+  property that makes this robust rather than a new timing race.
+- On `MC_WAIT_READY` the routine jumps back into `end_lines`, and the ARM subtracts
+  the scanlines it borrowed from its own line counter so the frame still adds up. The
+  count comes from DWT, not from counting polls: the polls taken while the ARM was
+  away are exactly the ones that consumed time and are precisely the ones it cannot
+  see.
+
+`moviecart_bus_yield` and `moviecart_bus_pump` return immediately during a handoff,
+which is what lets the *unmodified* SDIO driver run at full speed — its busy-waits
+still call them, and they now cost nothing. `bus_serve_cycle` and
+`emulate_cartridge`, the display-critical paths, are untouched.
+
+Cost, accepted deliberately: the ~28 borrowed lines push no audio samples and skip
+the controller capture, so there is a 60 Hz audio artifact during playback. Getting a
+stable picture and correct data first is worth an audible seam; the borrowed window
+can be shortened once the read time is known.
+
+Two builds, because the mechanism should be proven before it is trusted:
+
+- `make WAITCART_PROOF=1` — handoff every frame with a 1 ms stall and **no SD code**.
+  Under the old model 1 ms is far past the budget and would garble the picture; parked
+  in RAM it should be invisible. Expect 1 flash, 2 flashes, then a clean title and the
+  normal heartbeat.
+- `make SD_STAGE=0` — the real thing, field reads inside the handoff.
+
+`make WAITCART=0` skips installing the RAM routine. `mc_wait_handoff()` still
+enables IRQs around the work function so the stock driver can complete, but the
+6502 is not parked — that is the old cooperative-vs-blocking conflict and will
+glitch the picture. WaitCart is required for this driver.
+
+### Stock UnoCart SDIO, run inside the handoff
+
+The patched MovieCart SDIO driver (yields in every busy-wait, DMA fast-path,
+pumped completion with IRQs off) is gone. `fatfs_sd_sdio.c` / `.h` are byte-for-byte
+the files from UnoCart-2600's Atari2600Cart firmware, which already work on this
+board. `sd_reader.c` calls `TM_FATFS_SD_SDIO_disk_initialize` and
+`TM_FATFS_SD_SDIO_disk_read` directly — the same `SD_ReadMultiBlocks` /
+`SD_WaitReadOperation` / `SD_GetStatus` sequence UnoCart uses.
+
+That driver waits on SDIO and DMA *interrupt* flags, and `Delayms` waits on SysTick,
+so a WaitCart handoff now `__enable_irq()` for the duration of the work callback
+and masks again before serving resumes. `TM_DELAY_Init()` runs once at boot with
+IRQs already masked, so SysTick is programmed but silent until the first handoff.
+The transfer clock is UnoCart's `SDIO_TRANSFER_CLK_DIV = 0x04` (~8 MHz).
+
+Mount, file-open, the title geometry probe, and every playback field load all run
+as handoff work callbacks. LED blinks and `emulate_cartridge()` stay *outside* the
+handoff: those need the kernel running, and `flash_led` waiting for `mr_endFrame`
+while the 6502 is parked in RAM would hang forever.
+
+### The failure moved to the first read that changes destination
+
+With the completion bug fixed, the report from hardware became precise: `1, 2, 3, 7`.
+That is mount and file-open passing, and the fault landing on the title's field probe
+in `runTitle` — the *first* read of the run whose destination is not the scratch
+`diskBuffer`. Everything before it (MBR, boot sector, FAT, directory) targets that one
+buffer, so `M0AR` never has to change; everything after it, playback included, needs a
+new destination on every single sector.
+
+That asymmetry is the whole shape of the bug, across every result so far:
+
+| build | reads needing a new `M0AR` | outcome |
+| --- | --- | --- |
+| baseline (`NO_SD=1`) | none | 10/10 |
+| `SD_STAGE=2` (mount) | none | ~7/10 |
+| full playback | every sector | fails at the first one |
+
+The per-sector fast path in `SD_LowLevel_DMA_RxConfig` skips `DMA_DeInit`/`DMA_Init`
+and rewrites `M0AR` alone, on the argument that nothing else about the stream changes
+between sectors. It reads correctly — it disables the stream and waits for `EN` to
+clear before touching `M0AR`, so the old transfer is flushed to the *old* address —
+and it is still the only thing in the read path that distinguishes the passing reads
+from the failing one.
+
+Rather than keep arguing from the reference manual, the fast path is now behind
+`MOVIECART_SD_DMA_FASTPATH`, **off by default** (`make FASTPATH=1` restores it). Full
+re-init sets `M0AR`, `NDTR`, the FIFO and the flags unambiguously. It costs more per
+sector, which is a timing problem; a read landing in the wrong buffer is a
+correctness problem, and correctness comes first.
+
+Two builds settle it together, since one shows *whether* and the other *why*:
+
+- `FASTPATH=0` — if playback works, the fast path was the fault.
+- `FASTPATH=1` plus a direct check: when a header fails validation, compare the
+  *scratch* buffer against `MVC\0`. Finding the field's signature there proves the
+  read succeeded and was simply misdirected to the previous destination. No retry
+  could ever have shown this, because a misdirect is systematic and reports success.
+
+That proof gets a **long 2 s strobe** rather than a count (`fatalStrobe`), because
+distinguishing ten flashes from eleven by eye is unreliable and this particular
+result decides which layer to fix.
+
 ### Failure codes must not be timed by the kernel they are reporting on
 
 `fatalBlink` was frame-timed, which is only calibrated while the kernel is healthy —

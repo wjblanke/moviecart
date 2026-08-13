@@ -57,7 +57,8 @@ struct queueInfo
 bool		pf_mount();							/* Mount/Unmount a logical drive */
 bool		pf_open_file(uint32_t *numFrames, int num);	/* Open first 'num' archived non-deleted file */
 bool		pf_seek_block(uint32_t block);		/* Move file pointer of the open file */
-void        pf_read_block(uint8_t *dst);		/* Read full block*/
+bool        pf_read_block(uint8_t *dst);		/* Read full block, false on read failure */
+uint32_t    pf_current_sector(void);			/* Absolute sector the next read will fetch */
 
 uint32_t ld_dword (const uint8_t* ptr);
 uint32_t get_fat (uint32_t clst);   // Cluster# to get the link information

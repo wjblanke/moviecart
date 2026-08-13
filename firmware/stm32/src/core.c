@@ -9,6 +9,7 @@
 #define ST_ON					0x84	/* sty(2) */
 #define ADDR_RIGHT_LINE			0x3e
 #define ADDR_END_LINES			0xb7
+#define ADDR_WAIT_STUB			0xecu	/* $FFEC: copy stub / jmp $0084 */
 
 /*
  * Data on PD8-PD15 (high byte). Address PE0-PE12.
@@ -63,6 +64,7 @@ struct coreInfo r_coreInfo;
 #define DIAG_WRAP_VISIBLE	2
 #define DIAG_WRAP_ENDLINES	3
 #define DIAG_FRAME_LENGTH	4
+/* DIAG_FIELD_RETRY (5) lives in core.h — it is raised by main.c, not the kernel. */
 
 #define DIAG_SLOT_FRAMES	8	/* one flash: 4 frames on, 4 off */
 #define DIAG_GAP_FRAMES		30	/* silence between repeats */
@@ -89,6 +91,230 @@ static uint16_t frameLines;	/* scanlines counted in this frame */
  * blinking wins; the heartbeat resumes when it is done.
  */
 volatile uint8_t mc_led_host;
+
+/*
+ * Raise a diagnostic code from outside the kernel.
+ *
+ * The heartbeat already reports the worst thing seen since its last report, and it
+ * is non-fatal — exactly the right channel for "this happened but playback carried
+ * on". A field load that only succeeded on a retry must not be silent: without
+ * this, a healed transient fault and a genuinely clean run look identical, and we
+ * would not know whether retries were doing any work.
+ */
+void
+mc_diag_note(uint8_t code)
+{
+	DIAG_NOTE(code);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * WaitCart handoff
+ * ---------------------------------------------------------------------------
+ *
+ * Every previous attempt tried to fit SD work *between* Atari cycles, and the
+ * measurements said that cannot work: the fine sweep put the whole per-cycle
+ * budget near 100 ns, and a field is hundreds of sectors. UnoCart solves the same
+ * problem from the other side — it stops the 6502 from reading the cartridge at
+ * all, by copying a routine into Atari RAM and letting the console run from
+ * there. No fetches means no deadline, so the ARM can use plain blocking code.
+ *
+ * MovieCart cannot give up the whole frame like UnoCart's menu does, because it
+ * needs a field every frame. It does not have to: the vertical blank is ~37
+ * scanlines in which nothing is displayed and the kernel is only marking time.
+ * That is ~2.8 ms of Atari time against roughly 1 ms of field read, so the read
+ * fits inside the interval that was being wasted anyway.
+ *
+ * Protocol:
+ *
+ *   The blanking JMP at $FFE9/$FFEA/$FFEB is the original kernel: 0x4C,
+ *   nextLineJump, 0xFF. $FFB7-$FFB9 stay `ldy #2` / `ldx #0` immediates —
+ *   overlaying them as a JMP was late on the cycle-counted path and produced
+ *   a false RUNNING (black screen, kernel jammed, LED already solid).
+ *
+ *   1. Install: $FFEC is a 7-byte LDA/STA/JMP stub that streams mc_wait_code[]
+ *      into $84, then JMPs back to end_lines. Main sets nextLineJump $B7→$EC
+ *      during vblank (endState==2, lines>8, and only while it is already $B7).
+ *   2. Handoff: $FFEC is `jmp $0084`. Same vblank patch. Three cart fetches,
+ *      then the 6502 is in RIOT RAM. This is the protocol the WAITCART_PROOF
+ *      build already parked with.
+ *   3. The RAM routine STA WSYNCs until $FFF3 answers MC_WAIT_READY, restores
+ *      Y=2 / X=0 (the stx/sty VSYNC pair), and JMPs to end_lines.
+ *
+ * Zero page is safe to use: the kernel touches only $80 (DUMMY) and $81 (FIELD),
+ * and the emulated program contains no JSR/RTS at all, so the stack is never
+ * pushed and cannot collide with the routine.
+ */
+#define MC_WAIT_RAM_BASE	0x84u	/* Atari zero page; clear of $80/$81 */
+#define MC_WAIT_READY		0x5au	/* poll answer meaning "ARM is done" */
+
+/*
+ * Hand-assembled 6502, loaded at MC_WAIT_RAM_BASE. Branch offsets are relative to
+ * that base, so this must be copied to $84 and nowhere else.
+ *
+ *   84: sta WSYNC          ; park on HBLANK until the ARM answers
+ *   86: lda $fff3
+ *   89: cmp #MC_WAIT_READY
+ *   8b: bne $84
+ *   8d: ldy #2             ; ST_ON = sty, needs Y=2
+ *   8f: ldx #0             ; ST_OFF = stx, needs X=0
+ *   91: jmp $ffb7          ; end_lines
+ *
+ * Kept to 16 bytes: a longer blob (sync-frame wait) made the copy miss the
+ * blanking window, so install never finished and SD never started.
+ */
+static const uint8_t mc_wait_code[] = {
+	0x85, 0x02,
+	0xad, 0xf3, 0xff,
+	0xc9, MC_WAIT_READY,
+	0xd0, 0xf7,
+	0xa0, 0x02,
+	0xa2, 0x00,
+	0x4c, 0xb7, 0xff
+};
+
+volatile uint8_t	mc_wait_state;
+volatile uint8_t	mc_wait_ready;
+
+static uint8_t		mc_copy_idx;
+static uint32_t		mc_wait_start;
+static uint8_t		mc_stub[7];	/* $FFEC-$FFF2: driven with no per-fetch branches */
+static uint8_t		mc_poll_byte;	/* $FFF3 answer; 0 until the ARM is done */
+
+static void
+mc_stub_copy_byte(void)
+{
+	uint8_t i = mc_copy_idx;
+
+	mc_stub[0] = 0xa9u;
+	mc_stub[1] = mc_wait_code[i];
+	mc_stub[2] = 0x85u;
+	mc_stub[3] = (uint8_t)(MC_WAIT_RAM_BASE + i);
+	mc_stub[4] = 0x4cu;
+	mc_stub[5] = (i + 1u < sizeof(mc_wait_code)) ? ADDR_WAIT_STUB : ADDR_END_LINES;
+	mc_stub[6] = 0xffu;
+}
+
+static void
+mc_stub_trampoline(void)
+{
+	mc_stub[0] = 0x4cu;
+	mc_stub[1] = MC_WAIT_RAM_BASE;
+	mc_stub[2] = 0x00u;
+	mc_stub[3] = 0x00u;
+	mc_stub[4] = 0x00u;
+	mc_stub[5] = 0x00u;
+	mc_stub[6] = 0x00u;
+}
+
+static void
+mc_stub_off(void)
+{
+	mc_stub[0] = 0;
+	mc_stub[1] = 0;
+	mc_stub[2] = 0;
+	mc_stub[3] = 0;
+	mc_stub[4] = 0;
+	mc_stub[5] = 0;
+	mc_stub[6] = 0;
+}
+
+static void
+mc_wait_try_patch(void)
+{
+	if (r_coreInfo.nextLineJump == ADDR_END_LINES)
+		r_coreInfo.nextLineJump = ADDR_WAIT_STUB;
+}
+
+static void
+mc_wait_unpatch(void)
+{
+	if (r_coreInfo.nextLineJump == ADDR_WAIT_STUB)
+		r_coreInfo.nextLineJump = ADDR_END_LINES;
+}
+
+/*
+ * Scanlines borrowed by the routine, derived from elapsed ARM cycles.
+ *
+ * Counting the 6502's poll reads would undercount badly: the polls taken while
+ * the ARM is off doing SD work are never seen, and those are exactly the ones
+ * that take the time. DWT keeps running with interrupts masked, so measuring the
+ * interval and dividing by a scanline is both simpler and correct.
+ */
+#define MC_CYCLES_PER_LINE	((SystemCoreClock / 1190000u) * 76u)
+
+static void
+mc_wait_resync(void)
+{
+	uint32_t lines = (DWT->CYCCNT - mc_wait_start) / MC_CYCLES_PER_LINE;
+
+	/*
+	 * The ARM never saw a g0xd9 tick for these lines, so its phase counter
+	 * still thinks they are owed. Leave at least one line so the phase ends
+	 * through the normal LINES_EXHAUSTED path rather than by underflow.
+	 */
+	if (lines >= r_coreInfo.lines)
+		lines = r_coreInfo.lines ? r_coreInfo.lines - 1u : 0u;
+
+	r_coreInfo.lines -= lines;
+	frameLines += lines;
+}
+
+/*
+ * Install the RAM routine. Serves the bus normally throughout: the copy is driven
+ * by the 6502's own fetches from the $FFEC stub.
+ */
+void
+mc_wait_install(void)
+{
+	mc_copy_idx = 0;
+	mc_poll_byte = 0;
+	mc_wait_state = MC_WAIT_COPY;
+	mc_stub_copy_byte();
+
+	while (mc_wait_state != MC_WAIT_INSTALLED) {
+		bus_serve_cycle();
+		if (mc_wait_state == MC_WAIT_COPY &&
+		    r_coreInfo.endState == 2 &&
+		    r_coreInfo.lines > 8u)
+			mc_wait_try_patch();
+	}
+}
+
+void
+mc_wait_handoff(void (*work)(void))
+{
+	if (mc_wait_state != MC_WAIT_INSTALLED) {
+		__enable_irq();
+		work();
+		__disable_irq();
+		return;
+	}
+
+	mc_wait_ready = 0;
+	mc_poll_byte = 0;
+	mc_wait_state = MC_WAIT_ARMED;
+	mc_stub_trampoline();
+
+	while (mc_wait_state != MC_WAIT_RUNNING) {
+		bus_serve_cycle();
+		if (mc_wait_state == MC_WAIT_ARMED &&
+		    r_coreInfo.endState == 2 &&
+		    r_coreInfo.lines > 8u)
+			mc_wait_try_patch();
+	}
+
+	SET_DATA_MODE_IN;
+	__enable_irq();
+	work();
+	__disable_irq();
+
+	mc_wait_ready = 1;
+	mc_poll_byte = MC_WAIT_READY;
+
+	while (mc_wait_state == MC_WAIT_RUNNING)
+		bus_serve_cycle();
+}
 
 static inline void
 diagFrameTick(void)
@@ -1278,12 +1504,9 @@ g0xe0:
 	EMULATE_DONE	// nop
 
 g0xe1:
-	SET_DATA(0xea); // nop
-	EMULATE_DONE	// nop
-
 g0xe2:
 	SET_DATA(0xea); // nop
-	EMULATE_DONE	// nop
+	EMULATE_DONE
 
 g0xe3:
 	SET_DATA(r_coreInfo.vsyncState);	// stx VSYNC
@@ -1318,12 +1541,12 @@ g0xe6:
 
 g0xe7:
 g0xe8:
-    SET_DATA(0xea); // nop
-    EMULATE_DONE
+	SET_DATA(0xea); // nop
+	EMULATE_DONE
 
 g0xe9:
 	SET_DATA(0x4c);	// jmp
-    EMULATE_DONE
+	EMULATE_DONE
 
 g0xea:
 	SET_DATA(r_coreInfo.nextLineJump);	//	 end_lines (b7)  right_line(3e)
@@ -1333,14 +1556,71 @@ g0xeb:
 	SET_DATA(0xff);
 	EMULATE_DONE
 
+/*
+ * $FFEC-$FFF2: bytes are precomputed into mc_stub[] so every fetch is a
+ * single SET_DATA. Branches here used to run *before* the ODR write and
+ * made the copy itself miss the data-valid window.
+ *
+ * Copy:   lda #<byte> / sta <zp> / jmp $ffec  until the last byte, then
+ *         jmp end_lines.
+ * Handoff: jmp $0084 — three fetches, then the 6502 is in RAM.
+ */
 g0xec:
+	SET_DATA(mc_stub[0]);
+	EMULATE_DONE
+
 g0xed:
+	SET_DATA(mc_stub[1]);
+	EMULATE_DONE
+
 g0xee:
+	SET_DATA(mc_stub[2]);
+	if (mc_wait_state == MC_WAIT_ARMED) {
+		mc_wait_unpatch();
+		mc_wait_start = DWT->CYCCNT;
+		mc_wait_state = MC_WAIT_RUNNING;
+		mc_stub_off();
+	}
+	EMULATE_DONE
+
 g0xef:
+	SET_DATA(mc_stub[3]);
+	EMULATE_DONE
+
 g0xf0:
+	SET_DATA(mc_stub[4]);
+	EMULATE_DONE
+
 g0xf1:
+	SET_DATA(mc_stub[5]);
+	EMULATE_DONE
+
 g0xf2:
+	SET_DATA(mc_stub[6]);
+	if (mc_wait_state == MC_WAIT_COPY) {
+		if (++mc_copy_idx >= sizeof(mc_wait_code)) {
+			mc_wait_unpatch();
+			mc_wait_state = MC_WAIT_INSTALLED;
+			mc_stub_off();
+		} else {
+			mc_stub_copy_byte();
+		}
+	}
+	EMULATE_DONE
+
+/*
+ * $FFF3: the "are you back yet?" poll, and the only cartridge access the RAM
+ * routine makes. Answering it is what ends the handoff.
+ */
 g0xf3:
+	SET_DATA(mc_poll_byte);
+	if (mc_poll_byte) {
+		mc_wait_resync();
+		mc_wait_state = MC_WAIT_INSTALLED;
+		mc_poll_byte = 0;
+	}
+	EMULATE_DONE
+
 g0xf4:
 g0xf5:
 g0xf6:

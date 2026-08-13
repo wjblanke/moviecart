@@ -116,6 +116,23 @@ ifneq ($(DOUBLE_READ),)
 DEFS += -DMOVIECART_SD_DOUBLE_READ=$(DOUBLE_READ)
 endif
 
+# Per-sector DMA setup: make FASTPATH=1 restores the M0AR-only retarget. Default is
+# the full re-init, which is slower but sets the destination unambiguously.
+ifneq ($(FASTPATH),)
+DEFS += -DMOVIECART_SD_DMA_FASTPATH=$(FASTPATH)
+endif
+
+# WaitCart handoff: make WAITCART=0 reverts to interleaving SD work into spare
+# Atari cycles (see defines.h).
+ifneq ($(WAITCART),)
+DEFS += -DMOVIECART_WAITCART=$(WAITCART)
+endif
+
+# Handoff proof: 1 ms stall per frame, no SD code at all. make WAITCART_PROOF=1
+ifneq ($(WAITCART_PROOF),)
+DEFS += -DMOVIECART_WAITCART_PROOF=$(WAITCART_PROOF)
+endif
+
 CFLAGS = \
 	-MT $@ -MMD -MP -MF $(DEPDIR)/$*.d \
 	$(DEFS) \

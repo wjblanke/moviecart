@@ -227,154 +227,11 @@
 #include "stm32f4xx.h"
 #include "fatfs_sd_sdio.h"
 #include <string.h>
-#include "moviecart_yield.h"
-#include "bus_service.h"	/* MC_PROBE region markers */
 /*
 #include "tm_stm32f4_usart.h"
 #define logf(x)	TM_USART_Puts(USART1, x); TM_USART_Puts(USART1, "\n");
 */
 #define logf(x)
-
-/*
- * Waiting on SDIO->STA without leaving a gap between served cycles.
- *
- * The STA read is on APB2 and costs ~60-120 ns. Done straight after a yield it
- * lands inside the freshly started Atari cycle and delays the data-bus write.
- * Card init spends >100k cycles in these waits, so those small overruns add up
- * to a near-certain jam. Sample STA in the free (A12-low) window instead and
- * let the wait loop test only a cached copy — one SRAM load between serves.
- */
-static volatile uint32_t sd_sta_cached;
-
-/*
- * Block length currently programmed into the card, so CMD16 (SET_BLOCKLEN) can be
- * skipped on a read when it would change nothing. It is 512 for every transfer
- * this firmware performs, and playback issues hundreds of reads a second, so the
- * stock driver's unconditional CMD16-plus-response-wait per sector was pure
- * repeated cost. 0 means unknown; reset it in SD_Init, and update it anywhere that
- * sends CMD16 with a different length, or a stale 512 would silently corrupt a read.
- *
- * NB: this is deliberately introduced *alone*, without the DPSM-window yields that
- * accompanied it last time and regressed reads.
- */
-static uint16_t sd_cur_blocklen;
-
-static void
-sd_sample_sta(void)
-{
-	sd_sta_cached = SDIO->STA;
-}
-
-/* Serve until STA shows `mask`, bounded by `iters` served cycles. */
-static uint32_t
-sd_wait_sta(uint32_t mask, uint32_t iters)
-{
-	sd_sta_cached = SDIO->STA;
-
-	while (!(sd_sta_cached & mask) && iters--)
-		moviecart_bus_pump(sd_sample_sta);
-
-	return sd_sta_cached;
-}
-
-/* Same, waiting for every bit of `mask` to go away (RXACT/TXACT draining). */
-static uint32_t
-sd_wait_sta_clear(uint32_t mask, uint32_t iters)
-{
-	sd_sta_cached = SDIO->STA;
-
-	while ((sd_sta_cached & mask) && iters--)
-		moviecart_bus_pump(sd_sample_sta);
-
-	return sd_sta_cached;
-}
-
-/*
- * Response waits in the stock driver were unbounded. Keep them effectively so,
- * but with a ceiling: each iteration is about one Atari cycle, so this is tens
- * of milliseconds — far beyond any real card, yet it cannot wedge forever.
- */
-#define SD_STA_WAIT_MAX		60000u
-
-/*
- * Per-pin GPIO setup for the SDIO lines, one pin per served cycle.
- *
- * The TM_GPIO_* helpers each loop over all 16 pin positions doing register
- * read-modify-writes, which is comfortably more than the ~838 ns an Atari cycle
- * allows — a single yield placed *between* those calls still left whole missed
- * cycles inside them. Writing the five registers for one pin is ~250 ns, so
- * doing it a pin at a time with a serve after each keeps every gap sub-cycle.
- */
-static void
-sd_pin_af(GPIO_TypeDef *port, uint32_t pin, uint32_t pupd)
-{
-	uint32_t p2 = pin * 2u;
-	uint32_t as = (pin & 7u) * 4u;
-
-	port->AFR[pin >> 3u] = (port->AFR[pin >> 3u] & ~(0xFu << as)) |
-			       ((uint32_t)GPIO_AF_SDIO << as);
-	port->PUPDR = (port->PUPDR & ~(3u << p2)) | (pupd << p2);
-	port->OSPEEDR = (port->OSPEEDR & ~(3u << p2)) | (2u << p2);	/* Fast */
-	port->OTYPER &= ~(1u << pin);					/* push-pull */
-	port->MODER = (port->MODER & ~(3u << p2)) | (2u << p2);		/* AF */
-
-	moviecart_bus_yield();
-}
-
-/* Release one pin: analog mode with a pull-down, matching the previous DeInit. */
-static void
-sd_pin_release(GPIO_TypeDef *port, uint32_t pin)
-{
-	uint32_t p2 = pin * 2u;
-
-	port->MODER |= (3u << p2);
-	port->PUPDR = (port->PUPDR & ~(3u << p2)) | (2u << p2);
-
-	moviecart_bus_yield();
-}
-
-/*
- * SCR drain step, run only in free cycles by moviecart_bus_pump. The SCR is two
- * words, so the destination is bounded explicitly rather than trusting RXDAVL.
- */
-static uint32_t *scr_dest;
-static volatile uint32_t scr_index;
-
-static void
-scr_drain(void)
-{
-	sd_sta_cached = SDIO->STA;
-	if ((SDIO->STA & SDIO_FLAG_RXDAVL) && scr_index < 2u)
-		scr_dest[scr_index++] = SDIO_ReadData ();
-}
-
-/*
- * IRQs stay masked for the Atari bus; pump SDIO/DMA completion by hand.
- *
- * One of the two checks per free cycle, never both. Even a free A12-low cycle is
- * only ~838 ns and we enter it partway through, while the SDIO branch alone is up
- * to four APB2 accesses on the DATAEND path (status read, pending-bit clear, MASK
- * read-modify-write) — adding the DMA register check on top can overrun the
- * window, and one overrun means one missed fetch, which the coarse sweep showed is
- * enough to garble the picture. Alternating halves the worst-case step and costs
- * only one extra free cycle per poll.
- */
-static uint8_t sd_pump_phase;
-
-static void
-sd_pump_completion(void)
-{
-	sd_pump_phase ^= 1u;
-
-	if (sd_pump_phase) {
-		if (SDIO->STA & (SDIO_IT_DATAEND | SDIO_IT_DCRCFAIL |
-				 SDIO_IT_DTIMEOUT | SDIO_IT_RXOVERR |
-				 SDIO_IT_TXUNDERR | SDIO_IT_STBITERR))
-			SD_ProcessIRQSrc();
-	} else {
-		SD_ProcessDMAIRQ();
-	}
-}
 
 
 static uint32_t CardType = SDIO_STD_CAPACITY_SD_CARD_V1_1;
@@ -431,23 +288,18 @@ DSTATUS TM_FATFS_SD_SDIO_disk_initialize(void) {
 	TM_GPIO_Init(FATFS_USE_WRITEPROTECT_PIN_PORT, FATFS_USE_WRITEPROTECT_PIN_PIN, TM_GPIO_Mode_IN, TM_GPIO_OType_PP, TM_GPIO_PuPd_UP, TM_GPIO_Speed_Low);
 #endif
 	
-	/* Do not touch NVIC_PriorityGroupConfig here — main owns Group_4.
-	 * SDIO/DMA below cart EXTI (0) and TIM1 bus (1). */
+	// Configure the NVIC Preemption Priority Bits 
+	NVIC_PriorityGroupConfig (NVIC_PriorityGroup_1);
 	NVIC_InitStructure.NVIC_IRQChannel = SDIO_IRQn;
-	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 2;
+	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
 	NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
 	NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
 	NVIC_Init (&NVIC_InitStructure);
 	NVIC_InitStructure.NVIC_IRQChannel = SD_SDIO_DMA_IRQn;
-	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 2;
+	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
 	NVIC_Init (&NVIC_InitStructure);
-
-	MC_PROBE(MC_PHASE_SDIO_REGS);	/* entry + NVIC */
-	moviecart_bus_yield();
-
-	MC_PROBE(MC_PHASE_PINS);	/* pin release */
+	
 	SD_LowLevel_DeInit();
-	MC_PROBE(MC_PHASE_PINS);	/* pin setup */
 	SD_LowLevel_Init();
 
 	/* Card power / CMD0 can fail intermittently on DevEBox — retry a few times. */
@@ -456,7 +308,7 @@ DSTATUS TM_FATFS_SD_SDIO_disk_initialize(void) {
 		SD_Error err = SD_ERROR;
 		for (attempt = 0; attempt < 5; attempt++) {
 			if (attempt)
-				moviecart_delay_ms(50);
+				Delayms(50);
 			err = SD_Init();
 			if (err == SD_OK)
 				break;
@@ -647,15 +499,9 @@ SD_Error SD_Init (void)
 {
 	__IO SD_Error errorstatus = SD_OK;
 
-	/* A re-initialised card is back to its own default block length. */
-	sd_cur_blocklen = 0;
-
 	/* SDIO Peripheral Low Level Init */
 	//SD_LowLevel_Init();
-	MC_PROBE(MC_PHASE_SDIO_REGS);	/* SDIO_DeInit */
 	SDIO_DeInit ();
-	moviecart_bus_yield();
-	MC_PROBE(MC_PHASE_COMMANDS);	/* PowerON: CMD0/8/55, ACMD41 */
 	errorstatus = SD_PowerON ();
 
 	if (errorstatus != SD_OK) {
@@ -666,7 +512,6 @@ SD_Error SD_Init (void)
 
 	logf ("SD_PowerON OK\r\n");
 
-	MC_PROBE(MC_PHASE_COMMANDS);	/* CMD2/CMD3/CMD9 */
 	errorstatus = SD_InitializeCards ();
 
 	if (errorstatus != SD_OK) {
@@ -680,7 +525,6 @@ SD_Error SD_Init (void)
 	/*!< Configure the SDIO peripheral */
 	/*!< SDIO_CK = SDIOCLK / (SDIO_TRANSFER_CLK_DIV + 2) */
 	/*!< on STM32F4xx devices, SDIOCLK is fixed to 48MHz */
-	MC_PROBE(MC_PHASE_SDIO_REGS);	/* SDIO_Init transfer clock */
 	SDIO_InitStructure.SDIO_ClockDiv = SDIO_TRANSFER_CLK_DIV;
 	SDIO_InitStructure.SDIO_ClockEdge = SDIO_ClockEdge_Rising;
 	SDIO_InitStructure.SDIO_ClockBypass = SDIO_ClockBypass_Disable;
@@ -689,16 +533,12 @@ SD_Error SD_Init (void)
 	SDIO_InitStructure.SDIO_HardwareFlowControl = SDIO_HardwareFlowControl_Disable;
 	SDIO_Init (&SDIO_InitStructure);
 
-	moviecart_bus_yield();
-
 	/*----------------- Read CSD/CID MSD registers ------------------*/
-	MC_PROBE(MC_PHASE_CARDINFO);	/* CSD/CID unpacking */
 	errorstatus = SD_GetCardInfo (&SDCardInfo);
 
 	if (errorstatus == SD_OK) {
 		/*----------------- Select Card --------------------------------*/
 		logf ("SD_GetCardInfo OK\r\n");
-		MC_PROBE(MC_PHASE_COMMANDS);	/* CMD7 */
 		errorstatus = SD_SelectDeselect ((uint32_t) (SDCardInfo.RCA << 16));
 	}
 	else {
@@ -707,7 +547,6 @@ SD_Error SD_Init (void)
 
 	if (errorstatus == SD_OK) {
 		logf ("SD_SelectDeselect OK\r\n");
-		MC_PROBE(MC_PHASE_COMMANDS);	/* wide bus: FindSCR + ACMD6 */
 #if FATFS_SDIO_4BIT == 1
 		/* Prefer 4-bit; fall back to 1-bit if wide-bus fails (noisy DAT1-3). */
 		errorstatus = SD_EnableWideBusOperation (SDIO_BusWide_4b);
@@ -812,18 +651,14 @@ SD_Error SD_PowerON (void)
 	SDIO_InitStructure.SDIO_HardwareFlowControl = SDIO_HardwareFlowControl_Disable;
 	SDIO_Init (&SDIO_InitStructure);
 
-	moviecart_bus_yield();
-
 	/*!< Set Power State to ON */
 	SDIO_SetPowerState (SDIO_PowerState_ON);
 
 	/*!< Enable SDIO Clock */
 	SDIO_ClockCmd (ENABLE);
 
-	moviecart_bus_yield();
-
 	/* >=74 SD clocks + card power settle before first CMD0 */
-	moviecart_delay_ms(2);
+	Delayms(2);
 
 	/*!< CMD0: GO_IDLE_STATE ---------------------------------------------------*/
 	/*!< No CMD response required */
@@ -1061,8 +896,6 @@ SD_Error SD_GetCardInfo (SD_CardInfo *cardinfo)
 	tmp = (uint8_t) (CSD_Tab[0] & 0x000000FF);
 	cardinfo->SD_csd.MaxBusClkFrec = tmp;
 
-	moviecart_bus_yield();
-
 	/*!< Byte 4 */
 	tmp = (uint8_t) ((CSD_Tab[1] & 0xFF000000) >> 24);
 	cardinfo->SD_csd.CardComdClasses = tmp << 4;
@@ -1129,9 +962,6 @@ SD_Error SD_GetCardInfo (SD_CardInfo *cardinfo)
 		cardinfo->CardBlockSize = 512;
 	}
 
-	/* Straight-line CSD/CID unpacking is long enough to starve the Atari. */
-	moviecart_bus_yield();
-
 	cardinfo->SD_csd.EraseGrSize = (tmp & 0x40) >> 6;
 	cardinfo->SD_csd.EraseGrMul = (tmp & 0x3F) << 1;
 
@@ -1168,8 +998,6 @@ SD_Error SD_GetCardInfo (SD_CardInfo *cardinfo)
 	cardinfo->SD_csd.CSD_CRC = (tmp & 0xFE) >> 1;
 	cardinfo->SD_csd.Reserved4 = 1;
 
-	moviecart_bus_yield();
-
 	/*!< Byte 0 */
 	tmp = (uint8_t) ((CID_Tab[0] & 0xFF000000) >> 24);
 	cardinfo->SD_cid.ManufacturerID = tmp;
@@ -1201,8 +1029,6 @@ SD_Error SD_GetCardInfo (SD_CardInfo *cardinfo)
 	/*!< Byte 7 */
 	tmp = (uint8_t) (CID_Tab[1] & 0x000000FF);
 	cardinfo->SD_cid.ProdName2 = tmp;
-
-	moviecart_bus_yield();
 
 	/*!< Byte 8 */
 	tmp = (uint8_t) ((CID_Tab[2] & 0xFF000000) >> 24);
@@ -1359,7 +1185,6 @@ SD_Error SD_EnableWideBusOperation (uint32_t WideMode)
 				SDIO_InitStructure.SDIO_BusWide = SDIO_BusWide_4b;
 				SDIO_InitStructure.SDIO_HardwareFlowControl = SDIO_HardwareFlowControl_Disable;
 				SDIO_Init (&SDIO_InitStructure);
-				moviecart_bus_yield();
 			}
 		} else {
 			errorstatus = SDEnWideBus (DISABLE);
@@ -1373,7 +1198,6 @@ SD_Error SD_EnableWideBusOperation (uint32_t WideMode)
 				SDIO_InitStructure.SDIO_BusWide = SDIO_BusWide_1b;
 				SDIO_InitStructure.SDIO_HardwareFlowControl = SDIO_HardwareFlowControl_Disable;
 				SDIO_Init (&SDIO_InitStructure);
-				moviecart_bus_yield();
 			}
 		}
 	}
@@ -1402,137 +1226,6 @@ SD_Error SD_SelectDeselect (uint64_t addr)
 
 	return (errorstatus);
 }
-
-#if MOVIECART_SD_POLL_READ
-/*
- * DMA-free single-block read.
- *
- * The card streams the sector into the 32-word RX FIFO, and this drains it *one
- * word per free (A12-low) cycle* through moviecart_bus_pump — the only window in
- * which touching a peripheral cannot make a cart fetch late. There is no DMA, so
- * nothing contends with bus_dispatch on the bus matrix and there is no per-sector
- * DMA setup; the price is that the SDIO clock must be low enough (see defines.h)
- * that the FIFO cannot overrun during a run of cart-only cycles, since the F407
- * cannot pause the card.
- *
- * The drain step is deliberately the smallest possible unit of work: one STA read
- * and at most one FIFO read. Emptying the whole FIFO in a single step was the
- * temptation and would be wrong — a full FIFO is ~3 us of reads, far past the
- * ~100 ns a free cycle can hide before the next cart cycle needs the bus. The
- * pump re-checks the address between every step, so a long A12-low window still
- * drains many words, but an A12-high edge is always seen within one word's time.
- */
-static uint32_t * volatile sd_poll_dst;
-static volatile uint32_t sd_poll_words;
-static volatile uint32_t sd_poll_err;
-
-#define SD_POLL_ERR_FLAGS	(SDIO_FLAG_DCRCFAIL | SDIO_FLAG_DTIMEOUT | \
-				 SDIO_FLAG_RXOVERR | SDIO_FLAG_STBITERR)
-
-static void
-sd_poll_drain(void)
-{
-	uint32_t sta = SDIO->STA;
-
-	if (sta & SD_POLL_ERR_FLAGS) {
-		sd_poll_err = sta;
-		return;
-	}
-
-	if ((sta & SDIO_FLAG_RXDAVL) && sd_poll_words) {
-		*sd_poll_dst++ = SDIO_ReadData();
-		sd_poll_words--;
-	}
-}
-
-SD_Error
-SD_ReadBlock_Polled(uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize)
-{
-	SD_Error errorstatus = SD_OK;
-	uint32_t guard;
-
-	TransferError = SD_OK;
-	TransferEnd = 0;
-	StopCondition = 0;
-
-	SDIO->DCTRL = 0x0;
-
-	if (CardType == SDIO_HIGH_CAPACITY_SD_CARD) {
-		BlockSize = 512;
-		ReadAddr /= 512;
-	}
-
-	/* Set block length only when it would change (see SD_ReadBlock). */
-	if (sd_cur_blocklen != BlockSize) {
-		SDIO_CmdInitStructure.SDIO_Argument = (uint32_t) BlockSize;
-		SDIO_CmdInitStructure.SDIO_CmdIndex = SD_CMD_SET_BLOCKLEN;
-		SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
-		SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
-		SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-		SDIO_SendCommand (&SDIO_CmdInitStructure);
-
-		errorstatus = CmdResp1Error (SD_CMD_SET_BLOCKLEN);
-		if (SD_OK != errorstatus)
-			return errorstatus;
-
-		sd_cur_blocklen = BlockSize;
-	}
-
-	/* Arm the receive path (no DMA). */
-	sd_poll_dst = (uint32_t *) readbuff;
-	sd_poll_words = BlockSize / 4u;
-	sd_poll_err = 0;
-
-	SDIO_DataInitStructure.SDIO_DataTimeOut = SD_DATATIMEOUT;
-	SDIO_DataInitStructure.SDIO_DataLength = BlockSize;
-	SDIO_DataInitStructure.SDIO_DataBlockSize = (uint32_t) SDIO_DATABLOCKSIZE;
-	SDIO_DataInitStructure.SDIO_TransferDir = SDIO_TransferDir_ToSDIO;
-	SDIO_DataInitStructure.SDIO_TransferMode = SDIO_TransferMode_Block;
-	SDIO_DataInitStructure.SDIO_DPSM = SDIO_DPSM_Enable;
-	SDIO_DataConfig (&SDIO_DataInitStructure);
-
-	/*!< Send CMD17 READ_SINGLE_BLOCK */
-	SDIO_CmdInitStructure.SDIO_Argument = (uint32_t) ReadAddr;
-	SDIO_CmdInitStructure.SDIO_CmdIndex = SD_CMD_READ_SINGLE_BLOCK;
-	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
-	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
-	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
-
-	errorstatus = CmdResp1Error (SD_CMD_READ_SINGLE_BLOCK);
-	if (errorstatus != SD_OK)
-		return errorstatus;
-
-	/*
-	 * Drain in the free cycles. The guard is a loose escape hatch for a dead
-	 * bus (no free cycles ever) or a stalled card; a live transfer completes in
-	 * far fewer iterations. It is a register decrement, so it costs the serve
-	 * loop nothing.
-	 */
-	guard = 8u * 1000u * 1000u;
-	while (sd_poll_words && !sd_poll_err && --guard)
-		moviecart_bus_pump(sd_poll_drain);
-
-	if (sd_poll_err) {
-		SDIO->ICR = SDIO_STATIC_FLAGS;
-		if (sd_poll_err & SDIO_FLAG_DCRCFAIL)
-			return SD_DATA_CRC_FAIL;
-		if (sd_poll_err & SDIO_FLAG_DTIMEOUT)
-			return SD_DATA_TIMEOUT;
-		if (sd_poll_err & SDIO_FLAG_RXOVERR)
-			return SD_RX_OVERRUN;
-		return SD_START_BIT_ERR;
-	}
-
-	if (sd_poll_words) {		/* guard expired before the sector finished */
-		SDIO->ICR = SDIO_STATIC_FLAGS;
-		return SD_DATA_TIMEOUT;
-	}
-
-	SDIO->ICR = SDIO_STATIC_FLAGS;
-	return SD_OK;
-}
-#endif /* MOVIECART_SD_POLL_READ */
 
 /**
  * @brief  Allows to read one block from a specified address in a card. The Data
@@ -1572,22 +1265,18 @@ SD_Error SD_ReadBlock (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize)
 		ReadAddr /= 512;
 	}
 
-	/* Set Block Size for Card — only when it would actually change. */
-	if (sd_cur_blocklen != BlockSize) {
-		SDIO_CmdInitStructure.SDIO_Argument = (uint32_t) BlockSize;
-		SDIO_CmdInitStructure.SDIO_CmdIndex = SD_CMD_SET_BLOCKLEN;
-		SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
-		SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
-		SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-		SDIO_SendCommand (&SDIO_CmdInitStructure);
+	/* Set Block Size for Card */
+	SDIO_CmdInitStructure.SDIO_Argument = (uint32_t) BlockSize;
+	SDIO_CmdInitStructure.SDIO_CmdIndex = SD_CMD_SET_BLOCKLEN;
+	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
+	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
+	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
+	SDIO_SendCommand (&SDIO_CmdInitStructure);
 
-		errorstatus = CmdResp1Error (SD_CMD_SET_BLOCKLEN );
+	errorstatus = CmdResp1Error (SD_CMD_SET_BLOCKLEN );
 
-		if (SD_OK != errorstatus) {
-			return (errorstatus);
-		}
-
-		sd_cur_blocklen = BlockSize;
+	if (SD_OK != errorstatus) {
+		return (errorstatus);
 	}
 
 	SDIO_DataInitStructure.SDIO_DataTimeOut = SD_DATATIMEOUT;
@@ -1705,8 +1394,6 @@ SD_Error SD_ReadMultiBlocks (uint8_t *readbuff, uint64_t ReadAddr, uint16_t Bloc
 		return (errorstatus);
 	}
 
-	sd_cur_blocklen = BlockSize;	/* keep SD_ReadBlock's cache honest */
-
 	SDIO_DataInitStructure.SDIO_DataTimeOut = SD_DATATIMEOUT;
 	SDIO_DataInitStructure.SDIO_DataLength = NumberOfBlocks * BlockSize;
 	SDIO_DataInitStructure.SDIO_DataBlockSize = SDIO_DATABLOCKSIZE;
@@ -1805,23 +1492,16 @@ SD_Error SD_WaitReadOperation (void)
 	timeout = SD_DATATIMEOUT;
 
 	while ((DMAEndOfTransfer == 0x00) && (TransferEnd == 0) && (TransferError == SD_OK) && (timeout > 0)) {
-		moviecart_bus_pump(sd_pump_completion);
 		timeout--;
 	}
 	
 	DMAEndOfTransfer = 0x00;
 
-	/*
-	 * RXACT drain. The stock loop tested SDIO->STA in its condition — an APB2
-	 * read issued immediately after the pump returned, i.e. inside the cycle the
-	 * 6507 had just started. That is exactly what sd_wait_sta exists to avoid,
-	 * and this loop was missed when the response waits were converted. Sample
-	 * STA in the free window and test only the cached copy.
-	 *
-	 * timeout is reduced to the pass/fail verdict the code below actually uses.
-	 */
-	timeout = (sd_wait_sta_clear(SDIO_FLAG_RXACT, SD_DATATIMEOUT) &
-		   SDIO_FLAG_RXACT) ? 0u : 1u;
+	timeout = SD_DATATIMEOUT;
+
+	while (((SDIO ->STA & SDIO_FLAG_RXACT)) && (timeout > 0)) {
+		timeout--;
+	}
 
 	if (StopCondition == 1) {
 		errorstatus = SD_StopTransfer ();
@@ -1894,8 +1574,6 @@ SD_Error SD_WriteBlock (uint8_t *writebuff, uint64_t WriteAddr, uint16_t BlockSi
 	if (SD_OK != errorstatus) {
 		return (errorstatus);
 	}
-
-	sd_cur_blocklen = BlockSize;	/* keep SD_ReadBlock's cache honest */
 
 	/*!< Send CMD24 WRITE_SINGLE_BLOCK */
 	SDIO_CmdInitStructure.SDIO_Argument = (uint32_t) WriteAddr;
@@ -2007,8 +1685,6 @@ SD_Error SD_WriteMultiBlocks (uint8_t *writebuff, uint64_t WriteAddr, uint16_t B
 	if (SD_OK != errorstatus) {
 		return (errorstatus);
 	}
-
-	sd_cur_blocklen = BlockSize;	/* keep SD_ReadBlock's cache honest */
 
 	/*!< To improve performance */
 	SDIO_CmdInitStructure.SDIO_Argument = (uint32_t) (RCA << 16);
@@ -2180,15 +1856,16 @@ SD_Error SD_WaitWriteOperation (void)
 	timeout = SD_DATATIMEOUT;
 
 	while ((DMAEndOfTransfer == 0x00) && (TransferEnd == 0) && (TransferError == SD_OK) && (timeout > 0)) {
-		moviecart_bus_pump(sd_pump_completion);
 		timeout--;
 	}
 
 	DMAEndOfTransfer = 0x00;
 
-	/* TXACT drain: same fix as the RXACT one in SD_WaitReadOperation. */
-	timeout = (sd_wait_sta_clear(SDIO_FLAG_TXACT, SD_DATATIMEOUT) &
-		   SDIO_FLAG_TXACT) ? 0u : 1u;
+	timeout = SD_DATATIMEOUT;
+
+	while (((SDIO ->STA & SDIO_FLAG_TXACT)) && (timeout > 0)) {
+		timeout--;
+	}
 
 	if (StopCondition == 1) {
 		errorstatus = SD_StopTransfer ();
@@ -2398,8 +2075,6 @@ SD_Error SD_SendSDStatus (uint32_t *psdstatus)
 		return (errorstatus);
 	}
 
-	sd_cur_blocklen = 64;	/* this path programs 64; invalidate the read cache */
-
 	/*!< CMD55 */
 	SDIO_CmdInitStructure.SDIO_Argument = (uint32_t) RCA << 16;
 	SDIO_CmdInitStructure.SDIO_CmdIndex = SD_CMD_APP_CMD;
@@ -2434,21 +2109,13 @@ SD_Error SD_SendSDStatus (uint32_t *psdstatus)
 	return (errorstatus);
 	}
 
-	{
-	uint32_t fifo_timeout = SD_DATATIMEOUT;
-	while (!(SDIO ->STA & (SDIO_FLAG_RXOVERR | SDIO_FLAG_DCRCFAIL | SDIO_FLAG_DTIMEOUT | SDIO_FLAG_DBCKEND | SDIO_FLAG_STBITERR))
-	       && fifo_timeout) {
+	while (!(SDIO ->STA & (SDIO_FLAG_RXOVERR | SDIO_FLAG_DCRCFAIL | SDIO_FLAG_DTIMEOUT | SDIO_FLAG_DBCKEND | SDIO_FLAG_STBITERR))) {
 		if (SDIO_GetFlagStatus (SDIO_FLAG_RXFIFOHF) != RESET) {
 			for (count = 0; count < 8; count++) {
 				*(psdstatus + count) = SDIO_ReadData ();
 			}
 			psdstatus += 8;
 		}
-		moviecart_bus_yield();
-		fifo_timeout--;
-	}
-	if (!fifo_timeout)
-		return (SD_DATA_TIMEOUT);
 	}
 
 	if (SDIO_GetFlagStatus (SDIO_FLAG_DTIMEOUT) != RESET) {
@@ -2547,7 +2214,11 @@ static SD_Error CmdError (void)
 
 	timeout = SDIO_CMD0TIMEOUT; /*!< 10000 */
 
-	if (!(sd_wait_sta (SDIO_FLAG_CMDSENT, timeout) & SDIO_FLAG_CMDSENT)) {
+	while ((timeout > 0) && (SDIO_GetFlagStatus (SDIO_FLAG_CMDSENT) == RESET)) {
+		timeout--;
+	}
+
+	if (timeout == 0) {
 		errorstatus = SD_CMD_RSP_TIMEOUT;
 		return (errorstatus);
 	}
@@ -2569,11 +2240,14 @@ static SD_Error CmdResp7Error (void)
 	uint32_t status;
 	uint32_t timeout = SDIO_CMD0TIMEOUT;
 
-	status = sd_wait_sta (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND |
-			      SDIO_FLAG_CTIMEOUT, timeout);
+	status = SDIO ->STA;
 
-	if (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))
-	    || (status & SDIO_FLAG_CTIMEOUT)) {
+	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT)) && (timeout > 0)) {
+		timeout--;
+		status = SDIO ->STA;
+	}
+
+	if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
 		/*!< Card is not V2.0 complient or card does not support the set voltage range */
 		errorstatus = SD_CMD_RSP_TIMEOUT;
 		SDIO->ICR =  (SDIO_FLAG_CTIMEOUT);
@@ -2600,11 +2274,11 @@ static SD_Error CmdResp1Error (uint8_t cmd)
 	uint32_t status;
 	uint32_t response_r1;
 
-	status = sd_wait_sta (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND |
-			      SDIO_FLAG_CTIMEOUT, SD_STA_WAIT_MAX);
+	status = SDIO ->STA;
 
-	if (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT)))
-		return (SD_CMD_RSP_TIMEOUT);
+	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))) {
+		status = SDIO ->STA;
+	}
 
 	if (status & SDIO_FLAG_CTIMEOUT) {
 		errorstatus = SD_CMD_RSP_TIMEOUT;
@@ -2720,11 +2394,11 @@ static SD_Error CmdResp3Error (void)
         SD_Error errorstatus = SD_OK;
         uint32_t status;
 
-        status = sd_wait_sta (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND |
-			      SDIO_FLAG_CTIMEOUT, SD_STA_WAIT_MAX);
+        status = SDIO ->STA;
 
-        if (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT)))
-                return (SD_CMD_RSP_TIMEOUT);
+        while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))) {
+                status = SDIO ->STA;
+        }
 
         if (status & SDIO_FLAG_CTIMEOUT) {
                 errorstatus = SD_CMD_RSP_TIMEOUT;
@@ -2746,11 +2420,11 @@ static SD_Error CmdResp2Error (void)
 	SD_Error errorstatus = SD_OK;
 	uint32_t status;
 
-	status = sd_wait_sta (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT |
-			      SDIO_FLAG_CMDREND, SD_STA_WAIT_MAX);
+	status = SDIO ->STA;
 
-	if (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND)))
-		return (SD_CMD_RSP_TIMEOUT);
+	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND))) {
+		status = SDIO ->STA;
+	}
 
 	if (status & SDIO_FLAG_CTIMEOUT) {
 		errorstatus = SD_CMD_RSP_TIMEOUT;
@@ -2781,11 +2455,11 @@ static SD_Error CmdResp6Error (uint8_t cmd, uint16_t *prca)
 	uint32_t status;
 	uint32_t response_r1;
 
-	status = sd_wait_sta (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT |
-			      SDIO_FLAG_CMDREND, SD_STA_WAIT_MAX);
+	status = SDIO ->STA;
 
-	if (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND)))
-		return (SD_CMD_RSP_TIMEOUT);
+	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND))) {
+		status = SDIO ->STA;
+	}
 
 	if (status & SDIO_FLAG_CTIMEOUT) {
 		errorstatus = SD_CMD_RSP_TIMEOUT;
@@ -2945,11 +2619,10 @@ static SD_Error IsCardProgramming (uint8_t *pstatus)
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
 	SDIO_SendCommand (&SDIO_CmdInitStructure);
 
-	status = sd_wait_sta (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND |
-			      SDIO_FLAG_CTIMEOUT, SD_STA_WAIT_MAX);
-
-	if (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT)))
-		return (SD_CMD_RSP_TIMEOUT);
+	status = SDIO ->STA;
+		while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))) {
+		status = SDIO ->STA;
+	}
 
 	if (status & SDIO_FLAG_CTIMEOUT) {
 		errorstatus = SD_CMD_RSP_TIMEOUT;
@@ -3088,8 +2761,6 @@ static SD_Error FindSCR (uint16_t rca, uint32_t *pscr)
 		return (errorstatus);
 	}
 
-	sd_cur_blocklen = 8;	/* this path programs 8; invalidate the read cache */
-
 	/*!< Send CMD55 APP_CMD with argument as card's RCA */
 	SDIO_CmdInitStructure.SDIO_Argument = (uint32_t) RCA << 16;
 	SDIO_CmdInitStructure.SDIO_CmdIndex = SD_CMD_APP_CMD;
@@ -3126,27 +2797,11 @@ static SD_Error FindSCR (uint16_t rca, uint32_t *pscr)
 		return (errorstatus);
 	}
 
-	/*
-	 * SCR is 8 bytes and the RX FIFO is 32 words, so yielding to the Atari
-	 * inside this drain cannot overrun it. Bounded as well: an unbounded spin
-	 * here hung the whole firmware when a flag never arrived.
-	 */
-	{
-	uint32_t fifo_timeout = SD_DATATIMEOUT;
-
-	scr_dest = tempscr;
-	scr_index = 0;
-	sd_sta_cached = SDIO->STA;
-
-	while (!(sd_sta_cached & (SDIO_FLAG_RXOVERR | SDIO_FLAG_DCRCFAIL | SDIO_FLAG_DTIMEOUT | SDIO_FLAG_DBCKEND | SDIO_FLAG_STBITERR))
-	       && fifo_timeout--)
-		moviecart_bus_pump(scr_drain);
-
-	index = scr_index;
-	(void)index;
-
-	if (!fifo_timeout)
-		return (SD_DATA_TIMEOUT);
+	while (!(SDIO ->STA & (SDIO_FLAG_RXOVERR | SDIO_FLAG_DCRCFAIL | SDIO_FLAG_DTIMEOUT | SDIO_FLAG_DBCKEND | SDIO_FLAG_STBITERR))) {
+		if (SDIO_GetFlagStatus (SDIO_FLAG_RXDAVL) != RESET) {
+			*(tempscr + index) = SDIO_ReadData ();
+			index++;
+		}
 	}
 
 	if (SDIO_GetFlagStatus (SDIO_FLAG_DTIMEOUT) != RESET) {
@@ -3260,21 +2915,13 @@ SD_Error SD_HighSpeed (void)
 			return (errorstatus);
 		}
 		
-		{
-		uint32_t fifo_timeout = SD_DATATIMEOUT;
-		while (!(SDIO ->STA & (SDIO_FLAG_RXOVERR | SDIO_FLAG_DCRCFAIL | SDIO_FLAG_DTIMEOUT | SDIO_FLAG_DBCKEND | SDIO_FLAG_STBITERR))
-		       && fifo_timeout) {
+		while (!(SDIO ->STA & (SDIO_FLAG_RXOVERR | SDIO_FLAG_DCRCFAIL | SDIO_FLAG_DTIMEOUT | SDIO_FLAG_DBCKEND | SDIO_FLAG_STBITERR))) {
 			if (SDIO_GetFlagStatus (SDIO_FLAG_RXFIFOHF) != RESET) {
 				for (count = 0; count < 8; count++) {
 					*(tempbuff + count) = SDIO_ReadData ();
 				}
 				tempbuff += 8;
 			}
-			moviecart_bus_yield();
-			fifo_timeout--;
-		}
-		if (!fifo_timeout)
-			return (SD_DATA_TIMEOUT);
 		}
 
 		if (SDIO_GetFlagStatus (SDIO_FLAG_DTIMEOUT) != RESET) {
@@ -3350,15 +2997,11 @@ SD_Error SD_HighSpeed (void)
  * @retval None
  */
 void SD_LowLevel_DeInit(void) {
-	/* One-shot register/GPIO sequence; yield between groups so the run does
-	 * not exceed a single Atari cycle and drop a fetch. */
 	/*!< Disable SDIO Clock */
 	SDIO_ClockCmd(DISABLE);
 
 	/*!< Set Power State to OFF */
 	SDIO_SetPowerState(SDIO_PowerState_OFF);
-
-	moviecart_bus_yield();
 
 	/*!< DeInitializes the SDIO peripheral */
 	SDIO_DeInit();
@@ -3366,16 +3009,16 @@ void SD_LowLevel_DeInit(void) {
 	/* Disable the SDIO APB2 Clock */
 	RCC->APB2ENR &= ~RCC_APB2ENR_SDIOEN;
 
-	moviecart_bus_yield();
-
-	sd_pin_release(GPIOC, 8u);
 #if FATFS_SDIO_4BIT == 1
-	sd_pin_release(GPIOC, 9u);
-	sd_pin_release(GPIOC, 10u);
-	sd_pin_release(GPIOC, 11u);
+	TM_GPIO_DeInit(GPIOC, GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12);
+	TM_GPIO_SetPullResistor(GPIOC, GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12, TM_GPIO_PuPd_DOWN);
+#else
+	TM_GPIO_DeInit(GPIOC, GPIO_PIN_8 | GPIO_PIN_12);
+	TM_GPIO_SetPullResistor(GPIOC, GPIO_PIN_8 | GPIO_PIN_12, TM_GPIO_PuPd_DOWN);
 #endif
-	sd_pin_release(GPIOC, 12u);
-	sd_pin_release(GPIOD, 2u);
+	
+	TM_GPIO_DeInit(GPIOD, GPIO_PIN_2);
+	TM_GPIO_SetPullResistor(GPIOD, GPIO_PIN_2, TM_GPIO_PuPd_DOWN);
 }
 
 /**
@@ -3385,28 +3028,22 @@ void SD_LowLevel_DeInit(void) {
  * @retval None
  */
 void SD_LowLevel_Init (void) {
-	/* GPIOC/GPIOD clocks (GPIOD already on for the Atari data bus). */
-	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN | RCC_AHB1ENR_GPIODEN;
-
-	moviecart_bus_yield();
-
-	/* D0 (and D1-D3 in 4-bit): pull-ups. CK (PC12): no pull. CMD (PD2): pull-up. */
-	sd_pin_af(GPIOC, 8u, 1u);
 #if FATFS_SDIO_4BIT == 1
-	sd_pin_af(GPIOC, 9u, 1u);
-	sd_pin_af(GPIOC, 10u, 1u);
-	sd_pin_af(GPIOC, 11u, 1u);
+	/* D0-D3: pull-ups; CK (PC12): no pull */
+	TM_GPIO_InitAlternate(GPIOC, GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11, TM_GPIO_OType_PP, TM_GPIO_PuPd_UP, TM_GPIO_Speed_Fast, GPIO_AF_SDIO);
+	TM_GPIO_InitAlternate(GPIOC, GPIO_PIN_12, TM_GPIO_OType_PP, TM_GPIO_PuPd_NOPULL, TM_GPIO_Speed_Fast, GPIO_AF_SDIO);
+#else
+	TM_GPIO_InitAlternate(GPIOC, GPIO_PIN_8, TM_GPIO_OType_PP, TM_GPIO_PuPd_UP, TM_GPIO_Speed_Fast, GPIO_AF_SDIO);
+	TM_GPIO_InitAlternate(GPIOC, GPIO_PIN_12, TM_GPIO_OType_PP, TM_GPIO_PuPd_NOPULL, TM_GPIO_Speed_Fast, GPIO_AF_SDIO);
 #endif
-	sd_pin_af(GPIOC, 12u, 0u);
-	sd_pin_af(GPIOD, 2u, 1u);
+
+	TM_GPIO_InitAlternate(GPIOD, GPIO_PIN_2, TM_GPIO_OType_PP, TM_GPIO_PuPd_UP, TM_GPIO_Speed_Fast, GPIO_AF_SDIO);
 
 	/* Enable the SDIO APB2 Clock */
 	RCC->APB2ENR |= RCC_APB2ENR_SDIOEN;
 
 	/* Enable the DMA2 Clock */
 	RCC->AHB1ENR |= SD_SDIO_DMA_CLK;
-
-	moviecart_bus_yield();
 }
 
 /**
@@ -3438,8 +3075,8 @@ void SD_LowLevel_DMA_TxConfig (uint32_t *BufferSRC, uint32_t BufferSize) {
 	SDDMA_InitStructure.DMA_Mode = DMA_Mode_Normal;
 	SDDMA_InitStructure.DMA_Priority = DMA_Priority_VeryHigh;
 	SDDMA_InitStructure.DMA_FIFOMode = DMA_FIFOMode_Enable;
-	SDDMA_InitStructure.DMA_FIFOThreshold = DMA_FIFOThreshold_HalfFull;
-	SDDMA_InitStructure.DMA_MemoryBurst = DMA_MemoryBurst_Single;
+	SDDMA_InitStructure.DMA_FIFOThreshold = DMA_FIFOThreshold_HalfFull; /* DMA_FIFOThreshold_Full */
+	SDDMA_InitStructure.DMA_MemoryBurst = DMA_MemoryBurst_Single; /* DMA_MemoryBurst_INC4 */
 	SDDMA_InitStructure.DMA_PeripheralBurst = DMA_PeripheralBurst_INC4;
 	DMA_Init (SD_SDIO_DMA_STREAM, &SDDMA_InitStructure);
 	DMA_ITConfig (SD_SDIO_DMA_STREAM, DMA_IT_TC, ENABLE);
@@ -3454,65 +3091,17 @@ void SD_LowLevel_DMA_TxConfig (uint32_t *BufferSRC, uint32_t BufferSize) {
  * @param  BufferSize: buffer size
  * @retval None
  */
-/*
- * Per-sector DMA setup must be tiny.
- *
- * The stock sequence is DMA_ClearFlag, DMA_Cmd(DISABLE), DMA_DeInit, DMA_Init,
- * DMA_ITConfig, DMA_FlowControllerConfig, DMA_Cmd(ENABLE) — dozens of register
- * accesses plus DMA_DeInit's spin waiting for EN to clear, and it ran on *every*
- * sector with yields only *between* the calls, never inside them. Each call is
- * therefore microseconds of straight-line work with the Atari unserved, and the
- * coarse sweep says a single missed cart fetch is enough to garble the picture.
- * That is the per-sector risk the failure gradient was measuring.
- *
- * Nothing about the stream's configuration changes from sector to sector except
- * the destination address, so do the full init once and afterwards touch only
- * what must change, with a yield between individual register writes. Everything
- * else — channel, direction, burst, FIFO, TC interrupt, peripheral flow control —
- * survives a disable/enable untouched.
- */
-static uint8_t sd_dma_rx_ready;
-
 void SD_LowLevel_DMA_RxConfig (uint32_t *BufferDST, uint32_t BufferSize)
 {
 	DMA_InitTypeDef SDDMA_InitStructure;
-
-	if (sd_dma_rx_ready) {
-		DMA_Cmd(SD_SDIO_DMA_STREAM, DISABLE);
-		moviecart_bus_yield();
-
-		/* Serve the bus while the stream winds down, rather than spinning. */
-		while (SD_SDIO_DMA_STREAM->CR & (uint32_t)DMA_SxCR_EN)
-			moviecart_bus_yield();
-
-		DMA_ClearFlag(SD_SDIO_DMA_STREAM, SD_SDIO_DMA_FLAG_FEIF |
-			      SD_SDIO_DMA_FLAG_DMEIF | SD_SDIO_DMA_FLAG_TEIF |
-			      SD_SDIO_DMA_FLAG_HTIF | SD_SDIO_DMA_FLAG_TCIF);
-		moviecart_bus_yield();
-
-		SD_SDIO_DMA_STREAM->M0AR = (uint32_t)BufferDST;
-		moviecart_bus_yield();
-
-		DMA_Cmd(SD_SDIO_DMA_STREAM, ENABLE);
-		return;
-	}
 
 	DMA_ClearFlag(SD_SDIO_DMA_STREAM, SD_SDIO_DMA_FLAG_FEIF | SD_SDIO_DMA_FLAG_DMEIF | SD_SDIO_DMA_FLAG_TEIF | SD_SDIO_DMA_FLAG_HTIF | SD_SDIO_DMA_FLAG_TCIF);
 
 	/* DMA2 Stream3  or Stream6 disable */
 	DMA_Cmd(SD_SDIO_DMA_STREAM, DISABLE);
 
-	/*
-	 * DMA_DeInit/DMA_Init are long register sequences, so yield around them. No
-	 * transfer is in flight here and the DPSM is not started yet, so serving the
-	 * Atari in between is harmless. This runs once now, not per sector.
-	 */
-	moviecart_bus_yield();
-
 	/* DMA2 Stream3 or Stream6 Config */
 	DMA_DeInit(SD_SDIO_DMA_STREAM);
-
-	moviecart_bus_yield();
 
 	SDDMA_InitStructure.DMA_Channel = SD_SDIO_DMA_CHANNEL;
 	SDDMA_InitStructure.DMA_PeripheralBaseAddr = (uint32_t) SDIO_FIFO_ADDRESS;
@@ -3524,20 +3113,6 @@ void SD_LowLevel_DMA_RxConfig (uint32_t *BufferDST, uint32_t BufferSize)
 	SDDMA_InitStructure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Word;
 	SDDMA_InitStructure.DMA_MemoryDataSize = DMA_MemoryDataSize_Word;
 	SDDMA_InitStructure.DMA_Mode = DMA_Mode_Normal;
-	/*
-	 * Do not "de-prioritise" the DMA to protect the Atari bus. It was tried:
-	 * DMA_Priority_Low with single-beat transfers on both ports took SD_STAGE=2
-	 * from ~25% to never working. Two reasons, both worth keeping in mind:
-	 *
-	 *  - DMA_Priority arbitrates between DMA *streams*. CPU-versus-DMA arbitration
-	 *    happens in the bus matrix and is not configurable here, so the setting
-	 *    does nothing for the contention it was supposed to fix.
-	 *  - Single-beat transfers replace 32 four-beat bursts with 128 individual AHB
-	 *    transactions per sector. Each is shorter, but there are four times as
-	 *    many arbitration points, and total interference went up.
-	 *
-	 * Fewer, longer transactions are the better trade here. Bursts stay.
-	 */
 	SDDMA_InitStructure.DMA_Priority = DMA_Priority_VeryHigh;
 	SDDMA_InitStructure.DMA_FIFOMode = DMA_FIFOMode_Enable;
 	SDDMA_InitStructure.DMA_FIFOThreshold = DMA_FIFOThreshold_Full;
@@ -3547,11 +3122,7 @@ void SD_LowLevel_DMA_RxConfig (uint32_t *BufferDST, uint32_t BufferSize)
 	DMA_ITConfig (SD_SDIO_DMA_STREAM, DMA_IT_TC, ENABLE);
 	DMA_FlowControllerConfig (SD_SDIO_DMA_STREAM, DMA_FlowCtrl_Peripheral);
 
-	moviecart_bus_yield();
-
 	/* DMA2 Stream3 or Stream6 enable */
 	DMA_Cmd(SD_SDIO_DMA_STREAM, ENABLE);
-
-	sd_dma_rx_ready = 1;
 }
 

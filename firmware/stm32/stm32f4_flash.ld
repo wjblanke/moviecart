@@ -201,18 +201,18 @@ SECTIONS
   } >RAM
 
   /*
-   * DMA-target buffers live in SRAM2, a different bus-matrix slave than the
-   * SRAM1 that holds the kernel buffers and stack. This lets an SD sector DMA
-   * run without stalling the per-cycle bus_dispatch. NOLOAD: uninitialized,
-   * the DMA fills it before it is read.
+   * SRAM2 (0x2001C000, 16 K): every SD DMA destination (both field buffers and
+   * the FAT scratch sector). SRAM1 keeps the stack, r_coreInfo and the dispatch
+   * table, so DMA cannot stall the CPU. NOLOAD: uninitialized; DMA / the title
+   * loader fill them before they are read.
    */
   .sram2 (NOLOAD) :
   {
-    . = ALIGN(4);
+    . = ALIGN(16);
     _ssram2 = .;
     *(.sram2)
     *(.sram2*)
-    . = ALIGN(4);
+    . = ALIGN(16);
     _esram2 = .;
   } >RAM2
 

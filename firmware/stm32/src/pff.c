@@ -369,10 +369,17 @@ bool pf_seek_block (
 //-----------------------------------------------------------------------
 
 
-void
+bool
 pf_read_block(uint8_t *dst)
 {
-	disk_read_block2(fsInfo.file_block++, dst);
+	return disk_read_block2(fsInfo.file_block++, dst);
+}
+
+/* The absolute sector the next pf_read_block() will fetch (valid after a seek). */
+uint32_t
+pf_current_sector(void)
+{
+	return fsInfo.file_block;
 }
 
 bool

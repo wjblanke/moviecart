@@ -33,14 +33,23 @@
 #include "update.h"
 #include "title_data.h"
 #include "sd_reader.h"
+#include "tm_stm32f4_delay.h"
 
 extern struct coreInfo r_coreInfo;
 extern struct fileSystemInfo fsInfo;
 extern struct queueInfo qinfo;
 
 struct stateVars state;
-uint8_t mr_buffer1[FIELD_SIZE] __attribute__((aligned(4)));
-uint8_t mr_buffer2[FIELD_SIZE] __attribute__((aligned(4)));
+/*
+ * Both field buffers live in SRAM2, the opposite AHB slave from the CPU's
+ * stack, r_coreInfo, and the dispatch table in SRAM1. SD DMA only ever writes
+ * SRAM2, so it cannot stall instruction/stack traffic even while a transfer is
+ * in flight. bus_dispatch still reads the live field out of SRAM2 during
+ * display; that is a different slave from the stack, so those two do not
+ * contend with each other either.
+ */
+uint8_t mr_buffer1[FIELD_SIZE] __attribute__((aligned(16), section(".sram2")));
+uint8_t mr_buffer2[FIELD_SIZE] __attribute__((aligned(16), section(".sram2")));
 
 void updateInit(void);
 
@@ -426,6 +435,45 @@ run_interleave_proof(void)
 }
 #endif /* MOVIECART_STALL_TEST */
 
+static __attribute__((noreturn)) void fatalBlink(uint8_t code);
+
+#if MOVIECART_WAITCART_PROOF
+/*
+ * Prove the handoff before trusting it with the SD path.
+ *
+ * Burns a millisecond — the scale of a real field read — while serving the bus
+ * absolutely nothing. Under the old cooperative model this is far beyond the
+ * measured budget and would garble the picture outright; with the console parked
+ * in RAM it should be invisible. Expect 1 flash, 2 flashes, then a clean title
+ * screen and the kernel's once-per-second heartbeat.
+ */
+static void
+waitcart_proof_work(void)
+{
+	uint32_t start = DWT->CYCCNT;
+	uint32_t limit = SystemCoreClock / 1000u;	/* 1 ms */
+
+	while ((DWT->CYCCNT - start) < limit)
+		;
+}
+
+static __attribute__((noreturn)) void
+run_waitcart_proof(void)
+{
+	if (!wait_title_sync(3000u))
+		fatalBlink(6);
+	flash_led(1);
+
+	mc_wait_install();
+	flash_led(2);
+
+	for (;;) {
+		waitEndFrame();
+		mc_wait_handoff(waitcart_proof_work);
+	}
+}
+#endif
+
 static __attribute__((noreturn)) void
 fatalBlink(uint8_t code)
 {
@@ -435,33 +483,108 @@ fatalBlink(uint8_t code)
 }
 
 /*
+ * One specific finding gets a pattern instead of a count: a long 2 s on, short
+ * off. It means the failed field read succeeded when repeated into the SRAM2
+ * scratch buffer, i.e. the SRAM1 field buffer is the bad DMA target rather than a
+ * wrong-sector computation. Counting flashes by eye is unreliable, and this result
+ * is too important to risk misreading — it decides which layer to fix.
+ */
+static __attribute__((noreturn)) void
+fatalStrobe(void)
+{
+	__disable_irq();
+	mc_led_host = 1;
+	for (;;) {
+		TESTA0_LOW;
+		led_wait_ms(2000);
+		TESTA0_HIGH;
+		led_wait_ms(400);
+	}
+}
+
+/*
+ * Was the field readable into SRAM2 but not SRAM1?
+ *
+ * Re-reads the exact sector the failed field read used, this time into the SRAM2
+ * scratch buffer (disk_read_block1). The raw read path is identical; only the DMA
+ * destination region differs. The two outcomes need opposite fixes:
+ *
+ *   valid MVC\0 in scratch  -> the sector is right and the read works; the SRAM1
+ *                              field buffer is a bad DMA target (contention or a
+ *                              coherency gap against the per-cycle bus_dispatch).
+ *   wrong in scratch too    -> we computed the wrong sector; the FAT walk / seek is
+ *                              at fault, and the destination region is innocent.
+ *
+ * Caller must re-seek first so pf_current_sector() names the field's first sector.
+ */
+static int
+field_reads_ok_in_scratch(uint32_t offset)
+{
+	pf_seek_block(offset);
+	const uint8_t *scratch = disk_read_block1(pf_current_sector());
+	return memcmp(scratch, "MVC\0", 4) == 0;
+}
+
+/*
  * Boot progress on the status LED. Every blink keeps serving the bus, so these
  * are free to leave in: they are the only way to tell how far boot got when the
  * picture itself is unusable.
  *
  *   1  title synchronized    5  mount failed
  *   2  card mounted          6  title never synchronized
- *   3  movie file opened     7  bad field header or size
- *   4  first field valid     8  no playable file found
+ *   3  movie file opened     8  no playable file found
+ *   4  first field valid
+ *
+ * Field faults (title probe and every playback frame) were all reported as a
+ * single "7", which hid which of three different things went wrong. They are now
+ * split, because they point at different layers:
+ *
+ *   7   field header wrong ("MVC\0" missing) — wrong bytes, right length
+ *   9   field geometry invalid (visibleLines / numBlocks out of range)
+ *   10  sector read failed after DISK_READ_RETRIES — the card/read path, not
+ *       the data. Previously this hung silently on the last good frame; that is
+ *       the readable-diagnostic rule, so it now has a code.
+ *
+ * One result is a *pattern* rather than a count — a long 2 s strobe means the same
+ * sector read cleanly into the SRAM2 scratch buffer, so the SRAM1 field buffer is
+ * the bad DMA target, not the sector computation. See fatalStrobe().
  *
  * MOVIECART_SD_STAGE stops after a chosen milestone and hands the bus back to
  * the plain title loop, so a failure can be bisected one step at a time instead
  * of guessing which layer starved the bus.
  */
+#define BLINK_FIELD_HEADER	7u
+#define BLINK_FIELD_GEOMETRY	9u
+#define BLINK_SECTOR_READ	10u
+
+static bool disk_mount_ok;
+static bool disk_open_ok;
+
+static void
+mount_work(void)
+{
+	disk_mount_ok = pf_mount();
+}
+
+static void
+open_work(void)
+{
+	disk_open_ok = pf_open_file(&state.i_numFrames, 1);
+}
+
 static void
 setupDisk(void)
 {
 #if MOVIECART_SD_STAGE == 1
 	emulate_cartridge();
 #endif
-	if (!pf_mount())
+	mc_wait_handoff(mount_work);
+	if (!disk_mount_ok)
 		fatalBlink(5);
 	flash_led(2);
 
 #if MOVIECART_SD_STAGE == 2
 #if MOVIECART_GAP_PROBE
-	/* pf_mount has now read the MBR/boot sector/FAT, so the worst gap has
-	 * seen the real per-sector read path (regions 6-8), not just init. */
 	mc_probe_report();
 #else
 	emulate_cartridge();
@@ -469,7 +592,8 @@ setupDisk(void)
 #endif
 	state.io_frameNumber = 1;
 	state.io_bits &= ~STATE_PLAYING;
-	if (!pf_open_file(&state.i_numFrames, 1))
+	mc_wait_handoff(open_work);
+	if (!disk_open_ok)
 		fatalBlink(8);
 	flash_led(3);
 
@@ -478,7 +602,62 @@ setupDisk(void)
 #endif
 }
 
-static bool
+/* Seek to a field and load it. 0 on success, else the LED code for the fault. */
+static uint8_t
+loadField(struct frameInfo *fInfo, uint32_t offset)
+{
+	uint8_t *dst = fInfo->buffer;
+
+	pf_seek_block(offset);
+
+	if (!pf_read_block(dst))
+		return BLINK_SECTOR_READ;
+	dst += 512;
+
+	/* Every field starts with "MVC\0". Reject a bad sector/header before its
+	 * geometry can turn into an out-of-bounds DMA destination below. */
+	if (memcmp(fInfo->buffer, "MVC\0", 4) != 0)
+		return BLINK_FIELD_HEADER;
+
+	frameInit(fInfo);
+	if (!fInfo->visibleLines || !fInfo->numBlocks ||
+	    fInfo->numBlocks > FIELD_MAX_BLOCKS)
+		return BLINK_FIELD_GEOMETRY;
+
+	int nb = fInfo->numBlocks - 1;
+	while (nb) {
+		if (!pf_read_block(dst))
+			return BLINK_SECTOR_READ;
+		dst += 512;
+		nb--;
+	}
+
+	return 0;
+}
+
+/*
+ * A field that fails validation is retried against fresh reads.
+ *
+ * "Read reported success but the header is wrong" has exactly two shapes: the
+ * sector we computed was the wrong one (a bad FAT sector gives get_fat a bogus
+ * cluster, and nothing validates it), or the right sector's data never landed in
+ * the buffer. Retrying after dropping both sector caches re-walks the FAT *and*
+ * re-reads the data, so it covers both — and the outcome separates them:
+ *
+ *   playback continues (heartbeat shows 5) -> the fault was transient; a re-read
+ *                                            fixes it, so the bytes, not the
+ *                                            arithmetic, were at fault.
+ *   still code 7 after every attempt       -> the computed sector is genuinely
+ *                                            wrong every time; a deterministic
+ *                                            seek/FAT-walk fault, not a read.
+ *
+ * The cache invalidation is what makes this a real retry: keyed on (sector, dst),
+ * the caches would otherwise hand back the same bytes that just failed and the
+ * retry would prove nothing.
+ */
+#define FIELD_LOAD_ATTEMPTS	4
+
+static uint8_t
 prepareNextFrame(void)
 {
 	struct frameInfo *fInfo;
@@ -488,33 +667,24 @@ prepareNextFrame(void)
 	else
 		fInfo = &r_coreInfo.mr_frameInfo2;
 
-	uint8_t *dst = fInfo->buffer;
 	uint32_t offset = (uint32_t)(state.io_frameNumber * FIELD_NUM_BLOCKS);
+	uint8_t fault = 0;
 
-	pf_seek_block(offset);
+	for (int attempt = 0; attempt < FIELD_LOAD_ATTEMPTS; attempt++) {
+		fault = loadField(fInfo, offset);
+		if (!fault)
+			break;
 
-	pf_read_block(dst);
-	dst += 512;
-
-	/* Every field starts with "MVC\0". Reject a bad sector/header before its
-	 * geometry can turn into an out-of-bounds DMA destination below. */
-	if (memcmp(fInfo->buffer, "MVC\0", 4) != 0)
-		return false;
-
-	frameInit(fInfo);
-	if (!fInfo->visibleLines || !fInfo->numBlocks ||
-	    fInfo->numBlocks > FIELD_MAX_BLOCKS)
-		return false;
-
-	int nb = fInfo->numBlocks - 1;
-	while (nb) {
-		pf_read_block(dst);
-		dst += 512;
-		nb--;
+		mc_diag_note(DIAG_FIELD_RETRY);
+		disk_read_invalidate();
+		moviecart_bus_yield();
 	}
 
+	if (fault)
+		return fault;
+
 	updateBuffer(&state, fInfo);
-	return true;
+	return 0;
 }
 
 static void
@@ -529,15 +699,33 @@ coreInfoToState(void)
 	state.i_inpt4 &= state.i_inpt5;
 }
 
+static uint32_t title_offset;
+static uint8_t *title_dst;
+static uint8_t title_probe_fault;	/* 0 ok, else BLINK_* or 0xff for strobe */
+
+static void
+title_probe_work(void)
+{
+	pf_seek_block(title_offset);
+	if (!pf_read_block(title_dst)) {
+		title_probe_fault = BLINK_SECTOR_READ;
+		return;
+	}
+	if (memcmp(title_dst, "MVC\0", 4) != 0) {
+		title_probe_fault = field_reads_ok_in_scratch(title_offset)
+			? 0xffu : BLINK_FIELD_HEADER;
+		return;
+	}
+	title_probe_fault = 0;
+}
+
 static void
 runTitle(void)
 {
 	uint16_t m_titleFrame = 300;
 
 	state.io_frameNumber = 1;
-	uint32_t offset = (uint32_t)(state.io_frameNumber * FIELD_NUM_BLOCKS);
-
-	pf_seek_block(offset);
+	title_offset = (uint32_t)(state.io_frameNumber * FIELD_NUM_BLOCKS);
 
 	waitEndFrame();
 	if (!r_coreInfo.mr_bufferIndex)
@@ -550,15 +738,17 @@ runTitle(void)
 	 */
 	struct frameInfo fInfo;
 	fInfo.buffer = r_coreInfo.mr_frameInfo1.colorBuf;
-	pf_read_block(fInfo.buffer);
-
-	if (memcmp(fInfo.buffer, "MVC\0", 4) != 0)
-		fatalBlink(7);
+	title_dst = fInfo.buffer;
+	mc_wait_handoff(title_probe_work);
+	if (title_probe_fault == 0xffu)
+		fatalStrobe();
+	if (title_probe_fault)
+		fatalBlink(title_probe_fault);
 
 	frameInit(&fInfo);
 	if (!fInfo.visibleLines || !fInfo.numBlocks ||
 	    fInfo.numBlocks > FIELD_MAX_BLOCKS)
-		fatalBlink(7);
+		fatalBlink(BLINK_FIELD_GEOMETRY);
 	uint8_t fileVis = fInfo.visibleLines;
 
 	flash_led(4);
@@ -602,6 +792,14 @@ clearFieldBuffers(void)
 	}
 }
 
+static int select_which;
+
+static void
+select_open_work(void)
+{
+	disk_open_ok = pf_open_file(&state.i_numFrames, select_which);
+}
+
 static void
 checkSelectVideo(int *which)
 {
@@ -610,8 +808,13 @@ checkSelectVideo(int *which)
 		state.io_bits &= ~STATE_END;
 
 		(*which)++;
-		while (!pf_open_file(&state.i_numFrames, *which))
+		for (;;) {
+			select_which = *which;
+			mc_wait_handoff(select_open_work);
+			if (disk_open_ok)
+				break;
 			*which = 1;
+		}
 
 		qinfo.head = 0;
 		for (int i = 0; i < QUEUE_SIZE; i++) {
@@ -633,6 +836,15 @@ checkSelectVideo(int *which)
 	coreInfoToState();
 }
 
+/* Set by the field load so it can run as a plain callback under the handoff. */
+static uint8_t frame_fault;
+
+static void
+loadFrameWork(void)
+{
+	frame_fault = prepareNextFrame();
+}
+
 static void
 runFrameLoop(void)
 {
@@ -651,8 +863,17 @@ runFrameLoop(void)
 		 */
 		checkSelectVideo(&which);
 		updateTransport(&state);
-		if (!prepareNextFrame())
-			fatalBlink(7);
+
+		/*
+		 * The field is read with the console parked in RAM for part of the
+		 * vertical blank, so the read owns the CPU outright instead of
+		 * squeezing between Atari cycles. Falls back to a direct call if
+		 * the routine was never installed.
+		 */
+		frame_fault = 0;
+		mc_wait_handoff(loadFrameWork);
+		if (frame_fault)
+			fatalBlink(frame_fault);
 	}
 }
 
@@ -664,6 +885,14 @@ main(void)
 	config_status_led();
 	dwt_init();
 
+	/*
+	 * Mask IRQs before the 6507 starts fetching, then set up SysTick so
+	 * Delayms works once a WaitCart handoff re-enables them. TM_DELAY_Init
+	 * programs the timer; the handler does not run until __enable_irq().
+	 */
+	__disable_irq();
+	TM_DELAY_Init();
+
 	/* Everything the kernel dispatch touches must be valid before serving
 	 * starts, but nothing slow may run before the drain: the console's RC
 	 * reset releases the 6507 a few tens of ms after power-on, and its
@@ -672,7 +901,9 @@ main(void)
 	setupTitleBuffers();
 	loadTitlePixels();
 
-#if MOVIECART_STALL_TEST == 3
+#if MOVIECART_WAITCART_PROOF
+	run_waitcart_proof();
+#elif MOVIECART_STALL_TEST == 3
 	run_interleave_proof();
 #elif MOVIECART_STALL_TEST
 	run_stall_sweep();
@@ -681,6 +912,23 @@ main(void)
 	if (!wait_title_sync(3000u))
 		fatalBlink(6);
 	flash_led(1);
+
+#if MOVIECART_WAITCART
+	/*
+	 * Install before any SD access: mount and open then get the same free
+	 * window the per-frame field reads use.
+	 */
+	mc_wait_install();
+	/*
+	 * Same settle the proof used after copy (flash_led(2) is ~0.6 s of
+	 * serving). Then solid LED for mount:
+	 *   picture + solid  = ARMED never reached $FFEC
+	 *   black + solid    = parked, mount not returning
+	 */
+	led_wait_frames(36);
+	mc_led_host = 1;
+	TESTA0_LOW;
+#endif
 
 	setupDisk();
 

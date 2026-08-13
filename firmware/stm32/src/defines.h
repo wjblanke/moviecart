@@ -66,6 +66,43 @@
  *                    fixed-per-read-cost model; retained only to reproduce that
  *                    ablation.
  */
+/*
+ * Per-sector DMA setup: retarget fast path (1, default) or full re-init (0).
+ *
+ * The fast path skips DMA_DeInit/DMA_Init and only rewrites M0AR before
+ * re-enabling the stream. It was suspected of landing reads in the wrong buffer,
+ * because the failure appears exactly at the first read whose destination differs
+ * from the scratch diskBuffer. That suspicion was tested and *cleared*: with the
+ * fast path on, the field's MVC\0 was not found in the scratch buffer either
+ * (no misdirect), and with full re-init the header was still wrong (correctness
+ * unchanged) while SD_STAGE=2 fell from ~7/10 to ~2/10 (timing worse). Full
+ * re-init costs more per sector and fixes nothing, so the fast path stays default.
+ */
+#ifndef MOVIECART_SD_DMA_FASTPATH
+#define MOVIECART_SD_DMA_FASTPATH	1
+#endif
+
+/*
+ * WaitCart handoff (make WAITCART=0 to disable).
+ *
+ * Park the 6502 in a routine running from Atari RAM for part of the vertical
+ * blank, so it stops fetching from the cartridge and the field read can own the
+ * CPU. This replaces the strategy of interleaving SD work into spare Atari
+ * cycles, which the stall measurements never supported: the per-cycle budget is
+ * around 100 ns and a field is hundreds of sectors.
+ *
+ * With this off, mc_wait_handoff() simply calls its work function directly and
+ * the old cooperative path is unchanged. See core.c for the protocol.
+ */
+#ifndef MOVIECART_WAITCART
+#define MOVIECART_WAITCART		1
+#endif
+
+/* make WAITCART_PROOF=1: handoff exercised with a 1 ms stall and no SD code. */
+#ifndef MOVIECART_WAITCART_PROOF
+#define MOVIECART_WAITCART_PROOF	0
+#endif
+
 #ifndef MOVIECART_SD_SKIP_CARD_READY
 #define MOVIECART_SD_SKIP_CARD_READY	0
 #endif
@@ -80,25 +117,11 @@
 #define SDIO_TRANSFER_CLK_DIV		((uint8_t)MOVIECART_SD_POLL_CLKDIV)
 #else
 /*
- * Transfer clock for the DMA path (make DMA_CLKDIV=...).
- *
- * Faster is *safer* here, which is the opposite of the intuition that guided the
- * original 0x08 (4.8 MHz). With DMA the hardware drains the FIFO while we serve the
- * Atari, so the clock does not have to match anything we do — it only decides how
- * long a sector takes, and therefore how many served cycles run inside the SD code
- * with its slightly elevated per-cycle risk:
- *
- *   div 0x08 (4.8 MHz) -> ~213 us per 512 B sector
- *   div 0x02 (12 MHz)  -> ~85 us
- *   div 0x00 (24 MHz)  -> ~43 us
- *
- * The failure signature is a jammed 6507 (vertical bars), i.e. bus starvation, not
- * an SD error — so shrinking the exposure window is the lever, and slowing the card
- * down was making it worse. 24 MHz is within the 25 MHz default-speed limit and the
- * driver's own default is 16 MHz.
+ * UnoCart's DevEBox clock: SDIO_CK = 48 MHz / (div + 2). 0x04 ≈ 8 MHz is what
+ * that firmware uses on this board. Override with make DMA_CLKDIV=...
  */
 #ifndef MOVIECART_SD_DMA_CLKDIV
-#define MOVIECART_SD_DMA_CLKDIV		0x08
+#define MOVIECART_SD_DMA_CLKDIV		0x04
 #endif
 #define SDIO_TRANSFER_CLK_DIV		((uint8_t)MOVIECART_SD_DMA_CLKDIV)
 #endif

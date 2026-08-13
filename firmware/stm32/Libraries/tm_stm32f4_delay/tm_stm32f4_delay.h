@@ -280,25 +280,17 @@ static __INLINE void Delay(uint32_t micros) {
  * @note   Declared as static inline
  */
 static __INLINE void Delayms(uint32_t millis) {
-	volatile uint32_t timer = TM_Time;
+	/*
+	 * Busy-wait on DWT, not SysTick. The stock version spins on TM_Time, which
+	 * only advances in SysTick_Handler. MovieCart parks the 6502 and enables
+	 * IRQs for SD init; if that tick is late or the handler is the weak
+	 * Default_Handler, Delayms never returns and the LED never reaches "mounted".
+	 */
+	uint32_t start = DWT->CYCCNT;
+	uint32_t ticks = millis * (SystemCoreClock / 1000u);
 
-	/* Called from thread */
-	if (!__get_IPSR()) {
-		/* Wait for timer to count milliseconds */
-		while ((TM_Time - timer) < millis) {
-#ifdef DELAY_SLEEP
-			/* Go sleep, wait systick interrupt */
-			__WFI();
-#endif
-		}
-	} else {
-		/* Called from interrupt */
-		while (millis) {
-			if (SysTick->CTRL & SysTick_CTRL_COUNTFLAG_Msk) {
-				millis--;
-			}
-		}
-	}
+	while ((DWT->CYCCNT - start) < ticks)
+		;
 }
 
 /**

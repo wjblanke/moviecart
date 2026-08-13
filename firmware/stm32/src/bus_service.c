@@ -156,9 +156,18 @@ bus_serve_cycle(void)
  * silences the diagnostics, which is the same trade already made for the LED
  * blinks: a diagnostic that damages the system it measures is worse than none.
  */
+/*
+ * During a WaitCart handoff the 6502 is executing from Atari RAM and makes no
+ * cartridge fetches, so there is nothing to serve and every yield is pure
+ * overhead. Returning immediately is what lets the unmodified SDIO driver run at
+ * full speed: its busy-waits keep calling these, and here they cost nothing.
+ */
 void
 moviecart_bus_yield(void)
 {
+	if (mc_wait_state == MC_WAIT_RUNNING)
+		return;
+
 	bus_serve_cycle();
 }
 
@@ -224,6 +233,13 @@ HOTFUNC void
 moviecart_bus_pump(void (*work)(void))
 {
 	uint16_t addr;
+
+	/* Handoff in progress: no cart fetches to catch, so just make progress. */
+	if (mc_wait_state == MC_WAIT_RUNNING) {
+		if (work)
+			work();
+		return;
+	}
 
 	probe_enter();
 	while ((addr = ADDR_IN) != serve_addr_prev)
