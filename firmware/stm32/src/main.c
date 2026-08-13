@@ -155,6 +155,20 @@ flash_led_slow(uint8_t num)
 	 * be interleaved with the heartbeat between repeats. */
 }
 
+/*
+ * Milestone codes are wall-clock timed too, for the same reason the failure
+ * codes are: a milestone is reported at exactly the moment the thing it reports
+ * on might have broken the kernel. Frame-timed, a blink that begins with the LED
+ * lit and then loses the kernel never reaches its TESTA0_HIGH — waitEndFrame
+ * spins forever on an mr_endFrame that has stopped arriving. That is read from
+ * hardware as "two flashes with the LED remaining on", which hides whether the
+ * next milestone was reached at all. DWT does not care whether the display is
+ * alive, and led_wait_ms samples it once per 256 serves, so the hot loop stays
+ * as cheap as the frame-timed version's.
+ */
+#define LED_MS_ON	150u
+#define LED_MS_GAP	300u
+
 static void
 flash_led(uint8_t num)
 {
@@ -162,12 +176,12 @@ flash_led(uint8_t num)
 	TESTA0_HIGH;
 	for (uint8_t i = 0; i < num; i++) {
 		TESTA0_LOW;
-		led_wait_frames(LED_FRAMES_ON);
+		led_wait_ms(LED_MS_ON);
 		TESTA0_HIGH;
-		led_wait_frames(LED_FRAMES_ON);
+		led_wait_ms(LED_MS_ON);
 	}
 	TESTA0_HIGH;
-	led_wait_frames(LED_FRAMES_GAP);
+	led_wait_ms(LED_MS_GAP);
 	mc_led_host = 0;
 }
 
@@ -436,6 +450,7 @@ run_interleave_proof(void)
 #endif /* MOVIECART_STALL_TEST */
 
 static __attribute__((noreturn)) void fatalBlink(uint8_t code);
+static __attribute__((noreturn)) void fatalHandoff(uint8_t code);
 
 #if MOVIECART_WAITCART_PROOF
 /*
@@ -470,6 +485,8 @@ run_waitcart_proof(void)
 	for (;;) {
 		waitEndFrame();
 		mc_wait_handoff(waitcart_proof_work);
+		if (mc_wait_fault)
+			fatalHandoff(mc_wait_fault);
 	}
 }
 #endif
@@ -499,6 +516,36 @@ fatalStrobe(void)
 		led_wait_ms(2000);
 		TESTA0_HIGH;
 		led_wait_ms(400);
+	}
+}
+
+/*
+ * Report a handoff verdict: `code` slow flashes, repeating after a long gap
+ * (see mc_wait_fault in core.h for the codes).
+ *
+ * The slow, evenly-spaced pattern with a 2 s lead-in is what distinguishes this
+ * from the numbered disk faults, which are reported as a quick count. It needs
+ * distinguishing because a handoff fault does not look like a fault: one that
+ * never parks leaves the kernel running and the bus served, so a clean picture, a
+ * live heartbeat and a mount that never completes all look like healthy hardware.
+ */
+static __attribute__((noreturn)) void
+fatalHandoff(uint8_t code)
+{
+	__disable_irq();
+	mc_led_host = 1;
+	/* Off first, so this cannot be mistaken for the solid-on that
+	 * preceded it. Then `code` slow flashes, repeating. */
+	TESTA0_HIGH;
+	led_wait_ms(2000);
+	for (;;) {
+		for (uint8_t i = 0; i < code; i++) {
+			TESTA0_LOW;
+			led_wait_ms(400);
+			TESTA0_HIGH;
+			led_wait_ms(400);
+		}
+		led_wait_ms(2000);
 	}
 }
 
@@ -579,6 +626,8 @@ setupDisk(void)
 	emulate_cartridge();
 #endif
 	mc_wait_handoff(mount_work);
+	if (mc_wait_fault)
+		fatalHandoff(mc_wait_fault);	/* the handoff broke, not the card */
 	if (!disk_mount_ok)
 		fatalBlink(5);
 	flash_led(2);
@@ -593,6 +642,8 @@ setupDisk(void)
 	state.io_frameNumber = 1;
 	state.io_bits &= ~STATE_PLAYING;
 	mc_wait_handoff(open_work);
+	if (mc_wait_fault)
+		fatalHandoff(mc_wait_fault);
 	if (!disk_open_ok)
 		fatalBlink(8);
 	flash_led(3);
@@ -915,16 +966,13 @@ main(void)
 
 #if MOVIECART_WAITCART
 	/*
-	 * Install before any SD access: mount and open then get the same free
-	 * window the per-frame field reads use.
+	 * The 6502 copies the wait routine during boot (JSR $FFEC after
+	 * ClearMem). Title sync means that already happened. Then solid LED:
+	 *   title still live after ~2 s, LED goes off, 1 slow flash
+	 *     = never fetched $FFF4 from RAM (jmp $0084 did not run)
+	 *   LED goes off immediately, picture dies = parked; mount is running
 	 */
 	mc_wait_install();
-	/*
-	 * Same settle the proof used after copy (flash_led(2) is ~0.6 s of
-	 * serving). Then solid LED for mount:
-	 *   picture + solid  = ARMED never reached $FFEC
-	 *   black + solid    = parked, mount not returning
-	 */
 	led_wait_frames(36);
 	mc_led_host = 1;
 	TESTA0_LOW;

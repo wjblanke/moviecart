@@ -85,11 +85,10 @@
 /*
  * WaitCart handoff (make WAITCART=0 to disable).
  *
- * Park the 6502 in a routine running from Atari RAM for part of the vertical
- * blank, so it stops fetching from the cartridge and the field read can own the
- * CPU. This replaces the strategy of interleaving SD work into spare Atari
- * cycles, which the stall measurements never supported: the per-cycle budget is
- * around 100 ns and a field is hundreds of sectors.
+ * Park the 6502 in a routine it copied from this ROM into Atari RAM, so it
+ * stops fetching from the cartridge and SD work can own the CPU. The ARM
+ * only drops the bus when that RAM code fetches $FFF4 — the same "command
+ * from RAM" shape as UnoCart's LDA $1E00,X.
  *
  * With this off, mc_wait_handoff() simply calls its work function directly and
  * the old cooperative path is unchanged. See core.c for the protocol.

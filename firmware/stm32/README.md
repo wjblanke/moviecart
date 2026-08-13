@@ -705,55 +705,113 @@ fixing it. That pattern — many variables all mattering a little, none decisive
 what a fundamentally insufficient budget looks like.
 
 UnoCart solves the same problem from the opposite side, and it runs reliably on this
-board. `PrepareWaitCartRoutine` copies a routine into Atari RAM and the 6502 executes
-it *from there*, so it issues no cartridge fetches at all. With nothing to serve, the
-ARM has no deadline and does its SD work as ordinary blocking code
-(`emulate_firmware_cartridge` literally breaks out of its serve loop and returns).
-The console keeps a stable picture because it is generating its own VSYNC/VBLANK and
-WSYNC timing, and it polls the cart once a frame to ask whether the firmware is back.
+board. `PrepareWaitCartRoutine` copies a routine into Atari RAM and the 6502 JSRs it,
+so the first cart fetch after that JSR is issued *from RAM*. The ARM only leaves its
+serve loop when it sees that command (`LDA $1E00,X`). With nothing to serve, SD work
+is ordinary blocking code. The console keeps a picture because the RAM routine *is*
+a display kernel.
 
-The reason this had not been tried here is a false constraint: UnoCart blanks for
-whole seconds while listing a directory, whereas MovieCart needs a field *every*
-frame. But MovieCart does not have to surrender the frame — only the part of it where
-nothing is displayed. The vertical blank is ~37 scanlines, about 2.8 ms, in which the
-kernel is purely marking time. A field read is roughly 1 ms. **The read fits inside
-the interval that was already being wasted.**
+MovieCart owns the kernel ROM (`g0xNN` in `core.c`), so it uses that same sequence
+instead of hijacking a live instruction stream:
 
-Two facts about this port make the mechanism cheap to build:
+1. **Copy from `$FF2D`, between `RESP1` and the WSYNC at `$FF31`.** `JSR $FFEC`
+   replaces `lda #$20 / sta HMP1`; PrepareWait copies from `$1E00` into `$84`,
+   does that displaced pair itself, and `RTS` from `$FFFB` (the 6507 has no NMI
+   pin, so `$FFFA`-`$FFFB` are free). Sixteen bytes exactly.
 
-1. **`core.c` is the kernel ROM.** Each `g0xNN` case emits one hardcoded 6502 opcode
-   byte, so the instruction stream the console executes is defined in C. Changing what
-   the Atari runs needs no assembler and no rebuild of `movie_ntsc.bin`.
-2. **`$FFEC`-`$FFF9` were dead.** Fourteen dispatch indices emitted `0x00` (BRK), so
-   there was room for a loader without moving anything.
+   The slot matters, the length does not. `RESP0`/`RESP1` (`$FF1E`/`$FF21`) are
+   the only writes whose column depends on where the CPU sits within a scanline,
+   and they are anchored by ClearMem: `sta $00,x` walks x down from `$FF`, so
+   `x = $02` writes **WSYNC**, and every cycle from there to `RESP` is fixed.
+   (That anchor is why stock sprite positions are deterministic even though the
+   6507's reset phase is not.) The copy therefore has to go on the *far* side of
+   `RESP`, where the WSYNC at `$FF31` absorbs it and HMOVE, `wait_cnt` and the
+   entry into `right_line` are all timed from that WSYNC.
 
-The protocol:
+   The first attempt put the `JSR` at `$FF0C`, inside the anchored window: 267
+   cycles, 39 mod 76, **117 pixels** of sprite displacement — the corrupt title.
+   Padding to "0 mod 76" cannot fix that placement (with a 14-cycle copy loop the
+   total is always odd, and 76 is even), and adding a second WSYNC to the copy
+   changed nothing because `$FF31` already provided one. Do not move it past
+   `$FF33`: after HMOVE it skips `wait_cnt` and jams the 6507 (black, 6 flashes).
 
-- `$FFEC` is a 7-byte loader — `lda #<byte>` / `sta <dest>` / `jmp $ffec` — where the
-  ARM supplies both operands and advances a pointer each pass. Seven ROM bytes move an
-  arbitrary routine into zero page at ~8 cycles per byte, so the whole copy costs a
-  couple of scanlines, once, at boot.
-- Zero page is free to use: the kernel touches only `$80` (DUMMY) and `$81` (FIELD),
-  and the emulated program contains **no JSR/RTS at all**, so the stack is never
-  pushed and cannot collide with the routine. It loads at `$84`.
-- Each frame needing a read, the `JMP` at `$FFE9` (the end_lines path, reached only
-  during blanking) is diverted to `$0084`. The routine counts `MC_WAIT_LINES` blank
-  lines with `STA WSYNC`, entirely from RAM.
-- It then polls `$FFF3` once per line. While the ARM is away the bus floats and the
-  compare fails, so **a missed poll costs one scanline instead of jamming** — the
-  property that makes this robust rather than a new timing race.
-- On `MC_WAIT_READY` the routine jumps back into `end_lines`, and the ARM subtracts
-  the scanlines it borrowed from its own line counter so the frame still adds up. The
-  count comes from DWT, not from counting polls: the polls taken while the ARM was
-  away are exactly the ones that consumed time and are precisely the ones it cannot
-  see.
+   Whatever displaced pair PrepareWait absorbs must be a plain store. An earlier
+   version ended with `inc VDELP1`, which reads back a *write-only* TIA register,
+   so VDELP1 became bit 0 of stale bus data instead of 1 and player-1 graphics
+   were corrupt from boot.
+2. **Enter RAM only when ARMED.** The blanking kernel is exactly 76 cycles with no
+   WSYNC. Jumping to `$84` every frame while the title is up desyncs it (black
+   picture) and then the park wait hangs on a solid LED because `mr_endFrame` has
+   stopped. Title uses stock `$B7`/`$3E`. `nextLineJump` holds a whole 16-bit
+   target (`$FF3E`, `$FFB7`, `$0084`) — `$84` with high byte `$FF` is `jmp $FF84`,
+   a mid-kernel `sta AUDV0`, and gives vertical colour bars.
+3. **`$FFF4` is PARK while ARMED.** Not `$5A` → stay in the WSYNC loop. `$5A` →
+   clear VBLANK and VSYNC, `JMP $FF31`. Inferring park from `$FFEA`/`$FFEE` was a
+   false signal: those fetches are still cart cycles. The park wait times out on
+   DWT, not kernel frames.
+4. **Return.** `$FF31` is the boot path (`STA WSYNC`, `HMOVE` @03, `wait_cnt`,
+   `right_line`) so resume is on-cycle without counting into `end_lines`.
+   Cycle-counted `JMP $FFB7` was ~70 cycles early at cycle 0, and still wrong at
+   the guessed cycle 71. Both VBLANK and VSYNC are cleared on the way out:
+   nothing between there and `right_line` rewrites either, so parking out of the
+   vsync section would otherwise resume with VSYNC still asserted. The ARM reloads
+   the visible field on READY (`graphBuf` at the start of a buffer) so the picture
+   does not walk through SRAM.
+
+   **The data bus is tri-stated for the whole of `work()`** — `SET_DATA_MODE_IN`,
+   which is exactly what UnoCart does at its `got_cmd:` label before it touches
+   the card. Driving a constant PARK byte instead seems safer, because it
+   guarantees the parked 6502 cannot read a floating `$FFF4` as READY, and it is
+   what broke every resume: the park loop executes from RIOT RAM, so everything
+   except the single `$FFF4` poll is A12-low, and holding PD8-PD15 enabled means
+   the STM32 and the RIOT drive the same wires on every one of the 6502's own
+   opcode and operand fetches. It struggled out of the loop eventually — mount
+   and open both ran and reported success — but with a corrupted instruction
+   stream, so the jump back into the kernel produced no frames. A floating poll
+   cannot false-match READY anyway: the bus holds the last value driven, which is
+   that instruction's own `$FF` operand fetch, not `$5A`. UnoCart's `$D8` sentinel
+   relies on the same property.
+5. **Open: the title is not yet identical on every power-up.** With the copy at
+   `$FF2D` the boot path is correct, and it comes up correct — but not every time;
+   some power-ups are corrupt and some are black. Nothing in the boot path is
+   data-dependent, and the copy's length is now unobservable, which leaves the
+   6507 reset race as the candidate: the console's RC reset releases the CPU tens
+   of ms after power-on, and if its first vector fetches land before the ARM
+   reaches its first `bus_serve_cycle` they read a floating bus. `breakLoops = 0`
+   means there is no recovery loop to catch that. This was always present; it only
+   became *visible* once the good outcome stopped being corrupt too. To confirm,
+   compare power-up variability against the `NO_SD=1` baseline, which shares the
+   same init ordering but has no copy.
+6. **Prove the resume, not just the unpark.** The handoff waits for one
+   `mr_endFrame` (DWT-bounded) before returning, and raises fault 2 if none
+   arrives. Leaving RAM only proves the 6502 read READY from `$FFF4`; it says
+   nothing about whether the jump back into the kernel produced frames. Without
+   this the two are indistinguishable, and a failed resume showed up as a *fully
+   successful* SD sequence — every milestone blinked, mount and open both good —
+   followed by a black screen and an LED that just stopped, because the next
+   `waitEndFrame` never returned and no code was left to report anything.
+
+**Nothing in the handoff may add work to a dispatch case the title fetches.** The
+per-cycle budget is ~100 ns, and the first version tested `volatile mc_wait_state`
+inside `gstore` (four fetches per blanking line), `g0xb0`, `g0xb6`/`g0xeb` and
+`g0xd9` — enough to make the ARM late on the fetches that draw the picture, which
+reads on hardware as a corrupt, left-scrolling title. Every state-dependent choice
+is now precomputed into `mc_jmp_after_visible` / `mc_jmp_after_blank` (whole jmp
+targets) and `mc_gstore_page` (the copy source, zeroed once installed), so those
+cases cost one load, as the baseline did.
+
+The park is still only vblank-sized. Playback's visible 192 lines are a cycle-counted
+kernel that pulls colour/graph data from ARM SRAM over the cart bus; that data does
+not fit in 128 bytes of RIOT, so those lines cannot run from RAM. Mount and open do
+not need that kernel, but they use the same doorbell so one protocol covers boot and
+playback.
 
 `moviecart_bus_yield` and `moviecart_bus_pump` return immediately during a handoff,
 which is what lets the *unmodified* SDIO driver run at full speed — its busy-waits
 still call them, and they now cost nothing. `bus_serve_cycle` and
 `emulate_cartridge`, the display-critical paths, are untouched.
 
-Cost, accepted deliberately: the ~28 borrowed lines push no audio samples and skip
+Cost, accepted deliberately: the borrowed vblank lines push no audio samples and skip
 the controller capture, so there is a 60 Hz audio artifact during playback. Getting a
 stable picture and correct data first is worth an audible seam; the borrowed window
 can be shortened once the read time is known.
@@ -766,10 +824,10 @@ Two builds, because the mechanism should be proven before it is trusted:
   normal heartbeat.
 - `make SD_STAGE=0` — the real thing, field reads inside the handoff.
 
-`make WAITCART=0` skips installing the RAM routine. `mc_wait_handoff()` still
-enables IRQs around the work function so the stock driver can complete, but the
-6502 is not parked — that is the old cooperative-vs-blocking conflict and will
-glitch the picture. WaitCart is required for this driver.
+`make WAITCART=0` skips parking. `mc_wait_handoff()` still enables IRQs around the
+work function so the stock driver can complete, but the 6502 is not in RAM — that is
+the old cooperative-vs-blocking conflict and will glitch the picture. WaitCart is
+required for this driver.
 
 ### Stock UnoCart SDIO, run inside the handoff
 
@@ -788,8 +846,7 @@ The transfer clock is UnoCart's `SDIO_TRANSFER_CLK_DIV = 0x04` (~8 MHz).
 
 Mount, file-open, the title geometry probe, and every playback field load all run
 as handoff work callbacks. LED blinks and `emulate_cartridge()` stay *outside* the
-handoff: those need the kernel running, and `flash_led` waiting for `mr_endFrame`
-while the 6502 is parked in RAM would hang forever.
+handoff: the 6502 is parked in RAM for the duration, so there is no kernel to serve.
 
 ### The failure moved to the first read that changes destination
 
@@ -841,8 +898,15 @@ exactly the case where nothing needs reporting. Once the section machine desyncs
 into an uncountable flicker ("blinking too rapidly for me to tell what they are
 reporting"). Failure codes are now wall-clock timed off DWT (`flash_led_slow`), with
 the deadline sampled once per 256 serves so the hot loop stays identical to the
-baseline's — the trick `wait_title_sync` already relies on. Progress blinks stay
-frame-timed, since those only ever appear on a healthy kernel.
+baseline's — the trick `wait_title_sync` already relies on.
+
+Progress blinks (`flash_led`) were left frame-timed on the argument that they only
+appear on a healthy kernel. That was wrong in the one case that matters: a milestone
+is reported at the moment the thing it reports on may just have broken the kernel. A
+frame-timed blink that begins with the LED lit and then loses `mr_endFrame` never
+reaches its `TESTA0_HIGH`, so it reads as "two flashes and the LED remaining on" and
+hides whether the *next* milestone was reached. Milestone blinks are wall-clock timed
+for the same reason the failure codes are.
 
 ### Playback multiplies every per-sector cost by ~500 a second
 

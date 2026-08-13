@@ -38,7 +38,14 @@ struct coreInfo
 	uint_fast8_t	vblankState;
 	uint_fast8_t	vsyncState;
 	volatile uint_fast8_t	endState;
-	volatile uint_fast8_t	nextLineJump;
+	/*
+	 * Full jmp target: low byte in 0-7, high byte in 8-15. It is one value
+	 * rather than a low byte plus a computed high byte because $FFxx and the
+	 * RAM routine at $0084 do not share a page, and deciding the high byte
+	 * inside the fetch that serves it put a volatile compare on the hottest
+	 * path in the kernel.
+	 */
+	volatile uint_fast16_t	nextLineJump;
 	uint_fast8_t	data;
 
 	bool			audioPushed;
@@ -65,22 +72,30 @@ extern volatile uint8_t		mc_led_host;
 extern void			mc_diag_note(uint8_t code);
 
 /*
- * WaitCart handoff — borrowed from UnoCart-2600 (PrepareWaitCartRoutine).
+ * WaitCart handoff — UnoCart's sequence, in the kernel ROM we own.
  *
- * A short 6502 routine is copied into Atari zero page and the kernel's
- * end-of-line JMP is diverted into it for part of the vertical blank. While the
- * 6502 executes from RAM it makes no cartridge fetches at all, so the ARM owes
- * the bus nothing and can run a whole field read as ordinary blocking code.
- * See core.c for the routine and the protocol.
+ * After ClearMem the 6502 copies a wait routine from ROM into $84 and RTS.
+ * nextLineJump points at $0084 only while ARMED. See core.c.
  */
-#define MC_WAIT_IDLE		0u	/* normal kernel; ARM serves every cycle */
-#define MC_WAIT_COPY		1u	/* streaming the routine into Atari RAM */
-#define MC_WAIT_INSTALLED	2u	/* routine resident, no handoff pending */
-#define MC_WAIT_ARMED		3u	/* divert into the trampoline this VBLANK */
+#define MC_WAIT_IDLE		0u	/* boot; PrepareWait has not RTS'd */
+#define MC_WAIT_INSTALLED	2u	/* routine resident in RIOT RAM */
+#define MC_WAIT_ARMED		3u	/* next $FFF4 fetch parks; ARM is waiting */
 #define MC_WAIT_RUNNING		4u	/* 6502 in RAM: the ARM is free */
 
 extern volatile uint8_t		mc_wait_state;
 extern volatile uint8_t		mc_wait_ready;
+
+/*
+ * Why an armed handoff failed to park. Non-zero means work() did NOT run.
+ *
+ *   1  2 s elapsed without the RAM routine fetching $FFF4. A live title after
+ *      the LED goes solid is this case: the kernel never jumped to $84.
+ *   2  The 6502 parked, work() ran, and the 6502 read READY and left RAM — but
+ *      no end-of-frame arrived in the 250 ms after that. The park succeeded and
+ *      the resume did not.
+ *   3  work() ran but the 6502 never left RAM (never fetched READY).
+ */
+extern volatile uint8_t		mc_wait_fault;
 
 extern void			mc_wait_install(void);
 extern void			mc_wait_handoff(void (*work)(void));

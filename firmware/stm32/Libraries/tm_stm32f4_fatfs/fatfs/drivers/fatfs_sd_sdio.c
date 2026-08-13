@@ -2273,14 +2273,17 @@ static SD_Error CmdResp1Error (uint8_t cmd)
 	SD_Error errorstatus = SD_OK;
 	uint32_t status;
 	uint32_t response_r1;
+	uint32_t timeout;
 
 	status = SDIO ->STA;
 
-	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))) {
+	timeout = SDIO_CMD0TIMEOUT;
+	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT)) && (timeout > 0)) {
+		timeout--;
 		status = SDIO ->STA;
 	}
 
-	if (status & SDIO_FLAG_CTIMEOUT) {
+	if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
 		errorstatus = SD_CMD_RSP_TIMEOUT;
 		SDIO->ICR =  (SDIO_FLAG_CTIMEOUT);
 		return (errorstatus);
@@ -2393,14 +2396,17 @@ static SD_Error CmdResp3Error (void)
 {
         SD_Error errorstatus = SD_OK;
         uint32_t status;
+        uint32_t timeout;
 
         status = SDIO ->STA;
 
-        while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))) {
+        timeout = SDIO_CMD0TIMEOUT;
+        while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT)) && (timeout > 0)) {
+                timeout--;
                 status = SDIO ->STA;
         }
 
-        if (status & SDIO_FLAG_CTIMEOUT) {
+        if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
                 errorstatus = SD_CMD_RSP_TIMEOUT;
                 SDIO->ICR =  (SDIO_FLAG_CTIMEOUT);
                 return (errorstatus);
@@ -2419,14 +2425,17 @@ static SD_Error CmdResp2Error (void)
 {
 	SD_Error errorstatus = SD_OK;
 	uint32_t status;
+	uint32_t timeout;
 
 	status = SDIO ->STA;
 
-	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND))) {
+	timeout = SDIO_CMD0TIMEOUT;
+	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND)) && (timeout > 0)) {
+		timeout--;
 		status = SDIO ->STA;
 	}
 
-	if (status & SDIO_FLAG_CTIMEOUT) {
+	if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
 		errorstatus = SD_CMD_RSP_TIMEOUT;
 		SDIO->ICR =  (SDIO_FLAG_CTIMEOUT);
 		return (errorstatus);
@@ -2454,14 +2463,17 @@ static SD_Error CmdResp6Error (uint8_t cmd, uint16_t *prca)
 	SD_Error errorstatus = SD_OK;
 	uint32_t status;
 	uint32_t response_r1;
+	uint32_t timeout;
 
 	status = SDIO ->STA;
 
-	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND))) {
+	timeout = SDIO_CMD0TIMEOUT;
+	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND)) && (timeout > 0)) {
+		timeout--;
 		status = SDIO ->STA;
 	}
 
-	if (status & SDIO_FLAG_CTIMEOUT) {
+	if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
 		errorstatus = SD_CMD_RSP_TIMEOUT;
 		SDIO->ICR =  (SDIO_FLAG_CTIMEOUT);
 		return (errorstatus);
@@ -2620,8 +2632,16 @@ static SD_Error IsCardProgramming (uint8_t *pstatus)
 	SDIO_SendCommand (&SDIO_CmdInitStructure);
 
 	status = SDIO ->STA;
-		while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))) {
-		status = SDIO ->STA;
+	{
+		uint32_t timeout = SDIO_CMD0TIMEOUT;
+		while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT)) && (timeout > 0)) {
+			timeout--;
+			status = SDIO ->STA;
+		}
+		if (timeout == 0 && !(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))) {
+			errorstatus = SD_CMD_RSP_TIMEOUT;
+			return (errorstatus);
+		}
 	}
 
 	if (status & SDIO_FLAG_CTIMEOUT) {
