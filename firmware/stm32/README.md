@@ -61,7 +61,7 @@ Visible serving is the original MovieCart computed-goto kernel (one right/left p
 | **Pack** | RIOT `$CA`–`$E9` | 32 bytes / 64 nibbles (blanking tail after 6 cart OS samples) |
 | **VisibleBars** | Cart ROM | Looping dual-line kernel (`g0x3e`…`g0xb6`); `AUDV0` every scanline |
 
-There is **no preroll**. The first 6 overscan lines run from cart (`$F160`): play 6 tail samples and copy the 32-byte pack. Remaining OS 23/24 + VSYNC + VBLANK run from RIOT so SDIO finish/begin stay A12-low. NTSC field is **192 + 6 + 23/24 + 3 + 37 = 261 / 262**. Blanking audio is documented under **RIOT nibble audio** below.
+There is **no preroll**. The first 6 overscan lines run from cart (`$F160`): play 6 tail samples and copy the 32-byte pack. Remaining OS 23/24 + VSYNC + VBLANK run from RIOT so SDIO finish/begin stay A12-low. NTSC field is **192 + 6 + 23/24 + 3 + 37 = 261 / 262**. **NTSC is the target.** PAL still uses the NTSC 23/24+3+37 RamKernel (`visibleLines` still comes from the field header). Blanking audio is documented under **RIOT nibble audio** below.
 
 Cart dispatch indexes **`addr & 0xfff`** (12-bit space). Key hook addresses:
 
@@ -116,7 +116,7 @@ Pack is taken from the display buffer **base** at swap (`+ visible + 6`), not fr
 
 - **First field** — pack is zeros until the first swap; first OS/VS/VB after the 6 cart lines is silent if the pack was empty.
 - **Even vs odd** — 6 cart + 63 RIOT = 69; 6 + 64 = 70. The extra even file nibble is dropped.
-- **PAL / long tails** — pack is fixed at 64 samples / 32 bytes after the 6 head lines.
+- **PAL / long tails** — NTSC is the target. PAL still uses the NTSC 23/24+3+37 RamKernel. Pack is fixed at 64 samples / 32 bytes after the 6 head lines.
 - **Title** — swap packs `audio + visible + 6` in the title buffer; the 6 head lines play title audio at `visible`.
 
 ### Cart bus serving
@@ -234,7 +234,7 @@ NTSC field: **192 + 6 + 23/24 + 3 + 37 = 261 / 262**. Only the last three segmen
 | **RamKernel** | **63** | **64** | **4.01** | **4.08** | — |
 | **Field** | **261** | **262** | **16.62** | **16.69** | — |
 
-PAL files still get these NTSC RamKernel counts; `visibleLines` comes from the field header.
+**NTSC is the target.** PAL still uses the NTSC 23/24+3+37 RamKernel; `visibleLines` comes from the field header.
 
 #### Case-by-case
 
