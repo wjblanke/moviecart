@@ -83,5 +83,7 @@ extern volatile uint8_t		mc_visible_bars_vended;
 extern volatile uint8_t		mc_blanking_window;
 extern volatile uint16_t	mc_blanking_window_gen;
 extern volatile uint8_t		mc_sdio_gate_relaxed;
+extern volatile uint8_t		mc_playback_pipeline;
+extern volatile uint8_t		mc_buffer_swap_ready;
 
 #endif

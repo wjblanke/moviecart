@@ -119,6 +119,8 @@ volatile uint8_t	mc_visible_bars_vended;
 volatile uint8_t	mc_blanking_window;
 volatile uint16_t	mc_blanking_window_gen;
 volatile uint8_t	mc_sdio_gate_relaxed;
+volatile uint8_t	mc_playback_pipeline;
+volatile uint8_t	mc_buffer_swap_ready;
 
 static uint16_t		mc_cart_off;
 static volatile uint_fast8_t	mc_store_dummy;	/* gstore sink before joystick setup */
@@ -155,6 +157,8 @@ coreInit(void)
 	mc_blanking_window = 0;
 	mc_blanking_window_gen = 0;
 	mc_sdio_gate_relaxed = 0;
+	mc_playback_pipeline = 0;
+	mc_buffer_swap_ready = 0;
 
 	r_coreInfo.mr_swcha = 0xff;
 	r_coreInfo.mr_swchb = 0xff;
@@ -269,7 +273,10 @@ mc_visible_line_advance(void)
 static void
 mc_on_visible_bars_entry(void)
 {
-	mc_field_swap_to_display();
+	if (!mc_playback_pipeline || mc_buffer_swap_ready) {
+		mc_field_swap_to_display();
+		mc_buffer_swap_ready = 0;
+	}
 	mc_audio_begin_visible();
 	mc_blanking_window = 0;
 	mc_visible_bars_vended = 1;

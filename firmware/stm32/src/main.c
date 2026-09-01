@@ -588,98 +588,98 @@ setupDisk(void)
 #endif
 }
 
-/* Seek to a field and load it. 0 on success, else the LED code for the fault. */
-static uint8_t
-loadField(struct frameInfo *fInfo, uint32_t offset)
+#define FIELD_LOAD_ATTEMPTS	4
+
+static struct frameInfo *pending_frame;
+static uint32_t pending_offset;
+static uint8_t pending_attempt;
+static uint8_t field_dma_pending;
+
+static struct frameInfo *
+displayFrameInfo(void)
 {
-	uint8_t *dst = fInfo->buffer;
-	uint8_t fault = 0;
+	return r_coreInfo.mr_bufferIndex
+		? &r_coreInfo.mr_frameInfo2
+		: &r_coreInfo.mr_frameInfo1;
+}
 
-	mc_sdio_gate_relaxed = 1;
-
-	pf_seek_block(offset);
-
-	/*
-	 * The strict title probe cached this file's field size. MovieCart fields
-	 * occupy 1..6 consecutive sectors inside an eight-sector slot, so fetch
-	 * the entire field with one CMD18 and one DMA transfer.
-	 */
-	if (!playback_field_blocks ||
-	    !pf_read_blocks(dst, playback_field_blocks)) {
-		fault = BLINK_SECTOR_READ;
-		goto out;
-	}
-
-	/* Every field starts with "MVC\0". Reject a bad sector/header before its
-	 * geometry can turn into an out-of-bounds DMA destination below. */
-	if (memcmp(fInfo->buffer, "MVC\0", 4) != 0) {
-		fault = BLINK_FIELD_HEADER;
-		goto out;
-	}
-
-	frameInit(fInfo);
-	if (!fInfo->visibleLines || !fInfo->numBlocks ||
-	    fInfo->numBlocks > FIELD_MAX_BLOCKS ||
-	    fInfo->numBlocks != playback_field_blocks) {
-		fault = BLINK_FIELD_GEOMETRY;
-		goto out;
-	}
-
-out:
-	mc_sdio_gate_relaxed = 0;
-	return fault;
+static struct frameInfo *
+inactiveFrameInfo(void)
+{
+	return r_coreInfo.mr_bufferIndex
+		? &r_coreInfo.mr_frameInfo1
+		: &r_coreInfo.mr_frameInfo2;
 }
 
 /*
- * A field that fails validation is retried against fresh reads.
- *
- * "Read reported success but the header is wrong" has exactly two shapes: the
- * sector we computed was the wrong one (a bad FAT sector gives get_fat a bogus
- * cluster, and nothing validates it), or the right sector's data never landed in
- * the buffer. Retrying after dropping both sector caches re-walks the FAT *and*
- * re-reads the data, so it covers both — and the outcome separates them:
- *
- *   playback continues (heartbeat shows 5) -> the fault was transient; a re-read
- *                                            fixes it, so the bytes, not the
- *                                            arithmetic, were at fault.
- *   still code 7 after every attempt       -> the computed sector is genuinely
- *                                            wrong every time; a deterministic
- *                                            seek/FAT-walk fault, not a read.
- *
- * The cache invalidation is what makes this a real retry: keyed on (sector, dst),
- * the caches would otherwise hand back the same bytes that just failed and the
- * retry would prove nothing.
+ * Start the field's one CMD18 transfer, but deliberately do not drain or poll
+ * it here. DMA may finish while the other buffer is visible.
  */
-#define FIELD_LOAD_ATTEMPTS	4
-
 static uint8_t
-prepareNextFrame(void)
+beginFieldRead(struct frameInfo *fInfo, uint32_t offset, uint8_t attempt)
 {
-	struct frameInfo *fInfo;
+	if (!playback_field_blocks)
+		return BLINK_FIELD_GEOMETRY;
 
-	if (r_coreInfo.mr_bufferIndex)
-		fInfo = &r_coreInfo.mr_frameInfo1;
-	else
-		fInfo = &r_coreInfo.mr_frameInfo2;
+	mc_sdio_gate_relaxed = 1;
+	pf_seek_block(offset);
+	bool started = pf_read_blocks_begin(fInfo->buffer,
+					    playback_field_blocks);
+	mc_sdio_gate_relaxed = 0;
 
-	uint32_t offset = (uint32_t)(state.io_frameNumber * FIELD_NUM_BLOCKS);
+	if (!started)
+		return BLINK_SECTOR_READ;
+
+	pending_frame = fInfo;
+	pending_offset = offset;
+	pending_attempt = attempt;
+	field_dma_pending = 1;
+	return 0;
+}
+
+/*
+ * Drain the transfer started in the preceding blanking interval. A failed read
+ * is restarted into the same inactive buffer; it is never marked ready or
+ * exposed to VisibleBars until both DMA completion and field validation pass.
+ *
+ * Return 0 when a buffer became ready, 1 when a retry was started, or an LED
+ * fault code when all attempts failed.
+ */
+static uint8_t
+finishFieldRead(void)
+{
+	mc_sdio_gate_relaxed = 1;
+	bool read_ok = pf_read_blocks_finish();
+	mc_sdio_gate_relaxed = 0;
+	field_dma_pending = 0;
+
 	uint8_t fault = 0;
-
-	for (int attempt = 0; attempt < FIELD_LOAD_ATTEMPTS; attempt++) {
-		fault = loadField(fInfo, offset);
-		if (!fault)
-			break;
-
-		mc_diag_note(DIAG_FIELD_RETRY);
-		disk_read_invalidate();
-		moviecart_bus_yield();
+	if (!read_ok) {
+		fault = BLINK_SECTOR_READ;
+	} else if (memcmp(pending_frame->buffer, "MVC\0", 4) != 0) {
+		fault = BLINK_FIELD_HEADER;
+	} else {
+		frameInit(pending_frame);
+		if (!pending_frame->visibleLines || !pending_frame->numBlocks ||
+		    pending_frame->numBlocks > FIELD_MAX_BLOCKS ||
+		    pending_frame->numBlocks != playback_field_blocks)
+			fault = BLINK_FIELD_GEOMETRY;
 	}
 
-	if (fault)
+	if (!fault) {
+		updateBuffer(&state, pending_frame);
+		mc_buffer_swap_ready = 1;
+		return 0;
+	}
+
+	if (++pending_attempt >= FIELD_LOAD_ATTEMPTS)
 		return fault;
 
-	updateBuffer(&state, fInfo);
-	return 0;
+	mc_diag_note(DIAG_FIELD_RETRY);
+	disk_read_invalidate();
+	if (beginFieldRead(pending_frame, pending_offset, pending_attempt))
+		return fault;
+	return 1;
 }
 
 static void
@@ -799,12 +799,16 @@ select_open_work(void)
 	disk_open_ok = pf_open_file(&state.i_numFrames, select_which);
 }
 
-static void
+static bool
 checkSelectVideo(int *which)
 {
+	bool selected = false;
+
 	if ((state.io_bits & STATE_END) ||
 	    ((state.i_swchb & 0x02) && !((uint8_t)r_coreInfo.mr_swchb & 0x02))) {
+		selected = true;
 		state.io_bits &= ~STATE_END;
+		mc_buffer_swap_ready = 0;
 
 		(*which)++;
 		for (;;) {
@@ -815,6 +819,8 @@ checkSelectVideo(int *which)
 			*which = 1;
 		}
 
+		/* Drop cluster checkpoints from the previous file before seeking in
+		 * the newly selected one. */
 		qinfo.head = 0;
 		for (int i = 0; i < QUEUE_SIZE; i++) {
 			qinfo.block[i] = 0xffffffffu;
@@ -822,6 +828,20 @@ checkSelectVideo(int *which)
 			if (!(i & 7))
 				moviecart_bus_yield();
 		}
+
+		/* Cache the newly selected file's field size before its DMA pipeline
+		 * starts; selected files may differ between NTSC and PAL geometry. */
+		pf_seek_block(FIELD_NUM_BLOCKS);
+		uint8_t *probe = disk_read_block1(pf_current_sector());
+		struct frameInfo probe_info;
+		probe_info.buffer = probe;
+		if (memcmp(probe, "MVC\0", 4) != 0)
+			fatalBlink(BLINK_FIELD_HEADER);
+		frameInit(&probe_info);
+		if (!probe_info.visibleLines || !probe_info.numBlocks ||
+		    probe_info.numBlocks > FIELD_MAX_BLOCKS)
+			fatalBlink(BLINK_FIELD_GEOMETRY);
+		playback_field_blocks = probe_info.numBlocks;
 
 		state.io_frameNumber = 1;
 		state.io_bits |= STATE_PLAYING;
@@ -833,35 +853,59 @@ checkSelectVideo(int *which)
 	}
 
 	coreInfoToState();
+	return selected;
 }
 
 static void
 runFrameLoop(void)
 {
 	int which = 1;
+	bool bootstrap = true;
 
 	state.io_frameNumber = 1;
 	state.io_bits = STATE_PLAYING;
+	field_dma_pending = 0;
+	mc_buffer_swap_ready = 0;
+	mc_playback_pipeline = 1;
 
 	while (1) {
 		waitEndFrame();
 
-		checkSelectVideo(&which);
+		if (field_dma_pending) {
+			uint8_t finish = finishFieldRead();
+			if (finish > 1)
+				fatalBlink(finish);
+			if (finish == 1) {
+				while (!mc_visible_bars_vended)
+					bus_serve_cycle();
+				continue;
+			}
+		}
+
+		if (checkSelectVideo(&which)) {
+			bootstrap = true;
+			mc_buffer_swap_ready = 0;
+		}
 		updateTransport(&state);
 
 		/*
-		 * VisibleBars RTS ($F41D) marks the start of the RIOT blanking
-		 * tail. prepareNextFrame() calls into FatFs/disk_read; the SDIO
-		 * gate is relaxed for the field's single multi-block DMA, so every
-		 * command and poll may proceed in the current blanking window. If
-		 * the load finishes before the next VisibleBars entry, keep serving
-		 * until $F09D.
+		 * Complete the prior field at one $F41D and start the next field's
+		 * single CMD18 DMA into the buffer whose visible use just ended.
+		 * The first pass fills the inactive buffer and intentionally repeats
+		 * the title/current field once. Thereafter DMA and display alternate
+		 * buffers every frame.
 		 */
 		mc_visible_bars_vended = 0;
-		uint8_t frame_fault = prepareNextFrame();
+		struct frameInfo *target = bootstrap
+			? inactiveFrameInfo()
+			: displayFrameInfo();
+		uint32_t offset =
+			(uint32_t)(state.io_frameNumber * FIELD_NUM_BLOCKS);
+		uint8_t start_fault = beginFieldRead(target, offset, 0);
+		if (start_fault)
+			fatalBlink(start_fault);
+		bootstrap = false;
 
-		if (frame_fault)
-			fatalBlink(frame_fault);
 		while (!mc_visible_bars_vended)
 			bus_serve_cycle();
 	}

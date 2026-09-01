@@ -176,14 +176,18 @@ moviecart_bus_yield(void)
 void
 moviecart_sdio_gate(void)
 {
+	static uint16_t seen;
+	static uint8_t primed;
+
 	if (mc_sdio_gate_relaxed) {
 		while (!mc_blanking_window)
 			bus_serve_cycle();
+		/* A later strict operation must wait for an edge newer than the
+		 * relaxed window, not consume this already-active one. */
+		seen = mc_blanking_window_gen;
+		primed = 1;
 		return;
 	}
-
-	static uint16_t seen;
-	static uint8_t primed;
 
 	if (!primed) {
 		seen = mc_blanking_window_gen;

@@ -422,31 +422,15 @@ DSTATUS TM_FATFS_SD_SDIO_disk_status(void) {
 	return TM_FATFS_SD_SDIO_Stat;
 }
 
-DRESULT TM_FATFS_SD_SDIO_disk_read(BYTE *buff, DWORD sector, UINT count) {
+DRESULT
+TM_FATFS_SD_SDIO_disk_read_begin(BYTE *buff, DWORD sector, UINT count)
+{
 	SD_Error Status = SD_OK;
 
-	if ((TM_FATFS_SD_SDIO_Stat & STA_NOINIT)) {
+	if ((TM_FATFS_SD_SDIO_Stat & STA_NOINIT))
 		return RES_NOTRDY;
-	}
-	
-	if ((DWORD)buff & 3) {
-		DRESULT res = RES_OK;
-		DWORD scratch[BLOCK_SIZE / 4];
-
-		while (count--) {
-			res = TM_FATFS_SD_SDIO_disk_read((void *)scratch, sector++, 1);
-
-			if (res != RES_OK) {
-				break;
-			}
-
-			memcpy(buff, scratch, BLOCK_SIZE);
-
-			buff += BLOCK_SIZE;
-		}
-
-		return res;
-	}
+	if (!count || ((DWORD)buff & 3))
+		return RES_PARERR;
 
 	if (count == 1) {
 		Status = SD_ReadBlock(buff, sector << 9, BLOCK_SIZE);
@@ -454,27 +438,49 @@ DRESULT TM_FATFS_SD_SDIO_disk_read(BYTE *buff, DWORD sector, UINT count) {
 		Status = SD_ReadMultiBlocks(buff, sector << 9, BLOCK_SIZE, count);
 	}
 
-	if (Status == SD_OK) {
-		SDTransferState State;
+	return Status == SD_OK ? RES_OK : RES_ERROR;
+}
 
-		Status = SD_WaitReadOperation();
+DRESULT
+TM_FATFS_SD_SDIO_disk_read_finish(void)
+{
+	SD_Error Status;
+	SDTransferState State;
 
-		for (;;) {
-			moviecart_sdio_gate();
-			State = SD_GetStatus();
-			if (State != SD_TRANSFER_BUSY)
-				break;
-			moviecart_bus_yield();
-		}
+	Status = SD_WaitReadOperation();
 
-		if ((State == SD_TRANSFER_ERROR) || (Status != SD_OK)) {
-			return RES_ERROR;
-		} else {
-			return RES_OK;
-		}			
-	} else {
-		return RES_ERROR;
+	for (;;) {
+		moviecart_sdio_gate();
+		State = SD_GetStatus();
+		if (State != SD_TRANSFER_BUSY)
+			break;
+		moviecart_bus_yield();
 	}
+
+	if (State == SD_TRANSFER_ERROR || Status != SD_OK)
+		return RES_ERROR;
+
+	return RES_OK;
+}
+
+DRESULT TM_FATFS_SD_SDIO_disk_read(BYTE *buff, DWORD sector, UINT count) {
+	if ((DWORD)buff & 3) {
+		DRESULT res = RES_OK;
+		DWORD scratch[BLOCK_SIZE / 4];
+
+		while (count--) {
+			res = TM_FATFS_SD_SDIO_disk_read((void *)scratch, sector++, 1);
+			if (res != RES_OK)
+				break;
+			memcpy(buff, scratch, BLOCK_SIZE);
+			buff += BLOCK_SIZE;
+		}
+		return res;
+	}
+
+	if (TM_FATFS_SD_SDIO_disk_read_begin(buff, sector, count) != RES_OK)
+		return RES_ERROR;
+	return TM_FATFS_SD_SDIO_disk_read_finish();
 }
 
 DRESULT TM_FATFS_SD_SDIO_disk_write(const BYTE *buff, DWORD sector, UINT count) {

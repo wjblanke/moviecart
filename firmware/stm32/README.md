@@ -96,22 +96,23 @@ The stock UnoCart SDIO driver (`fatfs_sd_sdio.c`) keeps **DMA** for sector reads
 
 Every SDIO wait loop calls `moviecart_bus_yield()` (or `SD_PollDmaAndYield()` for DMA drains). Long delays use `moviecart_delay_ms()` instead of busy DWT spins.
 
-**Blanking-only SDIO:** `mc_blanking_window_gen` increments on each VisibleBars RTS (`$F41D`). By default `moviecart_sdio_gate()` blocks until that counter advances (mount, title probe, file select). During **`loadField()`** only, `mc_sdio_gate_relaxed` is set: the gate waits for `mc_blanking_window` but does not require a new gen edge, so a multi-sector field read can use one blanking tail. Between gates the firmware serves the cart only.
+**Blanking-only SDIO control:** `mc_blanking_window_gen` increments on each VisibleBars RTS (`$F41D`). By default `moviecart_sdio_gate()` blocks until that counter advances (mount, title probe, file select). Playback command initiation and completion polling use the relaxed gate in their respective blanking intervals. The DMA itself runs asynchronously between them while the other field buffer is displayed.
 
 ### Playback loop
 
 After the embedded title screen and SD mount:
 
 1. **`runTitle()`** — title hold; geometry probe reads one field sector while yielding.
-2. **`runFrameLoop()`** — each frame:
+2. **`runFrameLoop()`** — two-buffer DMA pipeline:
    - `waitEndFrame()` — blocked on `mr_endFrame` (set at VisibleBars RTS).
    - `checkSelectVideo()` / `updateTransport()` — console controls; file change opens the next movie file while yielding.
-   - **`prepareNextFrame()`** — load the next MovieCart field into the **inactive** ping-pong buffer (`mr_buffer1` / `mr_buffer2` in SRAM2). The title probe caches `numBlocks`; playback reads all 1–6 contiguous sectors with one CMD18 and one DMA transfer. Retries up to four times with cache invalidation on header/geometry failure.
-   - Wait until **`mc_visible_bars_vended`** — next VisibleBars entry (`$F09D`) before the newly loaded buffer is displayed.
+   - Finish and validate the CMD18 DMA started in the preceding blanking interval; only then set `mc_buffer_swap_ready`.
+   - Start one CMD18 DMA for the following field into the buffer whose visible use just ended. The title probe caches `numBlocks`, so all 1–6 contiguous sectors use one transfer.
+   - At **`mc_visible_bars_vended`** (`$F09D`), swap only when the completed buffer is ready. The first pipeline pass repeats the title/current field once while priming DMA.
 
 Field files: FAT32 root, first playable file by default; `MVC\0` header, 1–6 sectors (≤ 3 KiB field buffer). Controls match stock MovieCart (Select advances files, etc.).
 
-FatFs cluster walks and other CPU-bound loops call `moviecart_bus_yield()` so the cart keeps being served during `prepareNextFrame()`.
+FatFs cluster walks and other CPU-bound loops call `moviecart_bus_yield()` so the cart keeps being served.
 
 ### Memory map
 

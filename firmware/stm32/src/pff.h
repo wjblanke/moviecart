@@ -59,6 +59,8 @@ bool		pf_open_file(uint32_t *numFrames, int num);	/* Open first 'num' archived n
 bool		pf_seek_block(uint32_t block);		/* Move file pointer of the open file */
 bool        pf_read_block(uint8_t *dst);		/* Read full block, false on read failure */
 bool        pf_read_blocks(uint8_t *dst, uint8_t count); /* One contiguous multi-block read */
+bool        pf_read_blocks_begin(uint8_t *dst, uint8_t count);
+bool        pf_read_blocks_finish(void);
 uint32_t    pf_current_sector(void);			/* Absolute sector the next read will fetch */
 
 uint32_t ld_dword (const uint8_t* ptr);

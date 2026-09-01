@@ -18,6 +18,8 @@ struct diskInfo {
 };
 
 static struct diskInfo dinfo;
+static struct diskInfo pending;
+static bool read_pending;
 
 #define DISK_READ_RETRIES	32
 
@@ -43,6 +45,38 @@ disk_read_invalidate(void)
 	dinfo.sector2 = 0xffffffffu;
 	dinfo.dst2 = NULL;
 	dinfo.count2 = 0;
+}
+
+bool
+disk_read_blocks_begin(uint32_t sector, uint8_t *dst, uint8_t count)
+{
+	if (read_pending || !count)
+		return false;
+
+	if (TM_FATFS_SD_SDIO_disk_read_begin(dst, sector, count) != RES_OK)
+		return false;
+
+	pending.sector2 = sector;
+	pending.dst2 = dst;
+	pending.count2 = count;
+	read_pending = true;
+	return true;
+}
+
+bool
+disk_read_blocks_finish(void)
+{
+	if (!read_pending)
+		return false;
+
+	bool ok = TM_FATFS_SD_SDIO_disk_read_finish() == RES_OK;
+	if (ok) {
+		dinfo.sector2 = pending.sector2;
+		dinfo.dst2 = pending.dst2;
+		dinfo.count2 = pending.count2;
+	}
+	read_pending = false;
+	return ok;
 }
 
 uint8_t *
@@ -103,6 +137,7 @@ mc_disk_initialize(void)
 	dinfo.sector2 = 0xffffffffu;
 	dinfo.dst2 = NULL;
 	dinfo.count2 = 0;
+	read_pending = false;
 
 	return TM_FATFS_SD_SDIO_disk_initialize() == 0;
 }

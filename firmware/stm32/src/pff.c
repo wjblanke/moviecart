@@ -397,6 +397,39 @@ pf_read_blocks(uint8_t *dst, uint8_t count)
 	return true;
 }
 
+static uint8_t async_read_count;
+
+bool
+pf_read_blocks_begin(uint8_t *dst, uint8_t count)
+{
+	uint32_t cluster_offset =
+		(fsInfo.file_block - fsInfo.database) & fsInfo.csize_mask;
+
+	if (async_read_count || !count ||
+	    count > fsInfo.csize - cluster_offset)
+		return false;
+	if (!disk_read_blocks_begin(fsInfo.file_block, dst, count))
+		return false;
+
+	async_read_count = count;
+	return true;
+}
+
+bool
+pf_read_blocks_finish(void)
+{
+	if (!async_read_count)
+		return false;
+
+	uint8_t count = async_read_count;
+	async_read_count = 0;
+	if (!disk_read_blocks_finish())
+		return false;
+
+	fsInfo.file_block += count;
+	return true;
+}
+
 /* The absolute sector the next pf_read_block() will fetch (valid after a seek). */
 uint32_t
 pf_current_sector(void)
