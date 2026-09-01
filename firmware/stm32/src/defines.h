@@ -124,8 +124,8 @@
  * the system bus entirely to data. That decoupling is also the likely reason
  * this build has been so absurdly sensitive to adding a single instruction.
  *
- * romData stays in SRAM (see core.c): a table read over the system bus now runs
- * in parallel with instruction fetch rather than competing with it.
+ * romData lives in CCM (see core.c): a table read is a D-bus access and does
+ * not share the AHB matrix with GPIO or SDIO DMA.
  */
 #define RAMFUNC __attribute__((noinline))
 

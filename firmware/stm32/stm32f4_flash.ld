@@ -31,16 +31,12 @@
 ENTRY(Reset_Handler)
 
 /*
- * Stack lives at the top of SRAM1, NOT the top of the 128 K.
+ * Stack lives at the top of CCM (D-bus only, not on the AHB matrix).
  *
- * SRAM1 (0x20000000, 112 K) and SRAM2 (0x2001C000, 16 K) are separate slaves on
- * the bus matrix. The SD DMA target is placed in SRAM2 so a sector transfer can
- * run concurrently with the CPU driving the Atari data bus out of SRAM1 (kernel
- * buffers, stack) without either stalling the other. Keeping the stack in SRAM1
- * matters: bus_dispatch pushes/pops every cycle, and a stack in SRAM2 would
- * re-introduce exactly the contention this split removes.
+ * r_coreInfo and romData sit in the same bank so serve-path loads do not share
+ * a slave with GPIO (AHB1) or SDIO DMA (SRAM1/SRAM2). DMA cannot reach CCM.
  */
-_estack = 0x2001C000;    /* top of SRAM1 (112 K) */
+_estack = 0x10010000;    /* top of CCM (64 K) */
 
 /* Generate a link error if heap and stack don't fit into RAM */
 _Min_Heap_Size = 0;      /* required amount of heap  */
@@ -156,22 +152,32 @@ SECTIONS
 
   _siccmram = LOADADDR(.ccmram);
 
-  /* CCM-RAM section
-  *
-  * IMPORTANT NOTE!
-  * If initialized variables will be placed in this section,
-  * the startup code needs to be modified to copy the init-values.
-  */
+  /* Initialized CCM (romData). Reset_Handler copies from flash. */
   .ccmram :
   {
     . = ALIGN(4);
-    _sccmram = .;       /* create a global symbol at ccmram start */
+    _sccmram = .;
     *(.ccmram)
     *(.ccmram*)
 
     . = ALIGN(4);
-    _eccmram = .;       /* create a global symbol at ccmram end */
+    _eccmram = .;
   } >CCMRAM AT> FLASH
+
+  /* Uninitialized CCM (r_coreInfo). Reset_Handler zeros it. */
+  .ccmbss (NOLOAD) :
+  {
+    . = ALIGN(4);
+    _sccmbss = .;
+    *(.ccmbss)
+    *(.ccmbss*)
+
+    . = ALIGN(4);
+    _eccmbss = .;
+  } >CCMRAM
+
+  ASSERT(_eccmbss <= (ORIGIN(CCMRAM) + LENGTH(CCMRAM) - _Min_Stack_Size),
+         "CCM overflow: data collided with the stack reservation")
 
   /* Uninitialized data section */
   . = ALIGN(4);
@@ -189,22 +195,19 @@ SECTIONS
     __bss_end__ = _ebss;
   } >RAM
 
-  /* User_heap_stack section, used to check that there is enough RAM left */
+  /* SRAM1 leftover check. Stack is in CCM, not here. */
   ._user_heap_stack :
   {
     . = ALIGN(4);
     PROVIDE ( end = . );
     PROVIDE ( _end = . );
     . = . + _Min_Heap_Size;
-    . = . + _Min_Stack_Size;
     . = ALIGN(4);
   } >RAM
 
   /*
-   * SRAM2 (0x2001C000, 16 K): every SD DMA destination (both field buffers and
-   * the FAT scratch sector). SRAM1 keeps the stack, r_coreInfo and the dispatch
-   * table, so DMA cannot stall the CPU. NOLOAD: uninitialized; DMA / the title
-   * loader fill them before they are read.
+   * SRAM2 (0x2001C000, 16 K): mr_buffer2 only. mr_buffer1 and diskBuffer live
+   * in SRAM1 (.bss) so the two field buffers are on different AHB slaves.
    */
   .sram2 (NOLOAD) :
   {

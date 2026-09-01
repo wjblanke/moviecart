@@ -36,14 +36,11 @@ extern struct queueInfo qinfo;
 
 struct stateVars state;
 /*
- * Both field buffers live in SRAM2, the opposite AHB slave from the CPU's
- * stack, r_coreInfo, and the dispatch table in SRAM1. SD DMA only ever writes
- * SRAM2, so it cannot stall instruction/stack traffic even while a transfer is
- * in flight. bus_dispatch still reads the live field out of SRAM2 during
- * display; that is a different slave from the stack, so those two do not
- * contend with each other either.
+ * Field buffers sit on opposite AHB SRAM slaves. Stack, r_coreInfo, and
+ * romData live in CCM (D-bus only), so they never share a port with DMA
+ * or GPIO. DMA writes the inactive buffer; display reads the other.
  */
-uint8_t mr_buffer1[FIELD_SIZE] __attribute__((aligned(16), section(".sram2")));
+uint8_t mr_buffer1[FIELD_SIZE] __attribute__((aligned(16)));
 uint8_t mr_buffer2[FIELD_SIZE] __attribute__((aligned(16), section(".sram2")));
 
 void updateInit(void);

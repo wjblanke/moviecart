@@ -48,7 +48,7 @@
  */
 #define LINES_EXHAUSTED(n)	((n) == 0 || (n) > 250)
 
-struct coreInfo r_coreInfo;
+struct coreInfo r_coreInfo __attribute__((section(".ccmbss")));
 
 /*
  * Frame-driven diagnostics. The bus loop owns the CPU with interrupts off, so
@@ -93,7 +93,7 @@ static uint16_t frameLines;	/* scanlines counted in this frame */
  * two patterns superimposed, not one pattern mistimed. Whoever is deliberately
  * blinking wins; the heartbeat resumes when it is done.
  */
-volatile uint8_t mc_led_host;
+volatile uint8_t mc_led_host __attribute__((section(".ccmbss")));
 
 /*
  * Raise a diagnostic code from outside the kernel.
@@ -110,11 +110,11 @@ mc_diag_note(uint8_t code)
 	DIAG_NOTE(code);
 }
 
-volatile uint8_t	mc_visible_bars_vended;
-volatile uint8_t	mc_blanking_window;
-volatile uint16_t	mc_blanking_window_gen;
-volatile uint8_t	mc_sdio_gate_relaxed;
-volatile uint8_t	mc_playback_pipeline;
+volatile uint8_t	mc_visible_bars_vended __attribute__((section(".ccmbss")));
+volatile uint8_t	mc_blanking_window __attribute__((section(".ccmbss")));
+volatile uint16_t	mc_blanking_window_gen __attribute__((section(".ccmbss")));
+volatile uint8_t	mc_sdio_gate_relaxed __attribute__((section(".ccmbss")));
+volatile uint8_t	mc_playback_pipeline __attribute__((section(".ccmbss")));
 
 static inline void
 diagFrameTick(void)
@@ -273,10 +273,10 @@ mc_on_visible_bars_rts(void)
 HOTFUNC void
 bus_dispatch(uint16_t cart_off)
 {
-	/* Visible-line patch slots only (phase 0 = g0x3e). In SRAM so the
-	 * lookup does not take flash wait states on the data-valid path. */
+	/* Visible-line patch slots only (phase 0 = g0x3e). In CCM (D-bus)
+	 * so the lookup does not share AHB with GPIO or SDIO DMA. */
 	static const void* const romData[MC_PHASE_DYNAMIC_MAX + 1]
-		__attribute__((section(".ramfunc.romtable"))) =
+		__attribute__((section(".ccmram"))) =
 	{
 		&&g0x3e, &&g0x3f, &&g0x40, &&g0x41, &&g0x42, &&g0x43, &&g0x44, &&g0x45, &&g0x46, &&g0x47, &&g0x48, &&g0x49, &&g0x4a, &&g0x4b, &&g0x4c, &&g0x4d,
 		&&g0x4e, &&g0x4f, &&g0x50, &&g0x51, &&g0x52, &&g0x53, &&g0x54, &&g0x55, &&g0x56, &&g0x57, &&g0x58, &&g0x59, &&g0x5a, &&g0x5b, &&g0x5c, &&g0x5d,

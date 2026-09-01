@@ -44,7 +44,7 @@ System clock: HSI → PLL @ 168 MHz (same as UnoCart DevEBox); SDIOCLK 48 MHz.
 │   DMA + manual completion poll in fatfs_sd_sdio.c               │
 │   every wait yields → bus_serve_cycle() while RamKernel runs    │
 └───────────────────────────┬─────────────────────────────────────┘
-                            │ SDIO DMA → SRAM2 field buffers
+                            │ SDIO DMA → SRAM1 (buf1) / SRAM2 (buf2)
 ┌───────────────────────────▼─────────────────────────────────────┐
 │ microSD (FAT32, MovieCart field files)                          │
 └─────────────────────────────────────────────────────────────────┘
@@ -119,10 +119,11 @@ FatFs cluster walks and other CPU-bound loops call `moviecart_bus_yield()` so th
 | Region | Contents |
 |--------|----------|
 | **Flash `.hottext`** | `bus_dispatch`, `emulate_cartridge`, `bus_serve_cycle`, `moviecart_bus_pump` — fixed, line-aligned |
-| **SRAM1** (`0x20000000`) | Stack (`_estack = 0x2001C000`), `r_coreInfo`, `romData` table |
-| **SRAM2** (`0x2001C000`) | `mr_buffer1/2`, `diskBuffer` — SDIO DMA targets |
+| **CCM** (`0x10000000`) | Stack (`_estack = 0x10010000`), `r_coreInfo`, `romData` — D-bus only |
+| **SRAM1** (`0x20000000`) | `mr_buffer1`, `diskBuffer`, remaining `.data`/`.bss` |
+| **SRAM2** (`0x2001C000`) | `mr_buffer2` |
 
-Separating DMA destinations (SRAM2) from the stack and dispatch hot data (SRAM1) avoids AHB contention between sector DMA and per-cycle GPIO serving.
+CCM takes the serve-path table and stack off the AHB matrix. The two field buffers sit on opposite SRAM slaves so a DMA write to one does not share a port with a display read of the other.
 
 ### Source layout
 

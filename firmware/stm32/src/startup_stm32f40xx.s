@@ -69,10 +69,15 @@ defined in linker script */
     .section  .text.Reset_Handler
   .weak  Reset_Handler
   .type  Reset_Handler, %function
-Reset_Handler:  
-  ldr   sp, =_estack    /* Atollic update: set stack pointer */
+Reset_Handler:
+  /* CCM is D-bus only; enable its clock before SP lands there. */
+  ldr   r0, =0x40023830
+  ldr   r1, [r0]
+  orr   r1, r1, #(1 << 20)
+  str   r1, [r0]
+  ldr   sp, =_estack
 
-/* Copy the data segment initializers from flash to SRAM */  
+/* Copy the data segment initializers from flash to SRAM */
   movs  r1, #0
   b  LoopCopyDataInit
 
@@ -81,24 +86,53 @@ CopyDataInit:
   ldr  r3, [r3, r1]
   str  r3, [r0, r1]
   adds  r1, r1, #4
-    
+
 LoopCopyDataInit:
   ldr  r0, =_sdata
   ldr  r3, =_edata
   adds  r2, r0, r1
   cmp  r2, r3
   bcc  CopyDataInit
+
+/* Copy initialized CCM (romData) from flash */
+  movs  r1, #0
+  b  LoopCopyCcmInit
+
+CopyCcmInit:
+  ldr  r3, =_siccmram
+  ldr  r3, [r3, r1]
+  str  r3, [r0, r1]
+  adds  r1, r1, #4
+
+LoopCopyCcmInit:
+  ldr  r0, =_sccmram
+  ldr  r3, =_eccmram
+  adds  r2, r0, r1
+  cmp  r2, r3
+  bcc  CopyCcmInit
+
   ldr  r2, =_sbss
   b  LoopFillZerobss
-/* Zero fill the bss segment. */  
+/* Zero fill the bss segment. */
 FillZerobss:
   movs  r3, #0
   str  r3, [r2], #4
-    
+
 LoopFillZerobss:
-  ldr  r3, = _ebss
+  ldr  r3, =_ebss
   cmp  r2, r3
   bcc  FillZerobss
+
+/* Zero uninitialized CCM (r_coreInfo). */
+  ldr  r2, =_sccmbss
+  b  LoopFillZeroccm
+FillZeroccm:
+  movs  r3, #0
+  str  r3, [r2], #4
+LoopFillZeroccm:
+  ldr  r3, =_eccmbss
+  cmp  r2, r3
+  bcc  FillZeroccm
 
 /* Call the clock system initialization function. */
   bl  SystemInit
