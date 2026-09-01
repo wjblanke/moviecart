@@ -40,7 +40,7 @@ struct stateVars state;
  * romData live in CCM (D-bus only), so they never share a port with DMA
  * or GPIO. DMA writes the inactive buffer; display reads the other.
  */
-uint8_t mr_buffer1[FIELD_SIZE] __attribute__((aligned(16)));
+uint8_t mr_buffer1[FIELD_SIZE] __attribute__((aligned(16), section(".sram1")));
 uint8_t mr_buffer2[FIELD_SIZE] __attribute__((aligned(16), section(".sram2")));
 
 void updateInit(void);

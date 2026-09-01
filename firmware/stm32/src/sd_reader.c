@@ -23,8 +23,8 @@ static bool read_pending;
 
 #define DISK_READ_RETRIES	32
 
-/* Scratch sector in SRAM1, with mr_buffer1. */
-static uint8_t diskBuffer[512] __attribute__((aligned(16)));
+/* Scratch sector in SRAM1, with mr_buffer1. DMA cannot reach CCM. */
+static uint8_t diskBuffer[512] __attribute__((aligned(16), section(".sram1")));
 
 /*
  * UnoCart disk_read path. SDIO/DMA completion is polled manually in the driver

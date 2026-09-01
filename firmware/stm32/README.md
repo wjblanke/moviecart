@@ -161,11 +161,11 @@ Then `finishFieldRead()` checks `MVC\0` and geometry against the title-probe cac
 | Region | Contents |
 |--------|----------|
 | **Flash `.hottext`** | `bus_dispatch`, `emulate_cartridge`, `bus_serve_cycle`, `moviecart_bus_pump` — fixed, line-aligned |
-| **CCM** (`0x10000000`) | Stack (`_estack = 0x10010000`), `r_coreInfo`, `romData` — D-bus only |
-| **SRAM1** (`0x20000000`) | `mr_buffer1`, `diskBuffer`, remaining `.data`/`.bss` |
+| **CCM** (`0x10000000`) | Stack (`_estack = 0x10010000`), `.data`/`.bss`, `r_coreInfo`, `romData` — D-bus only |
+| **SRAM1** (`0x20000000`) | `mr_buffer1`, `diskBuffer` — SDIO DMA targets |
 | **SRAM2** (`0x2001C000`) | `mr_buffer2` |
 
-CCM takes the serve-path table and stack off the AHB matrix. The two field buffers sit on opposite SRAM slaves so a DMA write to one does not share a port with a display read of the other.
+CCM holds all CPU data so it does not share an AHB port with DMA. The two field buffers sit on opposite SRAM slaves so a DMA write to one does not share a port with a display read of the other.
 
 ### Source layout
 

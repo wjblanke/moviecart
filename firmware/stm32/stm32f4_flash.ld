@@ -136,23 +136,23 @@ SECTIONS
   /* used by the startup to initialize data */
   _sidata = LOADADDR(.data);
 
-  /* Initialized data sections goes into RAM, load LMA copy after code */
+  /*
+   * CPU data in CCM (D-bus). DMA cannot reach this bank — keep DMA buffers
+   * in .sram1 / .sram2. Reset_Handler copies .data and zeros .bss here.
+   */
   .data :
   {
     . = ALIGN(4);
-    _sdata = .;        /* create a global symbol at data start */
-    *(.ramfunc)        /* code executed from zero-wait-state SRAM */
-    *(.ramfunc*)
-    *(.data)           /* .data sections */
-    *(.data*)          /* .data* sections */
+    _sdata = .;
+    *(.data)
+    *(.data*)
 
     . = ALIGN(4);
-    _edata = .;        /* define a global symbol at data end */
-  } >RAM AT> FLASH
+    _edata = .;
+  } >CCMRAM AT> FLASH
 
   _siccmram = LOADADDR(.ccmram);
 
-  /* Initialized CCM (romData). Reset_Handler copies from flash. */
   .ccmram :
   {
     . = ALIGN(4);
@@ -164,7 +164,6 @@ SECTIONS
     _eccmram = .;
   } >CCMRAM AT> FLASH
 
-  /* Uninitialized CCM (r_coreInfo). Reset_Handler zeros it. */
   .ccmbss (NOLOAD) :
   {
     . = ALIGN(4);
@@ -176,26 +175,48 @@ SECTIONS
     _eccmbss = .;
   } >CCMRAM
 
-  ASSERT(_eccmbss <= (ORIGIN(CCMRAM) + LENGTH(CCMRAM) - _Min_Stack_Size),
-         "CCM overflow: data collided with the stack reservation")
-
-  /* Uninitialized data section */
-  . = ALIGN(4);
-  .bss :
+  .bss (NOLOAD) :
   {
-    /* This is used by the startup in order to initialize the .bss secion */
-    _sbss = .;         /* define a global symbol at bss start */
+    . = ALIGN(4);
+    _sbss = .;
     __bss_start__ = _sbss;
     *(.bss)
     *(.bss*)
+    *(.queueInfo)
+    *(.fileSystemInfo)
+    *(.updateInfo)
     *(COMMON)
 
     . = ALIGN(4);
-    _ebss = .;         /* define a global symbol at bss end */
+    _ebss = .;
     __bss_end__ = _ebss;
+  } >CCMRAM
+
+  ASSERT(_ebss <= (ORIGIN(CCMRAM) + LENGTH(CCMRAM) - _Min_Stack_Size),
+         "CCM overflow: data collided with the stack reservation")
+
+  /*
+   * SRAM1 DMA targets only. Executable RAM stubs stay here too — F4 CCM
+   * is not on the I-bus.
+   */
+  .sram1 (NOLOAD) :
+  {
+    . = ALIGN(16);
+    _ssram1 = .;
+    *(.sram1)
+    *(.sram1*)
+    . = ALIGN(16);
+    _esram1 = .;
   } >RAM
 
-  /* SRAM1 leftover check. Stack is in CCM, not here. */
+  .ramfunc :
+  {
+    . = ALIGN(4);
+    *(.ramfunc)
+    *(.ramfunc*)
+    . = ALIGN(4);
+  } >RAM AT> FLASH
+
   ._user_heap_stack :
   {
     . = ALIGN(4);
@@ -206,8 +227,8 @@ SECTIONS
   } >RAM
 
   /*
-   * SRAM2 (0x2001C000, 16 K): mr_buffer2 only. mr_buffer1 and diskBuffer live
-   * in SRAM1 (.bss) so the two field buffers are on different AHB slaves.
+   * SRAM2 (0x2001C000, 16 K): mr_buffer2 only. mr_buffer1 and diskBuffer
+   * are .sram1 so the two field buffers sit on different AHB slaves.
    */
   .sram2 (NOLOAD) :
   {
