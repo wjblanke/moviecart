@@ -1,13 +1,28 @@
 # MovieCart STM32F407VGT6 (DevEBox) firmware
 # Cart buses: A0-A12=PE0-PE12, D0-D7=PD8-PD15; SD via onboard SDIO.
+#
+# Toolchain (pick one):
+#   ./scripts/setup-toolchain.sh     # downloads ARM GNU 14.2 into tools/
+#   brew install --cask gcc-arm-embedded
+#   brew install arm-none-eabi-gcc arm-none-eabi-binutils  # compiler only; needs setup script
+#
+#   make TOOLCHAIN=/path/to/arm-none-eabi/bin   # override
 
 BUILDDIR = build
 DEPDIR = .depend/build
 
-CC = arm-none-eabi-gcc
-LD = arm-none-eabi-gcc
-OBJCOPY = arm-none-eabi-objcopy
+# Prefer a complete toolchain (compiler + newlib headers/libs).
+TOOLCHAIN ?= $(firstword $(wildcard tools/arm-gnu-toolchain-*-arm-none-eabi/bin) $(wildcard /Applications/ArmGNUToolchain/*/arm-none-eabi/bin))
+ifeq ($(TOOLCHAIN),)
+  TOOLCHAIN := $(shell command -v arm-none-eabi-gcc 2>/dev/null | xargs dirname 2>/dev/null)
+endif
+
+CC = $(TOOLCHAIN)/arm-none-eabi-gcc
+LD = $(TOOLCHAIN)/arm-none-eabi-gcc
+OBJCOPY = $(TOOLCHAIN)/arm-none-eabi-objcopy
 STFLASH = st-flash
+
+FREESTANDING = -ffreestanding
 
 SOURCES = \
 	src/startup_stm32f40xx.s \
@@ -27,6 +42,7 @@ SOURCES = \
 	Libraries/tm_stm32f4_fatfs/fatfs/drivers/fatfs_sd_sdio.c \
 	src/main.c \
 	src/core.c \
+	src/core_rom.c \
 	src/bus_service.c \
 	src/sd_reader.c \
 	src/pff.c \
@@ -136,6 +152,7 @@ endif
 CFLAGS = \
 	-MT $@ -MMD -MP -MF $(DEPDIR)/$*.d \
 	$(DEFS) \
+	$(FREESTANDING) \
 	-O2 -fno-tree-vrp -g \
 	-mcpu=cortex-m4 -mthumb \
 	-mfpu=fpv4-sp-d16 -mhard-float \
@@ -157,8 +174,32 @@ LDFLAGS += \
 	-Wl,--gc-sections \
 	-Wl,-Map=$(MAP)
 
-.PHONY: all bin elf hex flash clean
-all: bin hex
+.PHONY: all bin elf hex flash clean check-toolchain
+all: check-toolchain bin hex
+
+check-toolchain:
+	@test -x $(CC) || { \
+		echo "Missing $(CC)."; \
+		echo "Run: ./scripts/setup-toolchain.sh"; \
+		echo "  or: brew install --cask gcc-arm-embedded"; \
+		exit 1; \
+	}
+	@$(CC) -print-file-name=include/stdint.h | grep -q stdint.h || { \
+		echo "$(CC) has no newlib headers (Homebrew gcc-only install)."; \
+		echo "Run: ./scripts/setup-toolchain.sh"; \
+		exit 1; \
+	}
+
+# Generate cart ROM image from the Atari kernel build.
+../../kernel/core.bin:
+	$(MAKE) -C ../../kernel core.bin
+
+src/core_rom.c: ../../kernel/core.bin
+	python3 -c 'import pathlib; b=pathlib.Path("$<").read_bytes(); \
+print("#include \"core_rom.h\"\\n"); \
+print("const uint8_t mc_core_rom[MC_CORE_ROM_SIZE] = {"); \
+[print("  "+", ".join(f"0x{x:02x}" for x in b[i:i+16])+",") for i in range(0,len(b),16)]; \
+print("};")' > $@
 
 bin: $(BIN)
 hex: $(HEX)
@@ -178,6 +219,7 @@ $(BUILDDIR)/src/core.o: src/core.c
 	mkdir -p .depend/build/src
 	$(CC) -c -MT $@ -MMD -MP -MF .depend/build/src/core.d \
 		$(DEFS) \
+		$(FREESTANDING) \
 		-O2 -fno-tree-vrp -fno-gcse -fno-crossjumping -fno-toplevel-reorder -g \
 		-mcpu=cortex-m4 -mthumb \
 		-mfpu=fpv4-sp-d16 -mhard-float \

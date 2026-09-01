@@ -1,17 +1,25 @@
 
 #include "pff.h"
 #include "core.h"
+#include "core_rom.h"
 #include "defines.h"
 #include "cartridge_io.h"
 #include "bus_service.h"
 
 #define ST_OFF					0x86	/* stx(0) */
 #define ST_ON					0x84	/* sty(2) */
-#define ADDR_BOOT_WSYNC			0x31	/* sta WSYNC; HMOVE; wait_cnt; right_line */
 
-/* Whole jmp targets. The RAM routine is in page 0; the kernel is in page $FF. */
-#define JMP_RIGHT_LINE			0xff3eu
-#define JMP_END_LINES			0xffb7u
+/* core.asm / core.bin cart layout (org $F000). */
+#define MC_OFF_VISIBLE_ENTRY		0x09du
+#define MC_OFF_LINE0			0x0bfu
+#define MC_OFF_END_LINES		0x40eu
+#define MC_OFF_VISIBLE_RTS		0x41du
+#define MC_LINE_CYCLE			0x079u
+#define MC_PHASE_DYNAMIC_MAX		0x070u	/* g0x3e..g0xae; g0xaf+ from ROM */
+
+/* Legacy jmp targets (WaitCart resume only). */
+#define JMP_VISIBLE_BARS		0xf09du
+#define JMP_END_LINES			0xf40eu
 #define JMP_WAIT_RAM			0x0084u
 
 /*
@@ -175,7 +183,7 @@ static const uint8_t mc_wait_code[] = {
 	0xa2, 0x00,
 	0x86, 0x01,
 	0x86, 0x00,
-	0x4c, ADDR_BOOT_WSYNC, 0xff
+	0x4c, 0x9d, 0xf0
 };
 
 /*
@@ -184,7 +192,7 @@ static const uint8_t mc_wait_code[] = {
  * load instead of a volatile compare against mc_wait_state.
  */
 static volatile uint_fast16_t	mc_jmp_after_visible = JMP_END_LINES;
-static volatile uint_fast16_t	mc_jmp_after_blank = JMP_RIGHT_LINE;
+static volatile uint_fast16_t	mc_jmp_after_blank = JMP_VISIBLE_BARS;
 
 /*
  * What gstore drives. PrepareWait's `lda $1E00,y` lands here, so during the one
@@ -199,6 +207,9 @@ volatile uint8_t	mc_wait_state;
 volatile uint8_t	mc_wait_ready;
 volatile uint8_t	mc_wait_fault;
 volatile uint8_t	mc_visible_bars_vended;
+volatile uint8_t	mc_blanking_window;
+
+static uint16_t		mc_cart_off;
 
 static uint8_t		mc_poll_byte;
 static volatile uint_fast8_t	mc_store_dummy;	/* gstore sink before joystick setup */
@@ -226,6 +237,7 @@ mc_wait_restart_visible(void)
 	r_coreInfo.frameInfo.overscanLines = src->overscanLines;
 	r_coreInfo.frameInfo.vsyncLines = src->vsyncLines;
 	r_coreInfo.frameInfo.blankLines = src->blankLines;
+	r_coreInfo.frameInfo.totalLines = src->totalLines;
 	r_coreInfo.frameInfo.odd = src->odd;
 	r_coreInfo.mr_bufferIndex = !r_coreInfo.mr_bufferIndex;
 
@@ -233,9 +245,9 @@ mc_wait_restart_visible(void)
 	r_coreInfo.endState = 0;
 	r_coreInfo.vblankState = ST_OFF;
 	r_coreInfo.vsyncState = ST_OFF;
-	r_coreInfo.nextLineJump = JMP_RIGHT_LINE;
+	r_coreInfo.nextLineJump = JMP_VISIBLE_BARS;
 	mc_jmp_after_visible = JMP_END_LINES;
-	mc_jmp_after_blank = JMP_RIGHT_LINE;
+	mc_jmp_after_blank = JMP_VISIBLE_BARS;
 	frameLines = 0;
 }
 
@@ -292,7 +304,7 @@ mc_wait_handoff(void (*work)(void))
 				mc_wait_state = MC_WAIT_INSTALLED;
 				mc_poll_byte = MC_WAIT_READY;
 				mc_jmp_after_visible = JMP_END_LINES;
-				mc_jmp_after_blank = JMP_RIGHT_LINE;
+				mc_jmp_after_blank = JMP_VISIBLE_BARS;
 				r_coreInfo.nextLineJump = JMP_END_LINES;
 				mc_wait_fault = 1;
 				return;
@@ -403,6 +415,7 @@ coreInit(void)
 	r_coreInfo.mr_endFrame = 1;
 	r_coreInfo.mr_bufferIndex = false;
 	mc_visible_bars_vended = 0;
+	mc_blanking_window = 0;
 
 	r_coreInfo.mr_swcha = 0xff;
 	r_coreInfo.mr_swchb = 0xff;
@@ -428,7 +441,7 @@ coreInit(void)
 	r_coreInfo.vblankState = ST_OFF;
 	r_coreInfo.vsyncState = ST_OFF;
 	r_coreInfo.endState = 0;
-	r_coreInfo.nextLineJump = JMP_RIGHT_LINE;
+	r_coreInfo.nextLineJump = JMP_VISIBLE_BARS;
 	r_coreInfo.data = 0;
 	r_coreInfo.storeAddress = &mc_store_dummy;
 
@@ -439,13 +452,117 @@ coreInit(void)
 	SET_DATA_MODE_IN;
 }
 
+static void
+mc_field_swap_to_display(void)
+{
+	if (r_coreInfo.mr_bufferIndex == 0) {
+		r_coreInfo.frameInfo.colorBuf = r_coreInfo.mr_frameInfo2.colorBuf;
+		r_coreInfo.frameInfo.colorBKBuf = r_coreInfo.mr_frameInfo2.colorBKBuf;
+		r_coreInfo.frameInfo.audioBuf = r_coreInfo.mr_frameInfo2.audioBuf;
+		r_coreInfo.frameInfo.graphBuf = r_coreInfo.mr_frameInfo2.graphBuf;
+		r_coreInfo.frameInfo.visibleLines = r_coreInfo.mr_frameInfo2.visibleLines;
+		r_coreInfo.frameInfo.overscanLines = r_coreInfo.mr_frameInfo2.overscanLines;
+		r_coreInfo.frameInfo.vsyncLines = r_coreInfo.mr_frameInfo2.vsyncLines;
+		r_coreInfo.frameInfo.blankLines = r_coreInfo.mr_frameInfo2.blankLines;
+		r_coreInfo.frameInfo.totalLines = r_coreInfo.mr_frameInfo2.totalLines;
+		r_coreInfo.frameInfo.odd = r_coreInfo.mr_frameInfo2.odd;
+	} else {
+		r_coreInfo.frameInfo.colorBuf = r_coreInfo.mr_frameInfo1.colorBuf;
+		r_coreInfo.frameInfo.colorBKBuf = r_coreInfo.mr_frameInfo1.colorBKBuf;
+		r_coreInfo.frameInfo.audioBuf = r_coreInfo.mr_frameInfo1.audioBuf;
+		r_coreInfo.frameInfo.graphBuf = r_coreInfo.mr_frameInfo1.graphBuf;
+		r_coreInfo.frameInfo.visibleLines = r_coreInfo.mr_frameInfo1.visibleLines;
+		r_coreInfo.frameInfo.overscanLines = r_coreInfo.mr_frameInfo1.overscanLines;
+		r_coreInfo.frameInfo.vsyncLines = r_coreInfo.mr_frameInfo1.vsyncLines;
+		r_coreInfo.frameInfo.blankLines = r_coreInfo.mr_frameInfo1.blankLines;
+		r_coreInfo.frameInfo.totalLines = r_coreInfo.mr_frameInfo1.totalLines;
+		r_coreInfo.frameInfo.odd = r_coreInfo.mr_frameInfo1.odd;
+	}
+	r_coreInfo.mr_bufferIndex = !r_coreInfo.mr_bufferIndex;
+}
+
+/*
+ * Base of the audio array for the field currently on screen (mr_frameInfo
+ * holds the stable base; frameInfo.audioBuf is the live cursor).
+ */
+static uint8_t *
+mc_display_audio_base(void)
+{
+	if (r_coreInfo.mr_bufferIndex)
+		return r_coreInfo.mr_frameInfo2.audioBuf;
+	return r_coreInfo.mr_frameInfo1.audioBuf;
+}
+
+static void
+mc_audio_begin_visible(void)
+{
+	/*
+	 * MovieCart fields store audio in play order: visible scanlines first,
+	 * then vsync+blank+overscan (see the old cart kernel's end_lines path).
+	 * RamKernel runs visible from cart, blanking from RIOT with no AUDV0.
+	 */
+	r_coreInfo.frameInfo.audioBuf = mc_display_audio_base();
+}
+
+static void
+mc_audio_skip_blanking(void)
+{
+	/*
+	 * VisibleBars only hits sta AUDV0 on the eight dual-line kernels, not on
+	 * every visible scanline or during RIOT blanking.  Advance the cursor to
+	 * the end of this field's sound[] so the next load stays aligned and we
+	 * do not replay the blanking tail on the following frame.
+	 */
+	if (!r_coreInfo.frameInfo.numBlocks)
+		return;
+
+	if (r_coreInfo.frameInfo.totalLines <= r_coreInfo.frameInfo.visibleLines)
+		return;
+
+	r_coreInfo.frameInfo.audioBuf = mc_display_audio_base()
+		+ r_coreInfo.frameInfo.totalLines;
+}
+
+static void
+mc_visible_line_advance(void)
+{
+	r_coreInfo.frameInfo.graphBuf += 10;
+	r_coreInfo.frameInfo.colorBuf += 10;
+	frameLines += 2;
+}
+
+static void
+mc_on_visible_bars_entry(void)
+{
+	mc_field_swap_to_display();
+	mc_audio_begin_visible();
+	mc_blanking_window = 0;
+	mc_visible_bars_vended = 1;
+}
+
+static void
+mc_on_visible_bars_rts(void)
+{
+	mc_blanking_window = 1;
+	mc_visible_bars_vended = 0;
+	mc_audio_skip_blanking();
+
+	if (frameLines < 250 || frameLines > 275)
+		DIAG_NOTE(DIAG_FRAME_LENGTH);
+	frameLines = 0;
+#if MOVIECART_STALL_TEST != 1 && MOVIECART_STALL_TEST != 2
+	diagFrameTick();
+#endif
+	r_coreInfo.mr_endFrame = true;
+}
+
 
 HOTFUNC void
-bus_dispatch(uint16_t lo_address, uint8_t addr_low8)
+bus_dispatch(uint16_t cart_off, uint8_t addr_low8)
 {
 	/* In SRAM: a flash-resident table costs wait states per lookup, right
 	 * on the data-valid critical path. */
-	static const void* const romData[512] __attribute__((section(".ramfunc.romtable"))) = 
+	static const void* const romData[512] __attribute__((section(".ramfunc.romtable"))) =
 	{
 		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
 		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
@@ -474,16 +591,53 @@ bus_dispatch(uint16_t lo_address, uint8_t addr_low8)
 		&&g0x70, &&g0x71, &&g0x72, &&g0x73, &&g0x74, &&g0x75, &&g0x76, &&g0x77, &&g0x78, &&g0x79, &&g0x7a, &&g0x7b, &&g0x7c, &&g0x7d, &&g0x7e, &&g0x7f,
 		&&g0x80, &&g0x81, &&g0x82, &&g0x83, &&g0x84, &&g0x85, &&g0x86, &&g0x87, &&g0x88, &&g0x89, &&g0x8a, &&g0x8b, &&g0x8c, &&g0x8d, &&g0x8e, &&g0x8f,
 		&&g0x90, &&g0x91, &&g0x92, &&g0x93, &&g0x94, &&g0x95, &&g0x96, &&g0x97, &&g0x98, &&g0x99, &&g0x9a, &&g0x9b, &&g0x9c, &&g0x9d, &&g0x9e, &&g0x9f,
-		&&g0xa0, &&g0xa1, &&g0xa2, &&g0xa3, &&g0xa4, &&g0xa5, &&g0xa6, &&g0xa7, &&g0xa8, &&g0xa9, &&g0xaa, &&g0xab, &&g0xac, &&g0xad, &&g0xae, &&g0xaf,
-		&&g0xb0, &&g0xb1, &&g0xb2, &&g0xb3, &&g0xb4, &&g0xb5, &&g0xb6, &&g0xb7, &&g0xb8, &&g0xb9, &&g0xba, &&g0xbb, &&g0xbc, &&g0xbd, &&g0xbe, &&g0xbf,
-		&&g0xc0, &&g0xc1, &&g0xc2, &&g0xc3, &&g0xc4, &&g0xc5, &&g0xc6, &&g0xc7, &&g0xc8, &&g0xc9, &&g0xca, &&g0xcb, &&g0xcc, &&g0xcd, &&g0xce, &&g0xcf,
-		&&g0xd0, &&g0xd1, &&g0xd2, &&g0xd3, &&g0xd4, &&g0xd5, &&g0xd6, &&g0xd7, &&g0xd8, &&g0xd9, &&g0xda, &&g0xdb, &&g0xdc, &&g0xdd, &&g0xde, &&g0xdf,
-		&&g0xe0, &&g0xe1, &&g0xe2, &&g0xe3, &&g0xe4, &&g0xe5, &&g0xe6, &&g0xe7, &&g0xe8, &&g0xe9, &&g0xea, &&g0xeb, &&g0xec, &&g0xed, &&g0xee, &&g0xef,
+		&&g0xa0, &&g0xa1, &&g0xa2, &&g0xa3, &&g0xa4, &&g0xa5, &&g0xa6, &&g0xa7, &&g0xa8, &&g0xa9, &&g0xaa, &&g0xab, &&g0xac, &&g0xad, &&g0xae,
+		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
+		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
+		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
+		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
+		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
+		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
+		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&g0xec, &&g0xed, &&g0xee, &&g0xef,
 		&&g0xf0, &&g0xf1, &&g0xf2, &&g0xf3, &&g0xf4, &&g0xf5, &&g0xf6, &&g0xf7, &&g0xf8, &&g0xf9, &&g0xfa, &&g0xfb, &&g0xfc, &&g0xfd, &&g0xfe, &&g0xff
 	};
 
+	mc_cart_off = cart_off;
 
-	goto *romData[lo_address];
+	/*
+	 * VisibleBars scanlines: eight inlined kernel pairs from core.asm. Only
+	 * the lda # / ldx # / ldy # slots need buffer patches; the cycle-accurate
+	 * tail of each line (HMP, jmp next line) is served verbatim from core.bin.
+	 */
+	if (cart_off >= MC_OFF_LINE0 && cart_off < MC_OFF_END_LINES) {
+		uint16_t phase = (uint16_t)((cart_off - MC_OFF_LINE0) % MC_LINE_CYCLE);
+
+		if (phase <= MC_PHASE_DYNAMIC_MAX)
+			goto *romData[0x13Eu + phase];
+
+		SET_DATA(mc_core_rom[cart_off]);
+		if (phase == 0x76u)
+			mc_visible_line_advance();
+		EMULATE_DONE
+	}
+
+	if (cart_off == MC_OFF_VISIBLE_ENTRY) {
+		SET_DATA(mc_core_rom[cart_off]);
+		mc_on_visible_bars_entry();
+		EMULATE_DONE
+	}
+
+	if (cart_off == MC_OFF_VISIBLE_RTS) {
+		SET_DATA(mc_core_rom[cart_off]);
+		mc_on_visible_bars_rts();
+		EMULATE_DONE
+	}
+
+	if (cart_off == 0x0ff4u)
+		goto g0xf4;
+
+	SET_DATA(mc_core_rom[cart_off]);
+	EMULATE_DONE
 
 gstore:
 	*r_coreInfo.storeAddress = addr_low8;
@@ -493,6 +647,10 @@ gstore:
 	 * bios); mc_gstore_page is zero except during the boot copy.
 	 */
 	SET_DATA(mc_gstore_page[addr_low8]);
+	EMULATE_DONE
+
+mc_cart_rom_ld:
+	SET_DATA(mc_core_rom[mc_cart_off]);
 	EMULATE_DONE
 
 g0x00:
@@ -710,8 +868,6 @@ g0x30:
 
 g0x31:
 	SET_DATA(0x85); // sta WSYNC
-	/* VisibleBars entry: $31 path is vended once per frame after blanking. */
-	mc_visible_bars_vended = 1;
 	EMULATE_DONE
 
 g0x32:
@@ -1242,404 +1398,6 @@ g0xad:
 
 g0xae:
 	SET_DATA(0xa9);	// lda #$80 	// 2
-	EMULATE_DONE
-
-g0xaf:
-	SET_DATA(0x80);	// lda #$80 	// 2
-	r_coreInfo.lines -= 2;
-	frameLines += 2;
-	EMULATE_DONE
-
-g0xb0:
-	SET_DATA(0x85);	// sta HMP0 	// 3
-	if (LINES_EXHAUSTED(r_coreInfo.lines))
-	{
-		if (r_coreInfo.lines)	/* wrapped, not a clean zero */
-			DIAG_NOTE(DIAG_WRAP_VISIBLE);
-
-		r_coreInfo.nextLineJump = mc_jmp_after_visible;
-
-		if (!r_coreInfo.frameInfo.odd)
-			r_coreInfo.lines = r_coreInfo.frameInfo.overscanLines;
-		else
-			r_coreInfo.lines = r_coreInfo.frameInfo.overscanLines-1;
-
-		r_coreInfo.vblankState = ST_ON;
-	}
-	else
-	{
-		r_coreInfo.frameInfo.graphBuf += 10;
-		r_coreInfo.frameInfo.colorBuf += 10;
-	}
-	EMULATE_DONE
-
-g0xb1:
-	SET_DATA(0x20);
-	EMULATE_DONE
-
-g0xb2:
-	SET_DATA(0x85);	// sta HMP1 	// 3 @63
-	EMULATE_DONE
-
-g0xb3:
-	SET_DATA(0x21);
-	EMULATE_DONE
-
-g0xb4:
-	SET_DATA(0x4c); // jmp $FFxx (kernel) or $0084 (RAM wait)
-	EMULATE_DONE
-
-g0xb5:
-	SET_DATA(r_coreInfo.nextLineJump);
-	EMULATE_DONE
-
-g0xb6:
-	SET_DATA(r_coreInfo.nextLineJump >> 8);
-	EMULATE_DONE
-
-g0xb7:
-	SET_DATA(0xa0);	// ldy #2	// end_lines 	//@213	// end of current line
-	EMULATE_DONE
-
-g0xb8:
-	SET_DATA(0x02);
-	EMULATE_DONE
-
-g0xb9:
-	SET_DATA(0xa2);
-	EMULATE_DONE	// ldx #0
-
-g0xba:
-	SET_DATA(0x00);
-	EMULATE_DONE
-
-g0xbb:
-	SET_DATA(r_coreInfo.vsyncState);
-	EMULATE_DONE	// stx VSYNC	// beginning of new line
-
-g0xbc:
-	SET_DATA(0x00);
-	EMULATE_DONE
-
-g0xbd:
-	SET_DATA(r_coreInfo.vblankState);
-	EMULATE_DONE	// stx VBLANK
-
-g0xbe:
-	SET_DATA(0x01);
-	EMULATE_DONE
-
-g0xbf:
-	SET_DATA(0xa9); // lda #AUD_DATA 	// 2
-	r_coreInfo.data = *r_coreInfo.frameInfo.audioBuf++;
-	EMULATE_DONE
-
-
-g0xc0:
-	SET_DATA(r_coreInfo.data);
-	EMULATE_DONE
-
-g0xc1:
-	SET_DATA(0x85); // sta AUDV0 	// 3 @10
-	EMULATE_DONE
-
-g0xc2:
-	SET_DATA(0x19);
-	EMULATE_DONE
-
-g0xc3:
-	SET_DATA(0xae); // ldx SWCHA 	// 4 ad 80 02 0x280 RLDU(1) RLDU(2) 	// 1111 1111 by default
-	EMULATE_DONE
-
-g0xc4:
-	SET_DATA(0x80);
-	EMULATE_DONE
-
-g0xc5:
-	SET_DATA(0x02);
-	EMULATE_DONE
-
-g0xc6:
-	SET_DATA(0xbd);  // lda   $FE00,x //	 4  first 256 bytes
-	EMULATE_DONE
-
-g0xc7:
-	SET_DATA(0x00);
-	EMULATE_DONE
-
-g0xc8:
-	SET_DATA(0xfe);
-	r_coreInfo.storeAddress = &r_coreInfo.mr_swcha;
-	EMULATE_DONE
-
-g0xc9:
-	SET_DATA(0xae); // ldx SWCHB 	// 4 ad 82 02 0x282 a b - - color - select reset
-	EMULATE_DONE
-
-g0xca:
-	SET_DATA(0x82);
-	EMULATE_DONE
-
-g0xcb:
-	SET_DATA(0x02);
-	EMULATE_DONE
-
-g0xcc:
-	SET_DATA(0xbd);  // lda   $FE00,x //	 4  first 256 bytes
-	EMULATE_DONE
-
-g0xcd:
-	SET_DATA(0x00);
-	EMULATE_DONE
-
-g0xce:
-	SET_DATA(0xfe);
-	r_coreInfo.storeAddress = &r_coreInfo.mr_swchb;
-	EMULATE_DONE
-
-g0xcf:
-	SET_DATA(0xa6); // ldx INPT4 	// 3 a5 0c 0x0c button - - - - - - -
-	EMULATE_DONE
-
-
-g0xd0:
-	SET_DATA(0x0c);
-	EMULATE_DONE
-
-g0xd1:
-	SET_DATA(0xbd);  // lda   $FE00,x //	 4  first 256 bytes
-	EMULATE_DONE
-
-g0xd2:
-	SET_DATA(0x00);
-	EMULATE_DONE
-
-g0xd3:
-	SET_DATA(0xfe);
-	r_coreInfo.storeAddress = &r_coreInfo.mr_inpt4;
-	EMULATE_DONE
-
-g0xd4:
-	SET_DATA(0xa6); // ldx INPT5 	// 3 a5 0d 0x0d button - - - - - - -
-	EMULATE_DONE
-
-g0xd5:
-	SET_DATA(0x0d);
-	EMULATE_DONE
-
-g0xd6:
-	SET_DATA(0xbd);  // lda   $FE00,x //	 4  first 256 bytes
-	EMULATE_DONE
-
-g0xd7:
-	SET_DATA(0x00);
-	EMULATE_DONE
-
-g0xd8:
-	SET_DATA(0xfe);
-	r_coreInfo.storeAddress = &r_coreInfo.mr_inpt5;
-	EMULATE_DONE
-
-g0xd9:
-	SET_DATA(0xa2); // ldx   #0 
-	frameLines++;
-	r_coreInfo.lines--;
-	if (LINES_EXHAUSTED(r_coreInfo.lines))
-	{
-		if (r_coreInfo.lines)	/* wrapped, not a clean zero */
-			DIAG_NOTE(DIAG_WRAP_ENDLINES);
-
-		switch (r_coreInfo.endState)
-		{
-			case 0:
-				TESTA1_HIGH
-				r_coreInfo.endState++;
-				r_coreInfo.lines = r_coreInfo.frameInfo.vsyncLines;
-				r_coreInfo.vsyncState = ST_ON;
-
-				EMULATE_DONE
-
-			case 1:
-				r_coreInfo.endState++;
-				if (!r_coreInfo.frameInfo.odd)
-					r_coreInfo.lines = r_coreInfo.frameInfo.blankLines+1;
-				else
-					r_coreInfo.lines = r_coreInfo.frameInfo.blankLines;
-
-				r_coreInfo.vsyncState = ST_OFF;
-				EMULATE_DONE
-
-			case 2:
-				r_coreInfo.endState++;
-				r_coreInfo.vblankState = ST_OFF;
-				/*
-				 * Deliberately leaves lines at zero; $FFe3
-				 * loads visibleLines later in this same
-				 * scanline. Adding `lines = 1` here to absorb a
-				 * spurious extra decrement was tried and blacked
-				 * out the display: the end-of-frame cases have
-				 * no room for even one more store.
-				 */
-				r_coreInfo.nextLineJump = mc_jmp_after_blank;
-				EMULATE_DONE
-		}
-	}
-	EMULATE_DONE
-
-g0xda:
-	SET_DATA(0x00);
-	if (r_coreInfo.endState == 3)
-	{
-		if (r_coreInfo.frameInfo.odd)
-		{
-			r_coreInfo.audioVal = *r_coreInfo.frameInfo.audioBuf++;
-			r_coreInfo.audioPushed = true;
-		}
-	}
-	EMULATE_DONE
-
-g0xdb:
-	SET_DATA(0xea); // nop
-	if (r_coreInfo.endState == 3)
-	{
-		if (r_coreInfo.mr_bufferIndex == 0)
-		{
-			r_coreInfo.frameInfo.colorBuf = r_coreInfo.mr_frameInfo2.colorBuf;
-			r_coreInfo.frameInfo.colorBKBuf = r_coreInfo.mr_frameInfo2.colorBKBuf;
-		}
-		else
-		{
-			r_coreInfo.frameInfo.colorBuf = r_coreInfo.mr_frameInfo1.colorBuf;
-			r_coreInfo.frameInfo.colorBKBuf = r_coreInfo.mr_frameInfo1.colorBKBuf;
-		}
-	}
-	EMULATE_DONE
-
-g0xdc:
-	SET_DATA(0xea); // nop
-	if (r_coreInfo.endState == 3)
-	{
-		if (r_coreInfo.mr_bufferIndex == 0)
-		{
-			r_coreInfo.frameInfo.audioBuf = r_coreInfo.mr_frameInfo2.audioBuf;
-			r_coreInfo.frameInfo.graphBuf = r_coreInfo.mr_frameInfo2.graphBuf;
-		}
-		else
-		{
-			r_coreInfo.frameInfo.audioBuf = r_coreInfo.mr_frameInfo1.audioBuf;
-			r_coreInfo.frameInfo.graphBuf = r_coreInfo.mr_frameInfo1.graphBuf;
-		}
-	}
-	EMULATE_DONE
-
-g0xdd:
-	SET_DATA(0xea); // nop
-	if (r_coreInfo.endState == 3)
-	{
-		if (r_coreInfo.mr_bufferIndex == 0)
-		{
-			r_coreInfo.frameInfo.visibleLines = r_coreInfo.mr_frameInfo2.visibleLines;
-			r_coreInfo.frameInfo.overscanLines = r_coreInfo.mr_frameInfo2.overscanLines;
-		}
-		else
-		{
-			r_coreInfo.frameInfo.visibleLines = r_coreInfo.mr_frameInfo1.visibleLines;
-			r_coreInfo.frameInfo.overscanLines = r_coreInfo.mr_frameInfo1.overscanLines;
-		}
-	}
-	EMULATE_DONE
-
-g0xde:
-	SET_DATA(0xea); // nop
-	if (r_coreInfo.endState == 3)
-	{
-		if (r_coreInfo.mr_bufferIndex == 0)
-		{
-			r_coreInfo.frameInfo.vsyncLines = r_coreInfo.mr_frameInfo2.vsyncLines;
-			r_coreInfo.frameInfo.blankLines = r_coreInfo.mr_frameInfo2.blankLines;
-		}
-		else
-		{
-			r_coreInfo.frameInfo.vsyncLines = r_coreInfo.mr_frameInfo1.vsyncLines;
-			r_coreInfo.frameInfo.blankLines = r_coreInfo.mr_frameInfo1.blankLines;
-		}
-	}
-	EMULATE_DONE
-
-g0xdf:
-	SET_DATA(0xea); // nop
-	if (r_coreInfo.endState == 3)
-	{
-		if (r_coreInfo.mr_bufferIndex == 0)
-		{
-			r_coreInfo.frameInfo.odd = r_coreInfo.mr_frameInfo2.odd;
-		}
-		else
-		{
-			r_coreInfo.frameInfo.odd = r_coreInfo.mr_frameInfo1.odd;
-		}
-	}
-	EMULATE_DONE	// nop
-
-g0xe0:
-	SET_DATA(0xea); // nop
-	if (r_coreInfo.endState == 3)
-	{
-		r_coreInfo.mr_bufferIndex = !r_coreInfo.mr_bufferIndex;
-	}
-	EMULATE_DONE	// nop
-
-g0xe1:
-g0xe2:
-	SET_DATA(0xea); // nop
-	EMULATE_DONE
-
-g0xe3:
-	SET_DATA(r_coreInfo.vsyncState);	// stx VSYNC
-	if (r_coreInfo.endState == 3)
-	{
-		r_coreInfo.lines = r_coreInfo.frameInfo.visibleLines;
-
-		r_coreInfo.endState = 0;
-		r_coreInfo.mr_endFrame = true;
-		TESTA1_LOW
-
-		if (frameLines < 250 || frameLines > 275)
-			DIAG_NOTE(DIAG_FRAME_LENGTH);
-		frameLines = 0;
-#if MOVIECART_STALL_TEST != 1 && MOVIECART_STALL_TEST != 2
-		diagFrameTick();
-#endif
-	}
-	EMULATE_DONE
-
-g0xe4:
-	SET_DATA(0x00);
-	EMULATE_DONE
-
-g0xe5:
-	SET_DATA(r_coreInfo.vblankState);	// stx VBLANK
-	EMULATE_DONE
-
-g0xe6:
-	SET_DATA(0x01);
-	EMULATE_DONE
-
-g0xe7:
-g0xe8:
-	SET_DATA(0xea); // nop
-	EMULATE_DONE
-
-g0xe9:
-	SET_DATA(0x4c);	// jmp
-	EMULATE_DONE
-
-g0xea:
-	SET_DATA(r_coreInfo.nextLineJump);	// $B7 / $3E / $84
-	EMULATE_DONE
-
-g0xeb:
-	SET_DATA(r_coreInfo.nextLineJump >> 8);
 	EMULATE_DONE
 
 /*

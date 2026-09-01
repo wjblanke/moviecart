@@ -71,10 +71,8 @@ waitEndFrame(void)
 }
 
 /*
- * Block until the kernel's VisibleBars entry ($FF31) is served to the 6502.
- * That is the visible-kernel entry moment (sta WSYNC @ $FF31 before right_line):
- * blanking is done, the visible dual-line kernel is about to run, and the
- * inactive field buffer can be filled for the next swap.
+ * Block until VisibleBars ($F09D) is served — blanking in RIOT is done and the
+ * cart-visible section of this frame is about to run.
  */
 static void
 waitVisibleBarsVended(void)
@@ -902,15 +900,6 @@ checkSelectVideo(int *which)
 	coreInfoToState();
 }
 
-/* Set by the field load so it can run as a plain callback under the handoff. */
-static uint8_t frame_fault;
-
-static void
-loadFrameWork(void)
-{
-	frame_fault = prepareNextFrame();
-}
-
 static void
 runFrameLoop(void)
 {
@@ -922,25 +911,22 @@ runFrameLoop(void)
 	while (1) {
 		waitEndFrame();
 
-		/*
-		 * No status LED here. PA1 belongs to the kernel's end-of-frame
-		 * diagnostic; a once-per-frame write from this loop as well made
-		 * the blink count unreadable, which is the only channel out.
-		 */
 		checkSelectVideo(&which);
 		updateTransport(&state);
 
 		/*
-		 * Wait until $FF31 (VisibleBars / right_line entry) is vended, then
-		 * park via WaitCart and DMA the next field into the inactive
-		 * buffer. Handoff resumes at $FF31 so the visible kernel still
-		 * runs; the double-buffer swap at end-of-frame picks up the data.
+		 * VisibleBars RTS ($F41D) marks the start of the RIOT blanking
+		 * tail. prepareNextFrame() yields through SDIO reads on A12-low
+		 * cycles while RamKernel runs from RIOT $80. If the load finishes
+		 * before the next VisibleBars entry, keep serving until $F09D.
 		 */
-		waitVisibleBarsVended();
-		frame_fault = 0;
-		mc_wait_handoff(loadFrameWork);
+		mc_visible_bars_vended = 0;
+		uint8_t frame_fault = prepareNextFrame();
+
 		if (frame_fault)
 			fatalBlink(frame_fault);
+		while (!mc_visible_bars_vended)
+			bus_serve_cycle();
 	}
 }
 

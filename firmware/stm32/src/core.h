@@ -86,12 +86,18 @@ extern volatile uint8_t		mc_wait_state;
 extern volatile uint8_t		mc_wait_ready;
 
 /*
- * Set when the bus serves $FF31 (sta WSYNC → HMOVE → right_line) — the MovieCart
- * visible-kernel entry ($FF31 sta WSYNC before right_line)
- * landing in VisibleBars. Main uses this to start the next double-buffered field
- * DMA after that instruction stream is vended, instead of right after end-of-frame.
+ * RamKernel frame markers (see core.asm / core.bin):
+ *
+ *   mc_visible_bars_vended  set when the cart serves VisibleBars ($F09D) — the
+ *                          6502 just finished blanking in RIOT and is entering
+ *                          the cart-visible section for this frame.
+ *
+ *   mc_blanking_window     set when VisibleBars RTS ($F41D) is served — visible
+ *                          is done, blanking runs from RIOT, and the MCU is
+ *                          free for SDIO DMA on A12-low cycles.
  */
 extern volatile uint8_t		mc_visible_bars_vended;
+extern volatile uint8_t		mc_blanking_window;
 
 /*
  * Why an armed handoff failed to park. Non-zero means work() did NOT run.

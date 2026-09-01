@@ -1,5 +1,7 @@
 build/
 .depend/
+tools/arm-gnu-toolchain.tar.xz
+tools/arm-gnu-toolchain-*/
 *.o
 *.elf
 *.bin
