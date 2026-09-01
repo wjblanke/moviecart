@@ -32,7 +32,8 @@ System clock: HSI → PLL @ 168 MHz (same as UnoCart DevEBox); SDIOCLK 48 MHz.
 ┌─────────────────────────────────────────────────────────────────┐
 │ 6502 / 6507                                                     │
 │   Visible scanlines  ← looping kernel in core.c (g0x3e–g0xb6)   │
-│   Sync / blank / OS  ← RamKernel copied to RIOT $80 at boot     │
+│   First 6 overscan   ← cart $F160 (samples + pack copy)         │
+│   Rest of OS / VS / VB ← RamKernel in RIOT $80 (nibble play)    │
 └───────────────────────────┬─────────────────────────────────────┘
                             │ A12-high cart fetches (~838 ns/cycle)
 ┌───────────────────────────▼─────────────────────────────────────┐
@@ -70,6 +71,7 @@ Cart dispatch indexes **`addr & 0xfff`** (12-bit space). Key hook addresses:
 | `$F09D` | VisibleBars entry (nop) | Title: swap display buffer. Playback: no swap (already done in blanking). Reset audio cursor, set `mc_visible_bars_vended` |
 | `$F09E`–`$F116` | right/left pair | Patch graphics/color/audio; `jmp $F09E` or `$F160` |
 | `$F140`–`$F15F` | CartPack | 32 packed bytes (tail after 6 cart samples) |
+| `$F16C` / `$F199` | overscan `lda #` | Next tail sample immediate (6 fetches) |
 | `$F160`–`$F1C1` | overscan head | 5×6 + 2 copy, 6× `AUDV0`, joystick + `WSYNC`, RTS |
 | `$F200`+ | RamKernel image | Copied to RIOT `$80` at ColdStart |
 | `$FE00+x` | gstore | Latch SWCHA / SWCHB / INPT4 / INPT5 |
@@ -95,15 +97,17 @@ Pack is taken from the display buffer **base** at swap (`+ visible + 6`), not fr
 | Side | When | Action |
 |------|------|--------|
 | STM32 | swap | Pack two samples per byte into `mc_aud_pack[32]`; serve `$F140` |
-| STM32 | `$F16C` / `$F19B` | Next tail sample as `lda #` immediate (6 fetches) |
+| STM32 | `$F16C` / `$F199` | Next tail sample as `lda #` immediate (6 fetches) |
 | 6502 overscan head | After 192 picture lines | Play 6 samples; `lda $F140,x` / `sta $D0,x` |
 | 6502 RamKernel | A12 low | `AUDIDX` even → low nibble; odd → `lsr ×4`; both `and #$0F`; `sta AUDV0` |
 
-#### RIOT map (128 bytes)
+#### RIOT map (128 bytes, `$80`–`$FF`)
 
 | RIOT | Size | Role |
 |------|-----:|------|
-| `$80`–`$CB` | 76 | RamKernel (copied from `$F200` at ColdStart) |
+| `$80`–`$A7` | 40 | Frame: `jsr $F09D`, remaining OS 23/24, VS 3, VB 37, `stx VBLANK` / `AUDIDX` |
+| `$A8`–`$B2` | 11 | HMOVE pad (`ldx #7` / `nop` / `bit $00` / `jmp $80`) — not a scanline |
+| `$B3`–`$CB` | 25 | `Play` (`lda $D0,y`, nibble unpack, `sta AUDV0` / `WSYNC`) |
 | `$CC`–`$CF` | 4 | unused |
 | `$D0`–`$EF` | 32 | Packed tail after the 6 cart OS samples |
 | `$F0`–`$FA` | 11 | unused |
@@ -111,6 +115,60 @@ Pack is taken from the display buffer **base** at swap (`+ visible + 6`), not fr
 | `$FC` | 1 | `AUDIDX` |
 | `$FD` | 1 | unused |
 | `$FE`–`$FF` | 2 | 6502 stack for `jsr VisibleBars` / `jsr Play` |
+
+`$80`–`$CB` is 76 bytes (copied from `$F200`). `$80`–`$FF` is 128.
+
+#### RamKernel listing
+
+Firmware image `mc_ram_kernel[]` at `$F200`, copied to `$80`. Not assembled from `core.asm`.
+
+```asm
+; rorg $80
+RamKernel
+        jsr     $F09D           ; VisibleBars (cart)
+        inc     $FB             ; FIELD
+        lda     $FB
+        lsr
+        ldx     #23
+        bcc     .even
+        inx                     ; 24 on odd
+.even   jsr     Play            ; $B3
+        lda     #2
+        sta     $00             ; VSYNC
+        ldx     #3
+        jsr     Play
+        stx     $00             ; VSYNC off (X=0)
+        lda     #2
+        sta     $01             ; VBLANK
+        ldx     #37
+        jsr     Play
+        stx     $01             ; VBLANK off
+        stx     $FC             ; AUDIDX = 0
+        ldx     #7              ; HMOVE pad, $A8 (44 cycles, not a line)
+.pad    dex
+        bne     .pad
+        nop
+        bit     $00
+        jmp     $80
+
+Play                            ; $B3
+        lda     $FC             ; AUDIDX
+        lsr
+        tay
+        lda     $00D0,y         ; PACK
+        bcc     .lo
+        lsr
+        lsr
+        lsr
+        lsr
+.lo     and     #$0F
+        sta     $19             ; AUDV0
+        inc     $FC
+        sta     $02             ; WSYNC
+        dex
+        bne     Play
+        rts
+```
 
 #### Edges
 
@@ -222,7 +280,7 @@ Playback work must finish before VBLANK goes off. Mount, title probe, and file-s
 
 #### Window breakdown
 
-NTSC field: **192 + 6 + 23/24 + 3 + 37 = 261 / 262**. Only the last three segments are RamKernel. VSYNC/VBLANK register writes sit in the first cycles of a Play line (after the previous `WSYNC`); they are not extra scanlines. A ~12-cycle pad after VBLANK off is not a line.
+NTSC field: **192 + 6 + 23/24 + 3 + 37 = 261 / 262**. Only the 63 / 64 Play lines are the SDIO-quiet RamKernel window. VSYNC/VBLANK register writes sit in the first cycles of a Play line (after the previous `WSYNC`); they are not extra scanlines. The HMOVE pad after VBLANK off is **44 cycles** (`ldx #7` / `nop` / `bit $00` / `jmp $80`) — not a line, and after the window.
 
 | Segment | Even (lines) | Odd (lines) | Even (ms) | Odd (ms) | Budget? |
 |---------|-------------:|------------:|----------:|---------:|---------|
@@ -231,7 +289,8 @@ NTSC field: **192 + 6 + 23/24 + 3 + 37 = 261 / 262**. Only the last three segmen
 | Remaining overscan (RIOT) | 23 | 24 | 1.47 | 1.53 | Yes |
 | VSYNC (3 Play lines) | 3 | 3 | 0.19 | 0.19 | Yes |
 | VBLANK (37 Play lines) | 37 | 37 | 2.36 | 2.36 | Yes |
-| **RamKernel** | **63** | **64** | **4.01** | **4.08** | — |
+| **RamKernel (Play)** | **63** | **64** | **4.01** | **4.08** | SDIO-quiet window |
+| HMOVE pad (RIOT `$A8`) | 0 | 0 | 0.04 | 0.04 | No — after VBLANK off; A12 low |
 | **Field** | **261** | **262** | **16.62** | **16.69** | — |
 
 **NTSC is the target.** PAL still uses the NTSC 23/24+3+37 RamKernel; `visibleLines` comes from the field header.
@@ -295,7 +354,7 @@ Stacked totals in one **RamKernel** (168 MHz CPU, 8 MHz 4-bit SDIO). Shares are 
 | Field CMD18 payload (5–6 × 512 B) | Visible interval after `beginFieldRead` | 0.64 ms peak (4 MB/s, 5 sectors) · ~0.77 ms PAL 6 sectors · up to ~1.5 ms on a 2 MB/s card |
 | Looping visible kernel dispatch | Every cart cycle of ~192 lines | Must stay under ~100 ns per fetch |
 | `$F1C1` RTS hook (snap audio, diag, `mr_endFrame`) | End of 6-line overscan head | <2 µs on that cycle |
-| HMOVE pad (in RamKernel) | After VBLANK off; A12 low | `ldx #7` / `nop` / `bit $00` / `jmp $80`; no extra line |
+| HMOVE pad (RIOT `$A8`–`$B2`) | After VBLANK off; A12 low | 44 cycles (`ldx #7` / `nop` / `bit $00` / `jmp $80`); not a line |
 | Title buffer swap + pack at `$F09D` | Start of visible | Pointers + 32-byte pack, <15 µs |
 | Overscan head (`$F160`, 6 lines) | After 192 picture lines; A12 high | 6 `AUDV0` + 32-byte copy; before blanking window |
 
