@@ -48,7 +48,7 @@
  */
 #define LINES_EXHAUSTED(n)	((n) == 0 || (n) > 250)
 
-struct coreInfo r_coreInfo __attribute__((section(".ccmbss")));
+struct coreInfo r_coreInfo;
 
 /*
  * Frame-driven diagnostics. The bus loop owns the CPU with interrupts off, so
@@ -93,7 +93,7 @@ static uint16_t frameLines;	/* scanlines counted in this frame */
  * two patterns superimposed, not one pattern mistimed. Whoever is deliberately
  * blinking wins; the heartbeat resumes when it is done.
  */
-volatile uint8_t mc_led_host __attribute__((section(".ccmbss")));
+volatile uint8_t mc_led_host;
 
 /*
  * Raise a diagnostic code from outside the kernel.
@@ -110,11 +110,11 @@ mc_diag_note(uint8_t code)
 	DIAG_NOTE(code);
 }
 
-volatile uint8_t	mc_visible_bars_vended __attribute__((section(".ccmbss")));
-volatile uint8_t	mc_blanking_window __attribute__((section(".ccmbss")));
-volatile uint16_t	mc_blanking_window_gen __attribute__((section(".ccmbss")));
-volatile uint8_t	mc_sdio_gate_relaxed __attribute__((section(".ccmbss")));
-volatile uint8_t	mc_playback_pipeline __attribute__((section(".ccmbss")));
+volatile uint8_t	mc_visible_bars_vended;
+volatile uint8_t	mc_blanking_window;
+volatile uint16_t	mc_blanking_window_gen;
+volatile uint8_t	mc_sdio_gate_relaxed;
+volatile uint8_t	mc_playback_pipeline;
 
 static inline void
 diagFrameTick(void)
@@ -273,8 +273,8 @@ mc_on_visible_bars_rts(void)
 HOTFUNC void
 bus_dispatch(uint16_t cart_off)
 {
-	/* Visible-line patch slots only (phase 0 = g0x3e). In CCM (D-bus)
-	 * so the lookup does not share AHB with GPIO or SDIO DMA. */
+	/* Visible-line patch slots only (phase 0 = g0x3e). Section is required:
+	 * static const would otherwise go to flash .rodata. */
 	static const void* const romData[MC_PHASE_DYNAMIC_MAX + 1]
 		__attribute__((section(".ccmram"))) =
 	{

@@ -74,8 +74,7 @@ emulate_cartridge(void)
 	}
 }
 
-/* CCM: must not share SRAM1 with mr_buffer1 / diskBuffer DMA. */
-static uint16_t serve_addr_prev __attribute__((section(".ccmbss")));
+static uint16_t serve_addr_prev;
 
 #if MOVIECART_GAP_PROBE
 volatile uint8_t mc_probe_phase;
@@ -175,8 +174,8 @@ moviecart_bus_yield(void)
 void
 moviecart_sdio_gate(void)
 {
-	static uint16_t seen __attribute__((section(".ccmbss")));
-	static uint8_t primed __attribute__((section(".ccmbss")));
+	static uint16_t seen;
+	static uint8_t primed;
 
 	if (mc_sdio_gate_relaxed) {
 		while (!mc_blanking_window)
@@ -252,7 +251,7 @@ moviecart_sdio_gate(void)
  * same trade already made everywhere else here: never damage a healthy console to
  * report on a dead one.
  */
-static uint16_t pump_work_addr __attribute__((section(".ccmram"))) = 0xffffu;
+static uint16_t pump_work_addr = 0xffffu;
 #endif
 
 HOTFUNC void
