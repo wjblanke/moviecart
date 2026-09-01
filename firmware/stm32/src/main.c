@@ -544,6 +544,7 @@ field_reads_ok_in_scratch(uint32_t offset)
 
 static bool disk_mount_ok;
 static bool disk_open_ok;
+static uint8_t playback_field_blocks;
 
 static void
 mount_work(void)
@@ -598,11 +599,16 @@ loadField(struct frameInfo *fInfo, uint32_t offset)
 
 	pf_seek_block(offset);
 
-	if (!pf_read_block(dst)) {
+	/*
+	 * The strict title probe cached this file's field size. MovieCart fields
+	 * occupy 1..6 consecutive sectors inside an eight-sector slot, so fetch
+	 * the entire field with one CMD18 and one DMA transfer.
+	 */
+	if (!playback_field_blocks ||
+	    !pf_read_blocks(dst, playback_field_blocks)) {
 		fault = BLINK_SECTOR_READ;
 		goto out;
 	}
-	dst += 512;
 
 	/* Every field starts with "MVC\0". Reject a bad sector/header before its
 	 * geometry can turn into an out-of-bounds DMA destination below. */
@@ -613,19 +619,10 @@ loadField(struct frameInfo *fInfo, uint32_t offset)
 
 	frameInit(fInfo);
 	if (!fInfo->visibleLines || !fInfo->numBlocks ||
-	    fInfo->numBlocks > FIELD_MAX_BLOCKS) {
+	    fInfo->numBlocks > FIELD_MAX_BLOCKS ||
+	    fInfo->numBlocks != playback_field_blocks) {
 		fault = BLINK_FIELD_GEOMETRY;
 		goto out;
-	}
-
-	int nb = fInfo->numBlocks - 1;
-	while (nb) {
-		if (!pf_read_block(dst)) {
-			fault = BLINK_SECTOR_READ;
-			goto out;
-		}
-		dst += 512;
-		nb--;
 	}
 
 out:
@@ -747,6 +744,7 @@ runTitle(void)
 	if (!fInfo.visibleLines || !fInfo.numBlocks ||
 	    fInfo.numBlocks > FIELD_MAX_BLOCKS)
 		fatalBlink(BLINK_FIELD_GEOMETRY);
+	playback_field_blocks = fInfo.numBlocks;
 	uint8_t fileVis = fInfo.visibleLines;
 
 	flash_led(4);
@@ -854,9 +852,10 @@ runFrameLoop(void)
 		/*
 		 * VisibleBars RTS ($F41D) marks the start of the RIOT blanking
 		 * tail. prepareNextFrame() calls into FatFs/disk_read; the SDIO
-		 * driver waits for a fresh mc_blanking_window_gen edge before each
-		 * command, poll, or DMA drain. If the load finishes before the next
-		 * VisibleBars entry, keep serving until $F09D.
+		 * gate is relaxed for the field's single multi-block DMA, so every
+		 * command and poll may proceed in the current blanking window. If
+		 * the load finishes before the next VisibleBars entry, keep serving
+		 * until $F09D.
 		 */
 		mc_visible_bars_vended = 0;
 		uint8_t frame_fault = prepareNextFrame();

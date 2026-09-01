@@ -106,7 +106,7 @@ After the embedded title screen and SD mount:
 2. **`runFrameLoop()`** — each frame:
    - `waitEndFrame()` — blocked on `mr_endFrame` (set at VisibleBars RTS).
    - `checkSelectVideo()` / `updateTransport()` — console controls; file change opens the next movie file while yielding.
-   - **`prepareNextFrame()`** — load the next MovieCart field into the **inactive** ping-pong buffer (`mr_buffer1` / `mr_buffer2` in SRAM2). Retries up to four times with cache invalidation on header/geometry failure.
+   - **`prepareNextFrame()`** — load the next MovieCart field into the **inactive** ping-pong buffer (`mr_buffer1` / `mr_buffer2` in SRAM2). The title probe caches `numBlocks`; playback reads all 1–6 contiguous sectors with one CMD18 and one DMA transfer. Retries up to four times with cache invalidation on header/geometry failure.
    - Wait until **`mc_visible_bars_vended`** — next VisibleBars entry (`$F09D`) before the newly loaded buffer is displayed.
 
 Field files: FAT32 root, first playable file by default; `MVC\0` header, 1–6 sectors (≤ 3 KiB field buffer). Controls match stock MovieCart (Select advances files, etc.).

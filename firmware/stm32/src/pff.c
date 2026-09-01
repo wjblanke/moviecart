@@ -375,6 +375,28 @@ pf_read_block(uint8_t *dst)
 	return disk_read_block2(fsInfo.file_block++, dst);
 }
 
+bool
+pf_read_blocks(uint8_t *dst, uint8_t count)
+{
+	/*
+	 * CMD18 can only cross physically consecutive LBAs. Do not cross a FAT
+	 * cluster boundary: the next cluster may be fragmented elsewhere.
+	 * MovieCart fields begin every eight sectors, so normal >=4 KiB FAT32
+	 * clusters contain each 1..6-sector field in one contiguous run.
+	 */
+	uint32_t cluster_offset =
+		(fsInfo.file_block - fsInfo.database) & fsInfo.csize_mask;
+
+	if (!count || count > fsInfo.csize - cluster_offset)
+		return false;
+
+	if (!disk_read_blocks(fsInfo.file_block, dst, count))
+		return false;
+
+	fsInfo.file_block += count;
+	return true;
+}
+
 /* The absolute sector the next pf_read_block() will fetch (valid after a seek). */
 uint32_t
 pf_current_sector(void)
