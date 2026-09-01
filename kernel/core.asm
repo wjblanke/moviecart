@@ -1,7 +1,11 @@
 ; Stella-runnable title ROM (RamKernel + unrolled VisibleBars).
-; STM32 firmware does not assemble or embed this file. ColdStart+RamKernel
-; bytes are frozen in firmware/stm32/src/core.c (mc_boot_rom). Visible
-; playback is the original looping kernel jump table, not these unrolls.
+; STM32 firmware does not assemble or embed this file. ColdStart, the
+; RamKernel image, the phase pad, and the pack window are frozen in
+; firmware/stm32/src/core.c. Visible playback is the looping jump table.
+;
+; A Stella assemble of the unrolled VisibleBars overlaps $F136/$F140/$F200.
+; Those orgs document the firmware cart map; do not treat core.bin as the
+; hardware image.
 ;
 ; Build (optional Stella test): make (dasm → core.bin)
 
@@ -9,7 +13,12 @@
 	include vcs.h
 
 RAM_BASE	equ $80
-FIELD		equ $F1
+PACK		equ $D7		; 35 packed blanking nibbles ($D7–$F9)
+FIELD		equ $FB		; RIOT even/odd only (not the STM32 field)
+AUDIDX		equ $FC
+CARTPACK	equ $F140
+PHASEPAD	equ $F136
+; $FE/$FF are the jsr stack — do not store FIELD or AUDIDX there
 
 GAUDIO	equ #0
 NUM_LINES equ	8
@@ -180,7 +189,7 @@ ClearMem
 
 	ldx #(RamKernelEnd - RamKernel - 1)
 .copy
-	lda RamKernel,x
+	lda $F200,x
 	sta RAM_BASE,x
 	dex
 	bpl .copy
@@ -188,73 +197,89 @@ ClearMem
 	jmp RAM_BASE
 
 ;------------------------------------------------------------------------------
-; Copied to RIOT $80. Original frame order: visible, then blanking tail.
-; Sole cart call: jsr VisibleBars. Tail continues in RIOT after rts.
+; After preroll: restore the old busy/sta $82 cycle count so the first
+; visible pair still hits HMOVE at the same phase. Cart, A12-high, after SDIO.
+	org $F136
+PhasePad
+	ldx #9
+.pp	dex
+	bne .pp
+	bit 0
+	jmp RAM_BASE
+
+	org $F140
+CartPack
+	ds 35, 0
+
+;------------------------------------------------------------------------------
+; Copied to RIOT $80. jsr VisibleBars, play packed tail in OS/VS/VB (no cart),
+; copy next field's 35 bytes from $F140 during preroll (one byte per line).
+	org $F200
+	rorg $80
 RamKernel
 	jsr VisibleBars
 
 	inc FIELD
 	lda FIELD
 	lsr
-	bcc .rk_even
-
-	ldx #30
-	ldy #(PREROLL+1)
-	jmp .rk_os
-
-.rk_even
 	ldx #29
 	ldy #PREROLL
-
-.rk_os
-	sta WSYNC
-	dex
-	bne .rk_os
-
+	bcc .rk_even
+	inx
+	iny
+.rk_even
+	jsr Play
 	lda #2
 	sta VSYNC
 	ldx #3
-.rk_vsync
-	sta WSYNC
-	dex
-	bne .rk_vsync
-	lda #0
-	sta VSYNC
-
+	jsr Play
+	stx VSYNC
 	lda #2
 	sta VBLANK
 	ldx #37
-.rk_vblank
-	sta WSYNC
-	dex
-	bne .rk_vblank
-	lda #0
-	sta VBLANK
+	jsr Play
+	stx VBLANK
+	stx AUDIDX
 
-	tya
-	tax
 .rk_pr
+	cpx #35
+	bcs .rk_ws
+	lda CARTPACK,x
+	sta PACK,x
+.rk_ws
+	inx
 	sta WSYNC
-	dex
+	dey
 	bne .rk_pr
 
-	ldx #7
-.rk_busy
-	dex
-	bne .rk_busy
-	lda #0
-	sta $82
-	sta $82
-	sta $82
-	sta $82
-	nop
+	jmp PHASEPAD
 
-	jmp RAM_BASE
+Play
+	lda AUDIDX
+	lsr
+	sta PlayLoad+1		; self-mod lda PACK+index (Y stays preroll)
+PlayLoad
+	lda $00
+	bcc .lo
+	lsr
+	lsr
+	lsr
+	lsr
+	.byte $2C
+.lo	and #$0F
+	sta AUDV0
+	inc AUDIDX
+	sta WSYNC
+	dex
+	bne Play
+	rts
 RamKernelEnd
+	rend
 
 ;------------------------------------------------------------------------------
 ; Visible scanlines only — kernel macro + line0..end_lines unchanged.
 ; SyncToRight in cart (same cycle phase as original HMCLR/nop/nop/line0 entry).
+	org $F09D
 VisibleBars
 	sta WSYNC
 	ldx #6

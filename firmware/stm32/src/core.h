@@ -64,7 +64,8 @@ extern void			mc_field_swap_to_display(void);
  *
  *   mc_blanking_window     set when the visible stub RTS ($F135) is served —
  *                          visible is done, blanking runs from RIOT, and the
- *                          MCU is free for SDIO while RamKernel runs from $80.
+ *                          MCU is free for SDIO while RamKernel plays the
+ *                          packed tail from RIOT (A12 low during OS/VS/VB).
  *
  *   mc_blanking_window_gen increments on each $F135 edge. SDIO initiation and
  *                          polling wait for gen to advance (see moviecart_sdio_gate),

@@ -52,15 +52,16 @@ System clock: HSI → PLL @ 168 MHz (same as UnoCart DevEBox); SDIOCLK 48 MHz.
 
 ### RamKernel split (`src/core.c`)
 
-Visible serving is the original MovieCart computed-goto kernel (one right/left pair, `jmp` back until `lines == 0`). Blanking is still the RamKernel from `kernel/core.asm`, stored as `mc_boot_rom[]` and copied to RIOT `$80` at ColdStart. The firmware build does not assemble or embed `core.bin`.
+Visible serving is the original MovieCart computed-goto kernel (one right/left pair, `jmp` back until `lines == 0`). Blanking is RamKernel copied to RIOT `$80` at ColdStart (`mc_ram_kernel[]` at `$F200`). The firmware build does not assemble or embed `core.bin`.
 
 | Region | Where it runs | Role |
 |--------|---------------|------|
-| **ColdStart** | Cart ROM `$F000` | Copies **RamKernel** into RIOT `$80`, then enters it |
-| **RamKernel** | RIOT `$80`+ | VSYNC, VBLANK, overscan, preroll — no cart fetches during blanking |
+| **ColdStart** | Cart ROM `$F000` | Copies **RamKernel** from `$F200` into RIOT `$80`, then enters it |
+| **RamKernel** | RIOT `$80`–`$D6` | Visible `jsr`, then OS/VS/VB nibble play (A12 low), preroll copy |
+| **Pack** | RIOT `$D7`–`$F9` | 35 bytes / 70 blanking nibbles for the next field’s tail |
 | **VisibleBars** | Cart ROM | Looping dual-line kernel (`g0x3e`…`g0xb6`); `AUDV0` every scanline |
 
-Blanking therefore executes from RIOT RAM. The cart is fetched for ColdStart, the RamKernel image, the looping kernel, the end stub (joystick + RTS), and `$FE00,x` stores.
+OS / VSYNC / VBLANK run entirely from RIOT so SDIO finish/begin stay A12-low. Preroll fetches `$F140` (one packed byte per line). A 10-byte phase pad at `$F136` then restores the first-visible HMOVE cycle. The cart is also fetched for ColdStart, the RamKernel image, the looping kernel, the end stub, and `$FE00,x` stores. Blanking audio is documented under **RIOT nibble audio** below.
 
 Cart dispatch indexes **`addr & 0xfff`** (12-bit space). Key hook addresses:
 
@@ -68,10 +69,70 @@ Cart dispatch indexes **`addr & 0xfff`** (12-bit space). Key hook addresses:
 |--------|--------|------------|
 | `$F09D` | VisibleBars entry (nop) | Title: swap display buffer. Playback: no swap (already done in blanking). Reset audio cursor, set `mc_visible_bars_vended` |
 | `$F09E`–`$F116` | right/left pair | Patch graphics/color/audio; `jmp $F09E` or `$F117` |
-| `$F135` | Visible stub RTS | End frame (`mr_endFrame`), skip blanking audio tail, set `mc_blanking_window` |
+| `$F135` | Visible stub RTS | End frame (`mr_endFrame`), snap audio cursor, set `mc_blanking_window` |
+| `$F136`–`$F13F` | phase pad | After preroll; `jmp $80` into the next `jsr $F09D` |
+| `$F140`–`$F162` | CartPack | 35 packed blanking bytes for the upcoming field |
+| `$F200`+ | RamKernel image | Copied to RIOT `$80` at ColdStart |
 | `$FE00+x` | gstore | Latch SWCHA / SWCHB / INPT4 / INPT5 |
 
-Audio in field files is stored **[visible lines][blanking tail]**. The looping kernel writes `AUDV0` on every visible scanline. At `$F135` the audio pointer skips the unplayed blanking tail so the next field stays aligned. RamKernel still has no `AUDV0`.
+### RIOT nibble audio
+
+Field files store **`totalLines`** volume bytes in play order: **[visible lines][blanking tail]**. The looping kernel writes `AUDV0` on every visible scanline. After `rts` the 6502 is in RIOT, A12 is low, and the STM32 is in `finishFieldRead` / `beginFieldRead` — so the tail cannot be served as cart immediates. TIA would otherwise hold the last visible volume across the whole 119/121-line blanking interval.
+
+The tail is packed on the MCU, copied into RIOT during **preroll** (after SDIO is armed), and played from RIOT during the next field’s **overscan / VSYNC / VBLANK**.
+
+#### Pipeline
+
+One field of delay on the tail only. Do not play during preroll.
+
+1. **Swap** — STM32 packs the **new** display buffer’s `audio[visibleLines … totalLines)` (capped at 70 samples) into `mc_aud_pack[35]`. Playback swap is in `finishFieldRead` (blanking); title still swaps at `$F09D`.
+2. **Preroll** (before visible N+1) — 6502 copies those 35 bytes from cart `$F140` → RIOT `$D7`, one byte per `WSYNC`. Remaining preroll lines are `WSYNC` only.
+3. **Visible N+1** — cart kernel plays the field’s visible samples as before.
+4. **Overscan / VSYNC / VBLANK** — RamKernel unpacks one nibble per line → `AUDV0` → `WSYNC`. No cart fetches. This is the SDIO window.
+5. Repeat: next swap overwrites the CCM/SRAM pack blob; next preroll copies it into RIOT.
+
+`$F135` still snaps the visible audio cursor to `base + totalLines`. The next `$F09D` resets it with `mc_audio_begin_visible()`. Pack is always taken from the display buffer base at swap, not from that cursor.
+
+#### Who does what
+
+| Side | When | Action |
+|------|------|--------|
+| STM32 | `mc_field_swap_to_display()` | Pack two samples per byte (`lo` in bits 0–3, `hi` in 4–7) into `mc_aud_pack[35]`; serve `$F140` |
+| 6502 preroll | After OS/VS/VB | `lda $F140,x` / `sta $D7,x` for `x = 0…34` |
+| 6502 OS/VS/VB | A12 low | `AUDIDX` even → low nibble; odd → `lsr ×4`; `sta AUDV0` |
+
+Play is a RIOT subroutine (self-mod `lda pack+index` so Y can stay the preroll count). After the last play, `X` is 0 and is stored to `AUDIDX` for the next field. ClearMem leaves `AUDIDX` and the pack zero, so the first tail is silent.
+
+#### RIOT map (128 bytes)
+
+| RIOT | Size | Role |
+|------|-----:|------|
+| `$80`–`$D6` | 87 | RamKernel (copied from `$F200` at ColdStart) |
+| `$D7`–`$F9` | 35 | Packed tail for the **upcoming** visible’s blanking |
+| `$FA` | 1 | unused |
+| `$FB` | 1 | `FIELD` — even/odd line split only (OS 29/30, preroll 50/51). Not the STM32 field buffer. |
+| `$FC` | 1 | `AUDIDX` — nibble index into the pack |
+| `$FD` | 1 | unused |
+| `$FE`–`$FF` | 2 | 6502 stack for `jsr VisibleBars` / `jsr Play` |
+
+`FIELD` cannot live at `$FF`. `jsr` pushes the return address onto `$FE`/`$FF` (RIOT mirrors `$01FE`/`$01FF`). The earlier `$F1` location sat on top of a larger kernel; `$FB` is below the stack and above the pack.
+
+#### Cart windows (12-bit)
+
+| Offset | Image | Served when |
+|--------|-------|-------------|
+| `$F136`–`$F13F` | `mc_phase_pad[]` | After preroll; restores the first-visible HMOVE cycle, then `jmp $80` |
+| `$F140`–`$F162` | `mc_aud_pack[]` | Preroll copy (A12 high, after SDIO work) |
+| `$F200`+ | `mc_ram_kernel[]` | ColdStart copy only |
+
+`$F09D` stays the VisibleBars entry. RamKernel must not `jmp $F0xx` internals; the only cart transfers in the blanking loop are preroll `$F140` and the phase pad.
+
+#### Edges
+
+- **First field** — `jsr VisibleBars` runs before any preroll. OS/VS/VB play zeros (ClearMem / `coreInit`). After that, every tail plays in the blanking after its picture.
+- **Even vs odd** — file tail is typically 70 samples (30+3+37). Even RamKernel plays **69** lines (OS 29); the extra nibble is dropped. Odd plays all 70.
+- **PAL / long tails** — pack length is fixed at 70 samples / 35 bytes. Extra file samples are not copied.
+- **Title** (`numBlocks == 0`) — swap still packs whatever sits at `audio + visibleLines` in the title buffer (often unused padding). Harmless if that region is quiet.
 
 ### Cart bus serving
 
@@ -159,30 +220,29 @@ Then `finishFieldRead()` checks `MVC\0` and geometry against the title-probe cac
 
 ### RamKernel timing budget
 
-Window is VisibleBars RTS (`$F135`) through the next `jsr $F09D`. Line math is NTSC (76 CPU cycles at 1.193182 MHz = 63.695 µs). SD peak is 8 MHz × 4-bit = 4 MB/s (`DMA_CLKDIV=0x04`). Figures are calculated from the source, not scoped on the board.
+RamKernel is only the A12-low nibble-play tail: VisibleBars RTS (`$F135`) through VBLANK off. That is when `finishFieldRead` / `beginFieldRead` run and yield can skip A12-low. **Preroll is not in this budget** — it is cart time (pack copy from `$F140`, then the `$F136` phase pad), same class as visible.
 
-| | |
-|--|--|
-| Even-field budget | **7.58 ms** (119 lines) |
-| Odd-field budget | **7.71 ms** (121 lines) |
-| Typical playback work | **0.35–0.80 ms** (~9% of even-field) |
-| Worst must-fit stack | **1.9 ms** (FAT miss + OSD + slow CMD13) |
-| Pathological | **3.4 ms** (plus leftover DMA still on the wire) |
+Line math is NTSC (76 CPU cycles at 1.193182 MHz = 63.695 µs). SD peak is 8 MHz × 4-bit = 4 MB/s (`DMA_CLKDIV=0x04`). Figures are calculated from the source, not scoped on the board.
 
-Playback work that must finish before `$F09D` is typically under 11% of the interval. Mount, title probe, and file-select are sliced across many frames by the strict SDIO gate and do not have to finish in one blanking.
+| | Even | Odd |
+|--|-----:|----:|
+| **RamKernel (OS+VS+VB)** | **4.40 ms** (69 lines) | **4.46 ms** (70 lines) |
+| Typical playback work | **0.35–0.80 ms** (~16% of even RamKernel) | same |
+| Worst must-fit stack | **1.9 ms** (FAT miss + OSD + slow CMD13) | still inside 4.40 ms |
+| Pathological | **3.4 ms** (plus leftover DMA still on the wire) | still inside 4.40 ms |
+
+Playback work must finish before VBLANK goes off. Mount, title probe, and file-select are sliced across many frames by the strict SDIO gate and do not have to finish in one RamKernel.
 
 #### Window breakdown
 
-After VisibleBars `rts` the 6502 stays in RIOT `$80`. VBLANK is cleared before preroll, so those 50/51 lines are black picture, but they are still RamKernel — no cart fetch until `jsr $F09D`.
+After VisibleBars `rts` the 6502 stays in RIOT `$80`: one nibble → `AUDV0` → `WSYNC` per overscan / VSYNC / VBLANK line. That is the whole RamKernel window.
 
 | Segment | Even (lines) | Odd (lines) | Even (ms) | Odd (ms) |
 |---------|-------------:|------------:|----------:|---------:|
-| Overscan WSYNC | 29 | 30 | 1.85 | 1.91 |
-| VSYNC on + 3 WSYNC + off | 3 | 3 | 0.19 | 0.19 |
-| VBLANK on + 37 WSYNC + off | 37 | 37 | 2.36 | 2.36 |
-| Preroll WSYNC (VBLANK already off) | 50 | 51 | 3.18 | 3.25 |
-| Busy-wait + `jmp $80` | 0 | 0 | 0.002 | 0.002 |
-| **Total RTS → `$F09D`** | **119** | **121** | **7.58** | **7.71** |
+| Overscan nibble play | 29 | 30 | 1.85 | 1.91 |
+| VSYNC on + 3 play + off | 3 | 3 | 0.19 | 0.19 |
+| VBLANK on + 37 play + off | 37 | 37 | 2.36 | 2.36 |
+| **RamKernel total** | **69** | **70** | **4.40** | **4.46** |
 
 PAL files still get these NTSC RamKernel counts; `visibleLines` comes from the field header.
 
@@ -202,7 +262,7 @@ PAL files still get these NTSC RamKernel counts; `visibleLines` comes from the f
 
 #### Playback blanking — step timings
 
-`runFrameLoop` after `waitEndFrame`: `finishFieldRead` → `checkSelectVideo` (usually a compare) → `updateTransport` → `beginFieldRead`. Then it serves until `$F09D`.
+`runFrameLoop` after `waitEndFrame`: `finishFieldRead` → `checkSelectVideo` (usually a compare) → `updateTransport` → `beginFieldRead`. That stack must finish in the 4.40 ms RamKernel window (before VBLANK off). After that, preroll is cart serving (`$F140` / `$F136`), not RamKernel.
 
 | Step | What | Typical | Worst | Notes |
 |------|------|---------|-------|-------|
@@ -212,19 +272,19 @@ PAL files still get these NTSC RamKernel counts; `visibleLines` comes from the f
 | finish: validate | `memcmp MVC\0` + `frameInit` | <10 µs | 20 µs | Pointer math only |
 | `updateVolume` | `totalLines` table remap, yield /4 | 45 µs | 60 µs | 262 NTSC / ~312 PAL stores |
 | `updateColor` | bright/B&W on 5×visible + BK | 250–300 µs | 350 µs | OSD overlays add ~50–80 µs |
-| `mc_field_swap_to_display` | Copy buffer pointers | <5 µs | 10 µs | No pixel copy |
+| `mc_field_swap_to_display` | Pointers + pack 70 tail samples | <15 µs | 25 µs | 35-byte `mc_aud_pack`; no pixel copy |
 | `updateTransport` | Joystick → `frameNumber` step | <10 µs | 20 µs | No disk |
 | `pf_seek_block` hit | Queue scan, same cluster | 10–50 µs | 50 µs | 128-entry queue, yield /16 |
 | `pf_seek_block` FAT miss | `get_fat` → CMD17 512 B | 300–500 µs | 800–1000 µs | Same relaxed window as CMD18 |
 | CMD18 arm | DMA setup + CMD16? + CMD18 | 100–200 µs | 250 µs | Payload runs in the next visible |
 
-Stacked totals in one window (168 MHz CPU, 8 MHz 4-bit SDIO):
+Stacked totals in one **RamKernel** (168 MHz CPU, 8 MHz 4-bit SDIO). Shares are of 4.40 ms even-field.
 
-| Stack | Sum | Share of 7.58 ms |
+| Stack | Sum | Share of 4.40 ms |
 |-------|-----|------------------|
-| Sequential + cache hit | finish 0.20 + volume 0.05 + color 0.27 + seek 0.03 + CMD18 0.15 = **0.70 ms** | 9% |
-| FAT miss + OSD + slow busy | finish 0.50 + volume 0.06 + color 0.35 + FAT 0.80 + CMD18 0.20 = **1.91 ms** | 25% |
-| Plus leftover DMA | add 1.5 ms for a full PAL field still on the wire = **3.41 ms** | 45% |
+| Sequential + cache hit | finish 0.20 + volume 0.05 + color 0.27 + seek 0.03 + CMD18 0.15 + pack 0.01 = **0.71 ms** | 16% |
+| FAT miss + OSD + slow busy | finish 0.50 + volume 0.06 + color 0.35 + FAT 0.80 + CMD18 0.20 = **1.91 ms** | 43% |
+| Plus leftover DMA | add 1.5 ms for a full PAL field still on the wire = **3.41 ms** | 78% |
 
 #### Work that is not a single-window max
 
@@ -244,10 +304,13 @@ Stacked totals in one window (168 MHz CPU, 8 MHz 4-bit SDIO):
 |------|--------------|----------|
 | Field CMD18 payload (5–6 × 512 B) | Visible interval after `beginFieldRead` | 0.64 ms peak (4 MB/s, 5 sectors) · ~0.77 ms PAL 6 sectors · up to ~1.5 ms on a 2 MB/s card |
 | Looping visible kernel dispatch | Every cart cycle of ~192 lines | Must stay under ~100 ns per fetch |
-| `$F135` RTS hook (skip audio, diag, `mr_endFrame`) | Last visible cart cycle, not RIOT yet | <2 µs on that cycle |
-| Title buffer swap at `$F09D` | Entry cycle that ends RamKernel | Pointer copies, <2 µs |
+| `$F135` RTS hook (snap audio, diag, `mr_endFrame`) | Last visible cart cycle, not RIOT yet | <2 µs on that cycle |
+| Title buffer swap + pack at `$F09D` | Entry cycle after preroll | Pointers + 35-byte pack, <15 µs |
+| Preroll pack copy (35 lines) | After VBLANK off; `lda $F140,x` | 50/51 lines of cart/WSYNC; ~117 µs of `$F140` fetches (4 cyc/line, no page cross) |
+| Remaining preroll WSYNC (15/16) | After the 35-byte copy | Picture-black; A12 low, but not the finish/begin window |
+| `$F136` phase pad | Immediately before `jmp $80` | ~49 cart cycles (~41 µs) |
 
-For a healthy playback field: plan on **0.7 ms typical, 1.9 ms** if the FAT sector is cold and OSD is on. That is the number that must stay under 7.58 ms. Everything else either runs in visible (DMA payload) or is gated to one short SDIO touch per blanking (mount, probe, select).
+For a healthy playback field: plan on **0.7 ms typical, 1.9 ms** if the FAT sector is cold and OSD is on. That is the number that must stay under **4.40 ms** (even RamKernel). Everything else either runs in visible (DMA payload), in preroll (pack copy), or is gated to one short SDIO touch per RamKernel (mount, probe, select).
 
 ### Memory map
 
@@ -265,7 +328,7 @@ CCM holds all CPU data so it does not share an AHB port with DMA. The two field 
 | Path | Role |
 |------|------|
 | `src/bus_service.c` | UnoCart poll loop, yield/pump helpers |
-| `src/core.c` | Cart dispatch (looping kernel + RamKernel boot image), frame diagnostics |
+| `src/core.c` | Cart dispatch (looping kernel, ColdStart, RamKernel image, nibble pack), frame diagnostics |
 | `src/main.c` | Boot, SD milestones, title/playback loops, LED codes |
 | `src/pff.c` | Petit FatFs (read-only) |
 | `src/sd_reader.c` | Sector cache, UnoCart `disk_read` wrapper |

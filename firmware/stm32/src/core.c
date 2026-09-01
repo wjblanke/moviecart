@@ -6,24 +6,35 @@
 
 /*
  * Cart layout (12-bit, addr & 0xfff). Visible is the original MovieCart
- * looping kernel (firmware/core.c g0x3e–g0xb6). Blanking is still the
- * RamKernel from kernel/core.asm, served as a static image and copied
- * to RIOT $80 at ColdStart.
+ * looping kernel (firmware/core.c g0x3e–g0xb6). Blanking is RamKernel
+ * copied to RIOT $80 at ColdStart (source image at $F200).
  *
- *   $F000–$F09C  ColdStart + RamKernel image (bytes below; jsr $F09D)
+ *   $F000–$F04A  ColdStart (copy $F200 → $80, jmp $80)
  *   $F09D        nop — VisibleBars entry (once per jsr from RIOT)
  *   $F09E–$F116  right/left pair, jmp $F09E until lines == 0
  *   $F117–$F135  clear GRP, joystick $FE00,x stores, RTS
+ *   $F136–$F13F  phase pad (after preroll; keeps first HMOVE aligned)
+ *   $F140–$F162  35-byte packed blanking tail (next field)
+ *   $F200+       RamKernel source (87 bytes, copied to $80)
  *   $FE00–$FEFF  gstore (SWCHA/SWCHB/INPT4/INPT5)
  *   $FFFA–$FFFF  reset → $F000
+ *
+ * RIOT after copy: kernel $80–$D6, pack $D7–$F9, FIELD $FB, AUDIDX $FC.
+ * $FE/$FF are the 6502 stack (jsr VisibleBars / jsr Play). Do not store
+ * FIELD or AUDIDX there.
  *
  * jmp high byte is $F0 (not original $FF): 12-bit decode does not mirror
  * $FFxx onto $F0xx.
  */
-#define MC_OFF_BOOT_END		0x09cu
+#define MC_OFF_BOOT_END		0x04au
 #define MC_OFF_VISIBLE_ENTRY	0x09du
 #define ADDR_RIGHT_LINE		0x9eu
 #define ADDR_END_LINES		0x17u
+#define MC_OFF_PHASE_PAD	0x136u
+#define MC_OFF_PACK		0x140u
+#define MC_AUD_PACK_LEN		35u
+#define MC_AUD_PACK_SAMPLES	70u
+#define MC_OFF_RAMKERNEL	0x200u
 #define MC_OFF_STORE		0x0e00u
 #define MC_OFF_VECTORS		0x0ffau
 
@@ -69,23 +80,46 @@ volatile uint8_t	mc_sdio_gate_relaxed;
 volatile uint8_t	mc_playback_pipeline;
 
 /*
- * ColdStart + RamKernel ($F000–$F09C), exact bytes from the last core.asm
- * assemble. RamKernel ($F04B): jsr $F09D, FIELD $F1 even/odd, overscan
- * 29/30, vsync 3, vblank 37, preroll 50/51, busy-wait, jmp $80.
+ * ColdStart only ($F000–$F04A). Copies 87 bytes from $F200 → $80, jmp $80.
+ * TIA/RESP/HMOVE setup is unchanged; the copy source is the RamKernel image.
  */
 static const uint8_t mc_boot_rom[MC_OFF_BOOT_END + 1]
 	__attribute__((section(".ccmram"))) = {
 	0x78, 0xd8, 0xa2, 0xff, 0x9a, 0xa9, 0x00, 0x95, 0x00, 0xca, 0xd0, 0xfb, 0xa9, 0x01, 0x85, 0x26,
 	0xa9, 0xcf, 0x85, 0x0d, 0xa9, 0x33, 0x85, 0x0e, 0xa9, 0xcc, 0x85, 0x0f, 0xa2, 0x30, 0x85, 0x10,
 	0xea, 0x85, 0x11, 0xa9, 0x06, 0x85, 0x04, 0xa9, 0x02, 0x85, 0x05, 0x86, 0x20, 0xa9, 0x20, 0x85,
-	0x21, 0x85, 0x02, 0x85, 0x2a, 0xa2, 0x0c, 0xca, 0xd0, 0xfd, 0x85, 0x2b, 0xea, 0xea, 0xa2, 0x51,
-	0xbd, 0x4b, 0xf0, 0x95, 0x80, 0xca, 0x10, 0xf8, 0x4c, 0x80, 0x00, 0x20, 0x9d, 0xf0, 0xe6, 0xf1,
-	0xa5, 0xf1, 0x4a, 0x90, 0x07, 0xa2, 0x1e, 0xa0, 0x33, 0x4c, 0x60, 0xf0, 0xa2, 0x1d, 0xa0, 0x32,
-	0x85, 0x02, 0xca, 0xd0, 0xfb, 0xa9, 0x02, 0x85, 0x00, 0xa2, 0x03, 0x85, 0x02, 0xca, 0xd0, 0xfb,
-	0xa9, 0x00, 0x85, 0x00, 0xa9, 0x02, 0x85, 0x01, 0xa2, 0x25, 0x85, 0x02, 0xca, 0xd0, 0xfb, 0xa9,
-	0x00, 0x85, 0x01, 0x98, 0xaa, 0x85, 0x02, 0xca, 0xd0, 0xfb, 0xa2, 0x07, 0xca, 0xd0, 0xfd, 0xa9,
-	0x00, 0x85, 0x82, 0x85, 0x82, 0x85, 0x82, 0x85, 0x82, 0xea, 0x4c, 0x80, 0x00
+	0x21, 0x85, 0x02, 0x85, 0x2a, 0xa2, 0x0c, 0xca, 0xd0, 0xfd, 0x85, 0x2b, 0xea, 0xea, 0xa2, 0x56,
+	0xbd, 0x00, 0xf2, 0x95, 0x80, 0xca, 0x10, 0xf8, 0x4c, 0x80, 0x00
 };
+
+/*
+ * After preroll: match the old busy/sta $82 pad so the first visible pair
+ * still hits HMOVE at the same cycle. Runs from cart after SDIO is done.
+ */
+static const uint8_t mc_phase_pad[] __attribute__((section(".ccmram"))) = {
+	0xa2, 0x09, 0xca, 0xd0, 0xfd, 0x24, 0x00, 0x4c, 0x80, 0x00
+};
+
+/*
+ * RamKernel at RIOT $80 (source served from $F200). Play is in RIOT so
+ * OS/VS/VB stay A12-low. Preroll copies 35 packed bytes from $F140.
+ * Even: OS 29 + VS 3 + VB 37 = 69 nibbles (drop the 70th). Odd: 70.
+ */
+static const uint8_t mc_ram_kernel[] __attribute__((section(".ccmram"))) = {
+	0x20, 0x9d, 0xf0, 0xe6, 0xfb, 0xa5, 0xfb, 0x4a, 0xa2, 0x1d, 0xa0, 0x32,
+	0x90, 0x02, 0xe8, 0xc8, 0x20, 0xbd, 0x00, 0xa9, 0x02, 0x85, 0x00, 0xa2,
+	0x03, 0x20, 0xbd, 0x00, 0x86, 0x00, 0xa9, 0x02, 0x85, 0x01, 0xa2, 0x25,
+	0x20, 0xbd, 0x00, 0x86, 0x01, 0x86, 0xfc, 0xe0, 0x23, 0xb0, 0x05, 0xbd,
+	0x40, 0xf1, 0x95, 0xd7, 0xe8, 0x85, 0x02, 0x88, 0xd0, 0xf1, 0x4c, 0x36,
+	0xf1, 0xa5, 0xfc, 0x4a, 0x85, 0xc3, 0xa5, 0x00, 0x90, 0x05, 0x4a, 0x4a,
+	0x4a, 0x4a, 0x2c, 0x29, 0x0f, 0x85, 0x19, 0xe6, 0xfc, 0x85, 0x02, 0xca,
+	0xd0, 0xe7, 0x60
+};
+
+/* Writable; cannot share .ccmram with the const boot/kernel images. */
+static uint8_t mc_aud_pack[MC_AUD_PACK_LEN];
+
+static void mc_pack_blanking_audio(void);
 
 static inline void
 diagFrameTick(void)
@@ -131,6 +165,13 @@ coreInit(void)
 	r_coreInfo.storeAddress = &r_coreInfo.mr_swcha;
 	r_coreInfo.data = 0;
 
+	{
+		unsigned i;
+
+		for (i = 0; i < MC_AUD_PACK_LEN; i++)
+			mc_aud_pack[i] = 0;
+	}
+
 	SET_DATA_MODE_IN;
 }
 
@@ -161,6 +202,37 @@ mc_field_swap_to_display(void)
 		r_coreInfo.frameInfo.odd = r_coreInfo.mr_frameInfo1.odd;
 	}
 	r_coreInfo.mr_bufferIndex = !r_coreInfo.mr_bufferIndex;
+	mc_pack_blanking_audio();
+}
+
+static void
+mc_pack_blanking_audio(void)
+{
+	const uint8_t *src;
+	unsigned n, i;
+
+	for (i = 0; i < MC_AUD_PACK_LEN; i++)
+		mc_aud_pack[i] = 0;
+
+	if (!r_coreInfo.frameInfo.audioBuf)
+		return;
+	if (r_coreInfo.frameInfo.totalLines <= r_coreInfo.frameInfo.visibleLines)
+		return;
+
+	n = (unsigned)(r_coreInfo.frameInfo.totalLines
+		- r_coreInfo.frameInfo.visibleLines);
+	if (n > MC_AUD_PACK_SAMPLES)
+		n = MC_AUD_PACK_SAMPLES;
+
+	src = r_coreInfo.frameInfo.audioBuf + r_coreInfo.frameInfo.visibleLines;
+	for (i = 0; i < n; i += 2) {
+		uint8_t lo = src[i] & 0x0f;
+		uint8_t hi = 0;
+
+		if (i + 1u < n)
+			hi = src[i + 1u] & 0x0f;
+		mc_aud_pack[i / 2u] = (uint8_t)(lo | (uint8_t)(hi << 4));
+	}
 }
 
 static uint8_t *
@@ -181,8 +253,10 @@ static void
 mc_audio_skip_blanking(void)
 {
 	/*
-	 * Visible now consumes every visible sample. Skip the blanking tail
-	 * so the next field stays aligned (RamKernel has no AUDV0).
+	 * Visible consumed every visible sample. Snap the cursor to the end
+	 * of the field. The blanking tail is packed at swap into mc_aud_pack
+	 * (not read from this cursor); the next $F09D resets via
+	 * mc_audio_begin_visible().
 	 */
 	if (!r_coreInfo.frameInfo.numBlocks)
 		return;
@@ -270,6 +344,24 @@ bus_dispatch(uint16_t cart_off)
 
 	if (cart_off >= ADDR_RIGHT_LINE && cart_off <= 0x135u)
 		goto *vis[cart_off - ADDR_RIGHT_LINE];
+
+	if (cart_off >= MC_OFF_PHASE_PAD &&
+	    cart_off < MC_OFF_PHASE_PAD + sizeof(mc_phase_pad)) {
+		SET_DATA(mc_phase_pad[cart_off - MC_OFF_PHASE_PAD]);
+		EMULATE_DONE
+	}
+
+	if (cart_off >= MC_OFF_PACK &&
+	    cart_off < MC_OFF_PACK + MC_AUD_PACK_LEN) {
+		SET_DATA(mc_aud_pack[cart_off - MC_OFF_PACK]);
+		EMULATE_DONE
+	}
+
+	if (cart_off >= MC_OFF_RAMKERNEL &&
+	    cart_off < MC_OFF_RAMKERNEL + sizeof(mc_ram_kernel)) {
+		SET_DATA(mc_ram_kernel[cart_off - MC_OFF_RAMKERNEL]);
+		EMULATE_DONE
+	}
 
 	if (cart_off >= MC_OFF_VECTORS) {
 		SET_DATA((cart_off & 1u) ? 0xf0 : 0x00);
