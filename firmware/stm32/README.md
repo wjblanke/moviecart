@@ -66,7 +66,7 @@ Cart dispatch indexes **`addr & 0xfff`** (12-bit space). Key hook addresses:
 
 | Offset | Symbol | MCU action |
 |--------|--------|------------|
-| `$F09D` | VisibleBars entry | Buffer swap, reset audio cursor, set `mc_visible_bars_vended` |
+| `$F09D` | VisibleBars entry | Title: swap display buffer. Playback: no swap (already done in blanking). Reset audio cursor, set `mc_visible_bars_vended` |
 | `$F41D` | VisibleBars RTS | End frame (`mr_endFrame`), skip blanking audio tail, set `mc_blanking_window` |
 | `$0BF`–`$40D` | Visible lines | Static bytes from `core.bin`; immediates patched via phase map → `g0x3e`…`g0xae` |
 
@@ -85,7 +85,7 @@ Critical rules (measured on this hardware):
 - **No work between address sample and ODR write** — even ~60 ns settle windows black the display.
 - **No repeat-address suppression** — the kernel legitimately refetches the same cart address.
 - **`SET_DATA()` enables drivers** immediately after writing ODR; dispatch side effects run before returning.
-- **Bus code runs from flash** (`.hottext`, ART-line aligned), not SRAM. The `romData` jump table stays in SRAM so table lookups do not contend with instruction fetch.
+- **Bus code runs from flash** (`.hottext`, ART-line aligned), not SRAM. The `romData` jump table lives in CCM so lookups are D-bus only.
 - Per-cycle budget is ~**100 ns**; one missed ~838 ns cycle can desync the scanline counter.
 
 `moviecart_bus_yield()` serves every cycle while visible; during blanking it serves **A12-high (cart) cycles only** so `$F09D` is not missed and `mc_blanking_window` clears. A12-low blanking cycles are skipped for faster SDIO polls.
@@ -103,16 +103,58 @@ Every SDIO wait loop calls `moviecart_bus_yield()` (or `SD_PollDmaAndYield()` fo
 After the embedded title screen and SD mount:
 
 1. **`runTitle()`** — title hold; geometry probe reads one field sector while yielding.
-2. **`runFrameLoop()`** — two-buffer DMA pipeline:
-   - `waitEndFrame()` — blocked on `mr_endFrame` (set at VisibleBars RTS).
-   - `checkSelectVideo()` / `updateTransport()` — console controls; file change opens the next movie file while yielding.
-   - Finish and validate the CMD18 DMA started in the preceding blanking interval, then swap display pointers **during that same blanking window**.
-   - Start one CMD18 DMA for the following field into the buffer whose visible use just ended. The title probe caches `numBlocks`, so all 1–6 contiguous sectors use one transfer.
-   - At **`$F09D`** VisibleBars starts using the already-swapped buffer. The first pipeline pass repeats the title once while priming DMA.
+2. **`runFrameLoop()`** — two-buffer DMA pipeline (see below).
 
 Field files: FAT32 root, first playable file by default; `MVC\0` header, 1–6 sectors (≤ 3 KiB field buffer). Controls match stock MovieCart (Select advances files, etc.).
 
 FatFs cluster walks and other CPU-bound loops call `moviecart_bus_yield()` so the cart keeps being served.
+
+### Double buffering
+
+`mr_buffer1` (SRAM1) and `mr_buffer2` (SRAM2) are a ping-pong pair. One field is displayed while SDIO DMA fills the other. `diskBuffer` is FAT/dir scratch only; field loads never use it.
+
+| Interval | Display | DMA target | Main-thread work |
+|----------|---------|------------|------------------|
+| Visible N | A | B (may still be filling) | Serve cart only |
+| Blanking N (`$F41D`) | — | B, then A | Finish/validate B, swap to B, start CMD18 into A |
+| Visible N+1 | B | A | Serve cart; `$F09D` does **not** swap |
+| Blanking N+1 | — | A, then B | Finish/validate A, swap to A, start CMD18 into B |
+
+`$F09D` still swaps during **title** (`mc_playback_pipeline == 0`). Once `runFrameLoop()` sets that flag, the swap happens in blanking inside `finishFieldRead()` after the field is validated — VisibleBars must not see a half-filled buffer.
+
+The first playback pass repeats the title once while the first CMD18 is primed. A failed field is retried into the same inactive buffer and is not swapped in.
+
+`beginFieldRead()` / `finishFieldRead()` each set `mc_sdio_gate_relaxed` so command start and completion polls use the current blanking window instead of waiting for a new `$F41D` edge. The DMA itself runs through the following visible interval.
+
+#### DMA completion (frame data)
+
+IRQs stay masked. After `waitEndFrame()`, if `field_dma_pending`:
+
+`finishFieldRead()` → `pf_read_blocks_finish()` → `disk_read_blocks_finish()` → `TM_FATFS_SD_SDIO_disk_read_finish()` → `SD_WaitReadOperation()`
+
+`SD_WaitReadOperation()` loops until **either** `TransferEnd` **or** `DMAEndOfTransfer` (or error / timeout):
+
+```
+while (!DMAEndOfTransfer && !TransferEnd && TransferError == SD_OK)
+    SD_PollDmaAndYield();
+```
+
+Each poll:
+
+1. `moviecart_sdio_gate()` — relaxed: wait until `mc_blanking_window` is set.
+2. `SD_ProcessIRQSrc()` — if `SDIO_IT_DATAEND`, set `TransferEnd` (also records CRC / timeout / overrun).
+3. `SD_ProcessDMAIRQ()` — if DMA2 Stream3 TCIF, set `DMAEndOfTransfer` and clear the flag.
+4. `moviecart_bus_yield()` — keep serving A12-high cart cycles.
+
+Those two `SD_Process*` helpers are the stock “IRQ” handlers; they are called from the wait loop, not from NVIC.
+
+After the flags trip, the finish path also:
+
+- waits until `SDIO->STA` is not `RXACT`
+- sends CMD12 (`SD_StopTransfer`) because the field was a multi-block CMD18
+- polls `SD_GetStatus()` (CMD13) until the card is not `SD_TRANSFER_BUSY`
+
+Then `finishFieldRead()` checks `MVC\0` and geometry against the title-probe cache (`playback_field_blocks`). Only a valid field calls `updateBuffer()` and `mc_field_swap_to_display()`.
 
 ### Memory map
 
