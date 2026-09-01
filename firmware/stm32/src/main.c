@@ -872,7 +872,7 @@ runFrameLoop(void)
 		updateTransport(&state);
 
 		/*
-		 * After $F135 the 6502 is in RIOT blanking. Finish the previous
+		 * After $F1C1 the 6502 is in RIOT blanking. Finish the previous
 		 * field's DMA, validate it, and swap display pointers here — still
 		 * in blanking — then start the next CMD18 into the buffer whose
 		 * visible use just ended. $F09D only begins VisibleBars; it does

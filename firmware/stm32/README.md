@@ -57,7 +57,7 @@ Visible serving is the original MovieCart computed-goto kernel (one right/left p
 | Region | Where it runs | Role |
 |--------|---------------|------|
 | **ColdStart** | Cart ROM `$F000` | Copies **RamKernel** from `$F200` into RIOT `$80`, then enters it |
-| **RamKernel** | RIOT `$80`–`$C9` | Visible `jsr`, then remaining OS/VS/VB nibble play (A12 low) |
+| **RamKernel** | RIOT `$80`–`$C4` | Visible `jsr`, then remaining OS/VS/VB nibble play (A12 low) |
 | **Pack** | RIOT `$CA`–`$E9` | 32 bytes / 64 nibbles (blanking tail after 6 cart OS samples) |
 | **VisibleBars** | Cart ROM | Looping dual-line kernel (`g0x3e`…`g0xb6`); `AUDV0` every scanline |
 
@@ -68,10 +68,10 @@ Cart dispatch indexes **`addr & 0xfff`** (12-bit space). Key hook addresses:
 | Offset | Symbol | MCU action |
 |--------|--------|------------|
 | `$F09D` | VisibleBars entry (nop) | Title: swap display buffer. Playback: no swap (already done in blanking). Reset audio cursor, set `mc_visible_bars_vended` |
-| `$F09E`–`$F116` | right/left pair | Patch graphics/color/audio; `jmp $F09E` or `$F117` |
-| `$F117` | `jmp $F160` | End of 192 picture lines |
+| `$F09E`–`$F116` | right/left pair | Patch graphics/color/audio; `jmp $F09E` or `$F160` |
+| `$F136`–`$F13E` | PhasePad | After VBLANK: `ldx #7` / `nop` / `jmp $80` (HMOVE phase) |
 | `$F140`–`$F15F` | CartPack | 32 packed bytes (tail after 6 cart samples) |
-| `$F160`–`$F1D8` | overscan head | 6× `AUDV0` + copy 32 bytes, joystick, RTS (sets `mc_blanking_window`) |
+| `$F160`–`$F1C1` | overscan head | 5×6 + 2 copy, 6× `AUDV0`, joystick + `WSYNC`, RTS |
 | `$F200`+ | RamKernel image | Copied to RIOT `$80` at ColdStart |
 | `$FE00+x` | gstore | Latch SWCHA / SWCHB / INPT4 / INPT5 |
 
@@ -85,7 +85,7 @@ The last 64 tail samples cannot be cart immediates during RamKernel (A12 low, SD
 
 1. **Swap** — pack `audio[visibleLines+6 … totalLines)` (capped at 64 samples) into `mc_aud_pack[32]`. Playback swap is in `finishFieldRead`; title still swaps at `$F09D`.
 2. **Visible** — 192 movie lines, unchanged.
-3. **Overscan head** (`$F160`, 6 lines) — `lda #` / `sta AUDV0` for tail[0..5]; copy 6+6+5+5+5+5 bytes from `$F140` → `$CA`. Joystick, `RTS` (blanking window starts).
+3. **Overscan head** (`$F160`, 6 lines) — `lda #` / `sta AUDV0` for tail[0..5]; copy 5×6 + 2 bytes from `$F140` → `$CA`. Joystick and `WSYNC` on line 6, then `RTS` (blanking window starts).
 4. **RamKernel OS/VS/VB** — unpack one nibble per line. Even OS 23, odd 24; +3 +37 = 63 / 64 play lines. A12 low. SDIO window.
 5. Next swap fills the pack for the following field. The 6-line copy at the end of that field’s picture loads it.
 
@@ -104,7 +104,7 @@ Pack is taken from the display buffer **base** at swap (`+ visible + 6`), not fr
 
 | RIOT | Size | Role |
 |------|-----:|------|
-| `$80`–`$C9` | 74 | RamKernel (copied from `$F200` at ColdStart) |
+| `$80`–`$C4` | 69 | RamKernel (copied from `$F200` at ColdStart) |
 | `$CA`–`$E9` | 32 | Packed tail after the 6 cart OS samples |
 | `$EA`–`$FA` | 17 | unused |
 | `$FB` | 1 | `FIELD` — even/odd (OS 23/24 only). Not the STM32 field buffer. |
@@ -143,7 +143,7 @@ The stock UnoCart SDIO driver (`fatfs_sd_sdio.c`) keeps **DMA** for sector reads
 
 Every SDIO wait loop calls `moviecart_bus_yield()` (or `SD_PollDmaAndYield()` for DMA drains). Long delays use `moviecart_delay_ms()` instead of busy DWT spins.
 
-**Blanking-only SDIO control:** `mc_blanking_window_gen` increments on each VisibleBars RTS (`$F135`). By default `moviecart_sdio_gate()` blocks until that counter advances (mount, title probe, file select). Playback command initiation and completion polling use the relaxed gate in their respective blanking intervals. The DMA itself runs asynchronously between them while the other field buffer is displayed.
+**Blanking-only SDIO control:** `mc_blanking_window_gen` increments on each overscan-head RTS (`$F1C1`). By default `moviecart_sdio_gate()` blocks until that counter advances (mount, title probe, file select). Playback command initiation and completion polling use the relaxed gate in their respective blanking intervals. The DMA itself runs asynchronously between them while the other field buffer is displayed.
 
 ### Playback loop
 
@@ -163,7 +163,7 @@ FatFs cluster walks and other CPU-bound loops call `moviecart_bus_yield()` so th
 | Interval | Display | DMA target | Main-thread work |
 |----------|---------|------------|------------------|
 | Visible N | A | B (may still be filling) | Serve cart only |
-| Blanking N (`$F135`) | — | B, then A | Finish/validate B, swap to B, start CMD18 into A |
+| Blanking N (`$F1C1`) | — | B, then A | Finish/validate B, swap to B, start CMD18 into A |
 | Visible N+1 | B | A | Serve cart; `$F09D` does **not** swap |
 | Blanking N+1 | — | A, then B | Finish/validate A, swap to A, start CMD18 into B |
 
@@ -171,7 +171,7 @@ FatFs cluster walks and other CPU-bound loops call `moviecart_bus_yield()` so th
 
 The first playback pass repeats the title once while the first CMD18 is primed. A failed field is retried into the same inactive buffer and is not swapped in.
 
-`beginFieldRead()` / `finishFieldRead()` each set `mc_sdio_gate_relaxed` so command start and completion polls use the current blanking window instead of waiting for a new `$F135` edge. The DMA itself runs through the following visible interval.
+`beginFieldRead()` / `finishFieldRead()` each set `mc_sdio_gate_relaxed` so command start and completion polls use the current blanking window instead of waiting for a new `$F1C1` edge. The DMA itself runs through the following visible interval.
 
 #### DMA completion (frame data)
 
@@ -205,7 +205,7 @@ Then `finishFieldRead()` checks `MVC\0` and geometry against the title-probe cac
 
 ### RamKernel timing budget
 
-RamKernel is only the A12-low nibble-play tail: `$F1D8` RTS through VBLANK off. That is when `finishFieldRead` / `beginFieldRead` run. The first 6 overscan lines are cart (`$F160`: 6 `AUDV0` + 32-byte pack copy) and finish **before** the blanking window opens — they are not in this budget.
+RamKernel is only the A12-low nibble-play tail: `$F1C1` RTS through VBLANK off. That is when `finishFieldRead` / `beginFieldRead` run. The first 6 overscan lines are cart (`$F160`: 6 `AUDV0` + 32-byte pack copy) and finish **before** the blanking window opens — they are not in this budget. After VBLANK, PhasePad (`$F136`) restores HMOVE phase; that is cart time after the window.
 
 Those 6 lines used to be RIOT overscan (29/30 OS + 3 VS + 37 VB = 69/70, **4.40 / 4.46 ms**). They are now cart, so the SDIO-quiet window is 6 lines shorter: **23/24 + 3 + 37 = 63 / 64**, **4.01 / 4.08 ms**.
 
@@ -248,7 +248,7 @@ PAL files still get these NTSC RamKernel counts; `visibleLines` comes from the f
 | 6. Title probe | `runTitle` `pf_seek` + 1-sector read | Strict | 1–3 frames | Several frames | No — one SDIO touch per edge |
 | 7. File select | `checkSelectVideo` open + probe + wipe | Strict, then relaxed wipe | Many frames | Directory walk + 30-frame hold | No |
 | 8. Mount / `SD_Init` | `setupDisk` before playback | Strict + `delay_ms` | Hundreds of ms to seconds | 5× (`SD_Init` + 50 ms) | No — title is already looping |
-| 9. RTS / entry hooks | `$F1D8` and `$F09D` dispatch | On the cart cycle | <2 µs | <5 µs | Cycle budget (~100 ns), not RamKernel |
+| 9. RTS / entry hooks | `$F1C1` and `$F09D` dispatch | On the cart cycle | <2 µs | <5 µs | Cycle budget (~100 ns), not RamKernel |
 
 #### Playback blanking — step timings
 
@@ -294,7 +294,8 @@ Stacked totals in one **RamKernel** (168 MHz CPU, 8 MHz 4-bit SDIO). Shares are 
 |------|--------------|----------|
 | Field CMD18 payload (5–6 × 512 B) | Visible interval after `beginFieldRead` | 0.64 ms peak (4 MB/s, 5 sectors) · ~0.77 ms PAL 6 sectors · up to ~1.5 ms on a 2 MB/s card |
 | Looping visible kernel dispatch | Every cart cycle of ~192 lines | Must stay under ~100 ns per fetch |
-| `$F1D8` RTS hook (snap audio, diag, `mr_endFrame`) | End of 6-line overscan head | <2 µs on that cycle |
+| `$F1C1` RTS hook (snap audio, diag, `mr_endFrame`) | End of 6-line overscan head | <2 µs on that cycle |
+| PhasePad (`$F136`) | After VBLANK off; A12 high | `ldx #7` / `nop` / `jmp $80`; no extra line |
 | Title buffer swap + pack at `$F09D` | Start of visible | Pointers + 32-byte pack, <15 µs |
 | Overscan head (`$F160`, 6 lines) | After 192 picture lines; A12 high | 6 `AUDV0` + 32-byte copy; before blanking window |
 

@@ -62,12 +62,12 @@ extern void			mc_field_swap_to_display(void);
  *                          6502 just finished blanking in RIOT and is entering
  *                          the looping visible kernel for this frame.
  *
- *   mc_blanking_window     set when the visible stub RTS ($F135) is served —
- *                          visible is done, blanking runs from RIOT, and the
- *                          MCU is free for SDIO while RamKernel plays the
- *                          packed tail from RIOT (A12 low during OS/VS/VB).
+ *   mc_blanking_window     set when the overscan-head RTS ($F1C1) is served —
+ *                          the 6 cart OS lines are done, blanking runs from
+ *                          RIOT, and the MCU is free for SDIO while RamKernel
+ *                          plays the packed tail (A12 low during OS/VS/VB).
  *
- *   mc_blanking_window_gen increments on each $F135 edge. SDIO initiation and
+ *   mc_blanking_window_gen increments on each $F1C1 edge. SDIO initiation and
  *                          polling wait for gen to advance (see moviecart_sdio_gate),
  *                          except during playback field loads (mc_sdio_gate_relaxed).
  */

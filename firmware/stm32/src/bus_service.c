@@ -168,7 +168,7 @@ moviecart_bus_yield(void)
 }
 
 /*
- * First call snapshots the current gen so we always wait for the *next* $F135
+ * First call snapshots the current gen so we always wait for the *next* $F1C1
  * edge, even if the kernel has already completed many frames before mount.
  */
 void
