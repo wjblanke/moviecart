@@ -1,8 +1,9 @@
-; MovieCart demo kernel — RamKernel in RIOT $80 (generate_title_rom shape).
-; Cart ROM: ColdStart, RamKernel image, VisibleBars only.
-; Visible scanlines: kernel macro + line0..end_lines (unchanged).
+; Stella-runnable title ROM (RamKernel + unrolled VisibleBars).
+; STM32 firmware does not assemble or embed this file. ColdStart+RamKernel
+; bytes are frozen in firmware/stm32/src/core.c (mc_boot_rom). Visible
+; playback is the original looping kernel jump table, not these unrolls.
 ;
-; Build: make (dasm → core.bin)
+; Build (optional Stella test): make (dasm → core.bin)
 
 	processor 6502
 	include vcs.h

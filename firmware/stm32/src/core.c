@@ -1,109 +1,61 @@
 
-#include "pff.h"
 #include "core.h"
-#include "core_rom.h"
 #include "defines.h"
 #include "cartridge_io.h"
 #include "bus_service.h"
 
-/* core.asm / core.bin cart layout (org $F000). */
-#define MC_OFF_VISIBLE_ENTRY		0x09du
-#define MC_OFF_LINE0			0x0bfu
-#define MC_OFF_END_LINES		0x40eu
-#define MC_OFF_VISIBLE_RTS		0x41du
-#define MC_LINE_CYCLE			0x079u
-#define MC_PHASE_DYNAMIC_MAX		0x070u	/* g0x3e..g0xae; g0xaf+ from ROM */
-
 /*
- * Data on PD8-PD15 (high byte). Address PE0-PE12.
+ * Cart layout (12-bit, addr & 0xfff). Visible is the original MovieCart
+ * looping kernel (firmware/core.c g0x3e–g0xb6). Blanking is still the
+ * RamKernel from kernel/core.asm, served as a static image and copied
+ * to RIOT $80 at ColdStart.
  *
- * Enabling the drivers here, rather than after bus_dispatch() returns, is what
- * keeps the heavy cases legal. Every case opens with SET_DATA and only then does
- * its side-effect work — advancing pointers, stepping the end-of-frame machine,
- * reloading frameInfo — and while that work runs, bus_dispatch() has not
- * returned, so a SET_DATA_MODE_OUT placed in the caller would still be waiting.
- * The 6502 would be handed its byte tens or hundreds of nanoseconds late on
- * exactly the cycles that matter most. Driving one instruction after the byte
- * reaches ODR takes every case's workload off the critical path; the exposure
- * to a stale value is the same zero as UnoCart's write-then-enable pair.
+ *   $F000–$F09C  ColdStart + RamKernel image (bytes below; jsr $F09D)
+ *   $F09D        nop — VisibleBars entry (once per jsr from RIOT)
+ *   $F09E–$F116  right/left pair, jmp $F09E until lines == 0
+ *   $F117–$F135  clear GRP, joystick $FE00,x stores, RTS
+ *   $FE00–$FEFF  gstore (SWCHA/SWCHB/INPT4/INPT5)
+ *   $FFFA–$FFFF  reset → $F000
+ *
+ * jmp high byte is $F0 (not original $FF): 12-bit decode does not mirror
+ * $FFxx onto $F0xx.
  */
+#define MC_OFF_BOOT_END		0x09cu
+#define MC_OFF_VISIBLE_ENTRY	0x09du
+#define ADDR_RIGHT_LINE		0x9eu
+#define ADDR_END_LINES		0x17u
+#define MC_OFF_STORE		0x0e00u
+#define MC_OFF_VECTORS		0x0ffau
+
 #define SET_DATA(X)     do { DATA_OUT = ((uint16_t)(uint8_t)(X)) << 8; \
 			     SET_DATA_MODE_OUT } while (0)
-#define READ_DATA()     ((uint8_t)(DATA_IN >> 8))
-#define DATA_OUTPUT     SET_DATA_MODE_OUT
-#define DATA_INPUT      SET_DATA_MODE_IN
 
 #define EMULATE_DONE    do { return; } while (0);
 
-/*
- * The line counter is stepped by the 6502's own fetches, so a single dispatch
- * that never happens (or happens twice) leaves it with the wrong parity, and
- * `lines -= 2` then steps straight past zero and wraps. Nothing in the kernel
- * would ever end the frame again: the buffer pointers advance every line
- * forever, the picture becomes a scroll through SRAM, and the read eventually
- * walks off the end of it and faults the CPU. Treat any impossibly large
- * counter as "end of section" so the frame closes and every pointer is
- * reloaded from mr_frameInfo1/2, which costs nothing in normal operation —
- * the real values are at most visibleLines.
- */
 #define LINES_EXHAUSTED(n)	((n) == 0 || (n) > 250)
 
 struct coreInfo r_coreInfo;
 
-/*
- * Frame-driven diagnostics. The bus loop owns the CPU with interrupts off, so
- * the status LED is the only channel out; it is driven entirely from the
- * kernel's own end-of-frame, one slot per frame. The blink count reports the
- * worst thing seen since the last report:
- *
- *   1 flash  nominal - frames closing normally, scanline count in range
- *   2        line counter wrapped in the visible section (missed dispatch)
- *   3        line counter wrapped in the end-lines section
- *   4        frame was not 250-275 scanlines long
- *
- * A frozen LED means the kernel stopped completing frames altogether.
- */
 #define DIAG_NOMINAL		1
 #define DIAG_WRAP_VISIBLE	2
 #define DIAG_WRAP_ENDLINES	3
 #define DIAG_FRAME_LENGTH	4
-/* DIAG_FIELD_RETRY (5) lives in core.h — it is raised by main.c, not the kernel. */
 
-#define DIAG_SLOT_FRAMES	8	/* one flash: 4 frames on, 4 off */
-#define DIAG_GAP_FRAMES		30	/* silence between repeats */
+#define DIAG_SLOT_FRAMES	8
+#define DIAG_GAP_FRAMES		30
 
 #define DIAG_NOTE(code)	do { \
 		if ((code) > diagWorst) \
 			diagWorst = (code); \
 	} while (0)
 
-static uint8_t  diagWorst;	/* worst code seen since the last report */
-static uint8_t  diagShowing;	/* code currently being blinked out */
-static uint16_t diagTick;	/* frames into the current blink cycle */
-static uint16_t frameLines;	/* scanlines counted in this frame */
+static uint8_t  diagWorst;
+static uint8_t  diagShowing;
+static uint16_t diagTick;
+static uint16_t frameLines;
 
-/*
- * Set while main.c is blinking a code of its own on the same LED.
- *
- * There is exactly one status LED and two things that want to drive it. Blinking
- * a boot or failure code necessarily keeps serving the bus, and serving runs
- * bus_dispatch, which lands here once per frame and drove TESTA0 unconditionally —
- * so the heartbeat kept stamping on the code mid-flash. That is what made the
- * codes unreadable ("some of the led blinks are overlapped or faster"): they were
- * two patterns superimposed, not one pattern mistimed. Whoever is deliberately
- * blinking wins; the heartbeat resumes when it is done.
- */
 volatile uint8_t mc_led_host;
 
-/*
- * Raise a diagnostic code from outside the kernel.
- *
- * The heartbeat already reports the worst thing seen since its last report, and it
- * is non-fatal — exactly the right channel for "this happened but playback carried
- * on". A field load that only succeeded on a retry must not be silent: without
- * this, a healed transient fault and a genuinely clean run look identical, and we
- * would not know whether retries were doing any work.
- */
 void
 mc_diag_note(uint8_t code)
 {
@@ -116,19 +68,38 @@ volatile uint16_t	mc_blanking_window_gen;
 volatile uint8_t	mc_sdio_gate_relaxed;
 volatile uint8_t	mc_playback_pipeline;
 
+/*
+ * ColdStart + RamKernel ($F000–$F09C), exact bytes from the last core.asm
+ * assemble. RamKernel ($F04B): jsr $F09D, FIELD $F1 even/odd, overscan
+ * 29/30, vsync 3, vblank 37, preroll 50/51, busy-wait, jmp $80.
+ */
+static const uint8_t mc_boot_rom[MC_OFF_BOOT_END + 1]
+	__attribute__((section(".ccmram"))) = {
+	0x78, 0xd8, 0xa2, 0xff, 0x9a, 0xa9, 0x00, 0x95, 0x00, 0xca, 0xd0, 0xfb, 0xa9, 0x01, 0x85, 0x26,
+	0xa9, 0xcf, 0x85, 0x0d, 0xa9, 0x33, 0x85, 0x0e, 0xa9, 0xcc, 0x85, 0x0f, 0xa2, 0x30, 0x85, 0x10,
+	0xea, 0x85, 0x11, 0xa9, 0x06, 0x85, 0x04, 0xa9, 0x02, 0x85, 0x05, 0x86, 0x20, 0xa9, 0x20, 0x85,
+	0x21, 0x85, 0x02, 0x85, 0x2a, 0xa2, 0x0c, 0xca, 0xd0, 0xfd, 0x85, 0x2b, 0xea, 0xea, 0xa2, 0x51,
+	0xbd, 0x4b, 0xf0, 0x95, 0x80, 0xca, 0x10, 0xf8, 0x4c, 0x80, 0x00, 0x20, 0x9d, 0xf0, 0xe6, 0xf1,
+	0xa5, 0xf1, 0x4a, 0x90, 0x07, 0xa2, 0x1e, 0xa0, 0x33, 0x4c, 0x60, 0xf0, 0xa2, 0x1d, 0xa0, 0x32,
+	0x85, 0x02, 0xca, 0xd0, 0xfb, 0xa9, 0x02, 0x85, 0x00, 0xa2, 0x03, 0x85, 0x02, 0xca, 0xd0, 0xfb,
+	0xa9, 0x00, 0x85, 0x00, 0xa9, 0x02, 0x85, 0x01, 0xa2, 0x25, 0x85, 0x02, 0xca, 0xd0, 0xfb, 0xa9,
+	0x00, 0x85, 0x01, 0x98, 0xaa, 0x85, 0x02, 0xca, 0xd0, 0xfb, 0xa2, 0x07, 0xca, 0xd0, 0xfd, 0xa9,
+	0x00, 0x85, 0x82, 0x85, 0x82, 0x85, 0x82, 0x85, 0x82, 0xea, 0x4c, 0x80, 0x00
+};
+
 static inline void
 diagFrameTick(void)
 {
 	uint16_t flashing = (uint16_t)diagShowing * DIAG_SLOT_FRAMES;
 
-	if (mc_led_host) {		/* main.c owns the LED right now */
+	if (mc_led_host) {
 		diagTick = 0;
 		return;
 	}
 
 	if (diagTick < flashing && (diagTick & (DIAG_SLOT_FRAMES - 1)) <
 				   (DIAG_SLOT_FRAMES / 2))
-		TESTA0_LOW	/* LED on */
+		TESTA0_LOW
 	else
 		TESTA0_HIGH
 
@@ -156,6 +127,8 @@ coreInit(void)
 	r_coreInfo.mr_inpt5 = 0xff;
 
 	r_coreInfo.lines = 190;
+	r_coreInfo.nextLineJump = ADDR_RIGHT_LINE;
+	r_coreInfo.storeAddress = &r_coreInfo.mr_swcha;
 	r_coreInfo.data = 0;
 
 	SET_DATA_MODE_IN;
@@ -190,10 +163,6 @@ mc_field_swap_to_display(void)
 	r_coreInfo.mr_bufferIndex = !r_coreInfo.mr_bufferIndex;
 }
 
-/*
- * Base of the audio array for the field currently on screen (mr_frameInfo
- * holds the stable base; frameInfo.audioBuf is the live cursor).
- */
 static uint8_t *
 mc_display_audio_base(void)
 {
@@ -205,11 +174,6 @@ mc_display_audio_base(void)
 static void
 mc_audio_begin_visible(void)
 {
-	/*
-	 * MovieCart fields store audio in play order: visible scanlines first,
-	 * then vsync+blank+overscan (see the old cart kernel's end_lines path).
-	 * RamKernel runs visible from cart, blanking from RIOT with no AUDV0.
-	 */
 	r_coreInfo.frameInfo.audioBuf = mc_display_audio_base();
 }
 
@@ -217,10 +181,8 @@ static void
 mc_audio_skip_blanking(void)
 {
 	/*
-	 * VisibleBars only hits sta AUDV0 on the eight dual-line kernels, not on
-	 * every visible scanline or during RIOT blanking.  Advance the cursor to
-	 * the end of this field's sound[] so the next load stays aligned and we
-	 * do not replay the blanking tail on the following frame.
+	 * Visible now consumes every visible sample. Skip the blanking tail
+	 * so the next field stays aligned (RamKernel has no AUDV0).
 	 */
 	if (!r_coreInfo.frameInfo.numBlocks)
 		return;
@@ -233,21 +195,14 @@ mc_audio_skip_blanking(void)
 }
 
 static void
-mc_visible_line_advance(void)
-{
-	r_coreInfo.frameInfo.graphBuf += 10;
-	r_coreInfo.frameInfo.colorBuf += 10;
-	frameLines += 2;
-}
-
-static void
 mc_on_visible_bars_entry(void)
 {
-	/* Title still swaps here. Playback commits the new buffer during
-	 * blanking after DMA validation, before VisibleBars starts. */
 	if (!mc_playback_pipeline)
 		mc_field_swap_to_display();
 	mc_audio_begin_visible();
+	if (r_coreInfo.frameInfo.visibleLines)
+		r_coreInfo.lines = r_coreInfo.frameInfo.visibleLines;
+	r_coreInfo.nextLineJump = ADDR_RIGHT_LINE;
 	mc_blanking_window = 0;
 	mc_visible_bars_vended = 1;
 }
@@ -255,27 +210,35 @@ mc_on_visible_bars_entry(void)
 static void
 mc_on_visible_bars_rts(void)
 {
+	uint8_t expect = r_coreInfo.frameInfo.visibleLines;
+
 	mc_blanking_window = 1;
 	mc_blanking_window_gen++;
 	mc_visible_bars_vended = 0;
 	mc_audio_skip_blanking();
 
-	if (frameLines < 250 || frameLines > 275)
+	/* Last pair does not increment frameLines (jmp to stub instead). */
+	if (expect && (frameLines + 2 < expect - 4 || frameLines + 2 > expect + 4))
 		DIAG_NOTE(DIAG_FRAME_LENGTH);
 	frameLines = 0;
 #if MOVIECART_STALL_TEST != 1 && MOVIECART_STALL_TEST != 2
 	diagFrameTick();
 #endif
 	r_coreInfo.mr_endFrame = true;
+	if (expect)
+		r_coreInfo.lines = expect;
+	r_coreInfo.nextLineJump = ADDR_RIGHT_LINE;
 }
 
 
 HOTFUNC void
 bus_dispatch(uint16_t cart_off)
 {
-	/* Visible-line patch slots only (phase 0 = g0x3e). Section is required:
-	 * static const would otherwise go to flash .rodata. */
-	static const void* const romData[MC_PHASE_DYNAMIC_MAX + 1]
+	/*
+	 * $F09E–$F135: original kernel pair + end stub. Section required so
+	 * this is not flash .rodata.
+	 */
+	static const void* const vis[0x135u - 0x09eu + 1]
 		__attribute__((section(".ccmram"))) =
 	{
 		&&g0x3e, &&g0x3f, &&g0x40, &&g0x41, &&g0x42, &&g0x43, &&g0x44, &&g0x45, &&g0x46, &&g0x47, &&g0x48, &&g0x49, &&g0x4a, &&g0x4b, &&g0x4c, &&g0x4d,
@@ -285,39 +248,40 @@ bus_dispatch(uint16_t cart_off)
 		&&g0x7e, &&g0x7f, &&g0x80, &&g0x81, &&g0x82, &&g0x83, &&g0x84, &&g0x85, &&g0x86, &&g0x87, &&g0x88, &&g0x89, &&g0x8a, &&g0x8b, &&g0x8c, &&g0x8d,
 		&&g0x8e, &&g0x8f, &&g0x90, &&g0x91, &&g0x92, &&g0x93, &&g0x94, &&g0x95, &&g0x96, &&g0x97, &&g0x98, &&g0x99, &&g0x9a, &&g0x9b, &&g0x9c, &&g0x9d,
 		&&g0x9e, &&g0x9f, &&g0xa0, &&g0xa1, &&g0xa2, &&g0xa3, &&g0xa4, &&g0xa5, &&g0xa6, &&g0xa7, &&g0xa8, &&g0xa9, &&g0xaa, &&g0xab, &&g0xac, &&g0xad,
-		&&g0xae
+		&&g0xae, &&g0xaf, &&g0xb0, &&g0xb1, &&g0xb2, &&g0xb3, &&g0xb4, &&g0xb5, &&g0xb6,
+		&&e0x117, &&e0x118, &&e0x119, &&e0x11a, &&e0x11b, &&e0x11c, &&e0x11d, &&e0x11e, &&e0x11f, &&e0x120, &&e0x121, &&e0x122, &&e0x123, &&e0x124,
+		&&e0x125, &&e0x126, &&e0x127, &&e0x128, &&e0x129, &&e0x12a, &&e0x12b, &&e0x12c, &&e0x12d, &&e0x12e, &&e0x12f, &&e0x130, &&e0x131, &&e0x132,
+		&&e0x133, &&e0x134, &&e0x135
 	};
 
-	/*
-	 * VisibleBars scanlines: eight inlined kernel pairs from core.asm. Only
-	 * the lda # / ldx # / ldy # slots need buffer patches; the cycle-accurate
-	 * tail of each line (HMP, jmp next line) is served verbatim from core.bin.
-	 */
-	if (cart_off >= MC_OFF_LINE0 && cart_off < MC_OFF_END_LINES) {
-		uint16_t phase = (uint16_t)((cart_off - MC_OFF_LINE0) % MC_LINE_CYCLE);
+	if (cart_off >= MC_OFF_STORE && cart_off < MC_OFF_STORE + 0x100u)
+		goto gstore;
 
-		if (phase <= MC_PHASE_DYNAMIC_MAX)
-			goto *romData[phase];
-
-		SET_DATA(mc_core_rom[cart_off]);
-		if (phase == 0x76u)
-			mc_visible_line_advance();
+	if (cart_off <= MC_OFF_BOOT_END) {
+		SET_DATA(mc_boot_rom[cart_off]);
 		EMULATE_DONE
 	}
 
 	if (cart_off == MC_OFF_VISIBLE_ENTRY) {
-		SET_DATA(mc_core_rom[cart_off]);
+		SET_DATA(0xea);
 		mc_on_visible_bars_entry();
 		EMULATE_DONE
 	}
 
-	if (cart_off == MC_OFF_VISIBLE_RTS) {
-		SET_DATA(mc_core_rom[cart_off]);
-		mc_on_visible_bars_rts();
+	if (cart_off >= ADDR_RIGHT_LINE && cart_off <= 0x135u)
+		goto *vis[cart_off - ADDR_RIGHT_LINE];
+
+	if (cart_off >= MC_OFF_VECTORS) {
+		SET_DATA((cart_off & 1u) ? 0xf0 : 0x00);
 		EMULATE_DONE
 	}
 
-	SET_DATA(mc_core_rom[cart_off]);
+	SET_DATA(0x00);
+	EMULATE_DONE
+
+gstore:
+	*r_coreInfo.storeAddress = (uint_fast8_t)(cart_off & 0xffu);
+	SET_DATA(0x00);
 	EMULATE_DONE
 
 g0x3e:
@@ -329,8 +293,6 @@ g0x3f:
 	SET_DATA(r_coreInfo.data);
 	EMULATE_DONE
 
-
-
 g0x40:
 	SET_DATA(0x85); // sta GRP1 	// 3 VDELed
 	EMULATE_DONE
@@ -340,7 +302,7 @@ g0x41:
 	EMULATE_DONE
 
 g0x42:
-	SET_DATA(0x85); // 2a sta HMOVE 	// 3 @03 +8 pixel
+	SET_DATA(0x85); // sta HMOVE 	// 3 @03 +8 pixel
 	EMULATE_DONE
 
 g0x43:
@@ -398,7 +360,6 @@ g0x4e:
 g0x4f:
 	SET_DATA(0x07);
 	EMULATE_DONE
-
 
 g0x50:
 	SET_DATA(0xa9);	// lda #GDATA5 	// 2
@@ -535,7 +496,6 @@ g0x6f:
 	SET_DATA(0x06);
 	EMULATE_DONE
 
-
 g0x70:
 	SET_DATA(0xa9);	// lda #$00 	// 2 turn off background color
 	EMULATE_DONE
@@ -545,7 +505,7 @@ g0x71:
 	EMULATE_DONE
 
 g0x72:
-	SET_DATA(0x85);	// 09 sta COLUBK 	// 3 background color
+	SET_DATA(0x85);	// sta COLUBK 	// 3 background color
 	EMULATE_DONE
 
 g0x73:
@@ -601,7 +561,6 @@ g0x7e:
 g0x7f:
 	SET_DATA(r_coreInfo.data);
 	EMULATE_DONE
-
 
 g0x80:
 	SET_DATA(0x85);	// sta COLUP1 	// 3
@@ -801,4 +760,146 @@ g0xae:
 	SET_DATA(0xa9);	// lda #$80 	// 2
 	EMULATE_DONE
 
+g0xaf:
+	SET_DATA(0x80);
+	r_coreInfo.lines -= 2;
+	EMULATE_DONE
+
+g0xb0:
+	SET_DATA(0x85);	// sta HMP0 	// 3
+	if (r_coreInfo.lines == 0) {
+		r_coreInfo.nextLineJump = ADDR_END_LINES;
+	} else if (LINES_EXHAUSTED(r_coreInfo.lines)) {
+		r_coreInfo.nextLineJump = ADDR_END_LINES;
+		DIAG_NOTE(DIAG_WRAP_VISIBLE);
+	} else {
+		r_coreInfo.frameInfo.graphBuf += 10;
+		r_coreInfo.frameInfo.colorBuf += 10;
+		frameLines += 2;
+	}
+	EMULATE_DONE
+
+g0xb1:
+	SET_DATA(0x20);
+	EMULATE_DONE
+
+g0xb2:
+	SET_DATA(0x85);	// sta HMP1 	// 3 @63
+	EMULATE_DONE
+
+g0xb3:
+	SET_DATA(0x21);
+	EMULATE_DONE
+
+g0xb4:
+	SET_DATA(0x4c); // jmp right_line / end stub
+	EMULATE_DONE
+
+g0xb5:
+	SET_DATA(r_coreInfo.nextLineJump);
+	EMULATE_DONE
+
+g0xb6:
+	SET_DATA(0xf0);
+	EMULATE_DONE
+
+/* $F117: lda #0 / sta GRP0 / sta GRP1 / sta GRP0 / joystick / rts */
+e0x117:
+	SET_DATA(0xa9);
+	EMULATE_DONE
+e0x118:
+	SET_DATA(0x00);
+	EMULATE_DONE
+e0x119:
+	SET_DATA(0x85);
+	EMULATE_DONE
+e0x11a:
+	SET_DATA(0x1b);
+	EMULATE_DONE
+e0x11b:
+	SET_DATA(0x85);
+	EMULATE_DONE
+e0x11c:
+	SET_DATA(0x1c);
+	EMULATE_DONE
+e0x11d:
+	SET_DATA(0x85);
+	EMULATE_DONE
+e0x11e:
+	SET_DATA(0x1b);
+	EMULATE_DONE
+e0x11f:
+	SET_DATA(0xae); // ldx SWCHA
+	EMULATE_DONE
+e0x120:
+	SET_DATA(0x80);
+	EMULATE_DONE
+e0x121:
+	SET_DATA(0x02);
+	EMULATE_DONE
+e0x122:
+	SET_DATA(0xbd); // lda $FE00,x
+	EMULATE_DONE
+e0x123:
+	SET_DATA(0x00);
+	EMULATE_DONE
+e0x124:
+	SET_DATA(0xfe);
+	r_coreInfo.storeAddress = &r_coreInfo.mr_swcha;
+	EMULATE_DONE
+e0x125:
+	SET_DATA(0xae); // ldx SWCHB
+	EMULATE_DONE
+e0x126:
+	SET_DATA(0x82);
+	EMULATE_DONE
+e0x127:
+	SET_DATA(0x02);
+	EMULATE_DONE
+e0x128:
+	SET_DATA(0xbd);
+	EMULATE_DONE
+e0x129:
+	SET_DATA(0x00);
+	EMULATE_DONE
+e0x12a:
+	SET_DATA(0xfe);
+	r_coreInfo.storeAddress = &r_coreInfo.mr_swchb;
+	EMULATE_DONE
+e0x12b:
+	SET_DATA(0xa6); // ldx INPT4
+	EMULATE_DONE
+e0x12c:
+	SET_DATA(0x0c);
+	EMULATE_DONE
+e0x12d:
+	SET_DATA(0xbd);
+	EMULATE_DONE
+e0x12e:
+	SET_DATA(0x00);
+	EMULATE_DONE
+e0x12f:
+	SET_DATA(0xfe);
+	r_coreInfo.storeAddress = &r_coreInfo.mr_inpt4;
+	EMULATE_DONE
+e0x130:
+	SET_DATA(0xa6); // ldx INPT5
+	EMULATE_DONE
+e0x131:
+	SET_DATA(0x0d);
+	EMULATE_DONE
+e0x132:
+	SET_DATA(0xbd);
+	EMULATE_DONE
+e0x133:
+	SET_DATA(0x00);
+	EMULATE_DONE
+e0x134:
+	SET_DATA(0xfe);
+	r_coreInfo.storeAddress = &r_coreInfo.mr_inpt5;
+	EMULATE_DONE
+e0x135:
+	SET_DATA(0x60); // rts
+	mc_on_visible_bars_rts();
+	EMULATE_DONE
 }

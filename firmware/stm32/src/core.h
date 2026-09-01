@@ -30,7 +30,9 @@ struct coreInfo
 	// following only used by the bus loop
 
 	volatile uint_fast8_t	lines;
+	uint_fast8_t	nextLineJump;
 	uint_fast8_t	data;
+	volatile uint_fast8_t	*storeAddress;
 
 	struct frameInfo	frameInfo;
 };
@@ -54,17 +56,17 @@ extern void			mc_diag_note(uint8_t code);
 extern void			mc_field_swap_to_display(void);
 
 /*
- * RamKernel frame markers (see core.asm / core.bin):
+ * RamKernel frame markers (see core.c):
  *
  *   mc_visible_bars_vended  set when the cart serves VisibleBars ($F09D) — the
  *                          6502 just finished blanking in RIOT and is entering
- *                          the cart-visible section for this frame.
+ *                          the looping visible kernel for this frame.
  *
- *   mc_blanking_window     set when VisibleBars RTS ($F41D) is served — visible
- *                          is done, blanking runs from RIOT, and the MCU is
- *                          free for SDIO while RamKernel runs from RIOT $80.
+ *   mc_blanking_window     set when the visible stub RTS ($F135) is served —
+ *                          visible is done, blanking runs from RIOT, and the
+ *                          MCU is free for SDIO while RamKernel runs from $80.
  *
- *   mc_blanking_window_gen increments on each $F41D edge. SDIO initiation and
+ *   mc_blanking_window_gen increments on each $F135 edge. SDIO initiation and
  *                          polling wait for gen to advance (see moviecart_sdio_gate),
  *                          except during playback field loads (mc_sdio_gate_relaxed).
  */

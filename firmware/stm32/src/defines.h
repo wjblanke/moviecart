@@ -105,7 +105,7 @@
 #define SDIO_TRANSFER_CLK_DIV		((uint8_t)MOVIECART_SD_DMA_CLKDIV)
 #endif
 
-/* UnoCart DevEBox: A12 high selects cart; kernel indexed by A0-A8. */
+/* UnoCart DevEBox: A12 high selects cart; kernel indexed by A0-A11. */
 #define CART_ADDR_MASK			0x1000u
 #define CART_ADDR_SELECT		0x1000u
 

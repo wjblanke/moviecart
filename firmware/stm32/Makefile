@@ -42,7 +42,6 @@ SOURCES = \
 	Libraries/tm_stm32f4_fatfs/fatfs/drivers/fatfs_sd_sdio.c \
 	src/main.c \
 	src/core.c \
-	src/core_rom.c \
 	src/bus_service.c \
 	src/sd_reader.c \
 	src/pff.c \
@@ -178,17 +177,6 @@ check-toolchain:
 		echo "Run: ./scripts/setup-toolchain.sh"; \
 		exit 1; \
 	}
-
-# Generate cart ROM image from the Atari kernel build.
-../../kernel/core.bin:
-	$(MAKE) -C ../../kernel core.bin
-
-src/core_rom.c: ../../kernel/core.bin
-	python3 -c 'import pathlib; b=pathlib.Path("$<").read_bytes(); \
-print("#include \"core_rom.h\"\\n"); \
-print("const uint8_t mc_core_rom[MC_CORE_ROM_SIZE] = {"); \
-[print("  "+", ".join(f"0x{x:02x}" for x in b[i:i+16])+",") for i in range(0,len(b),16)]; \
-print("};")' > $@
 
 bin: $(BIN)
 hex: $(HEX)

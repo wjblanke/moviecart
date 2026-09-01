@@ -31,14 +31,14 @@ System clock: HSI → PLL @ 168 MHz (same as UnoCart DevEBox); SDIOCLK 48 MHz.
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │ 6502 / 6507                                                     │
-│   Visible scanlines  ← cart ROM (VisibleBars + patched immediates)│
+│   Visible scanlines  ← looping kernel in core.c (g0x3e–g0xb6)   │
 │   Sync / blank / OS  ← RamKernel copied to RIOT $80 at boot     │
 └───────────────────────────┬─────────────────────────────────────┘
                             │ A12-high cart fetches (~838 ns/cycle)
 ┌───────────────────────────▼─────────────────────────────────────┐
 │ STM32 main thread (IRQs masked while serving)                     │
 │   emulate_cartridge() / bus_serve_cycle()  ← UnoCart poll loop  │
-│   bus_dispatch()                           ← core.bin + patches │
+│   bus_dispatch()                           ← original-style jump table │
 │                                                                 │
 │ All SD (mount, open, probe, select, playback field loads):      │
 │   DMA + manual completion poll in fatfs_sd_sdio.c               │
@@ -50,27 +50,28 @@ System clock: HSI → PLL @ 168 MHz (same as UnoCart DevEBox); SDIOCLK 48 MHz.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### RamKernel split (`kernel/core.asm` → `core.bin`)
+### RamKernel split (`src/core.c`)
 
-The Atari-side kernel is built with DASM in `kernel/` and embedded as `mc_core_rom[4096]` in `src/core_rom.c` (regenerated automatically when `core.bin` changes).
+Visible serving is the original MovieCart computed-goto kernel (one right/left pair, `jmp` back until `lines == 0`). Blanking is still the RamKernel from `kernel/core.asm`, stored as `mc_boot_rom[]` and copied to RIOT `$80` at ColdStart. The firmware build does not assemble or embed `core.bin`.
 
 | Region | Where it runs | Role |
 |--------|---------------|------|
-| **ColdStart** | Cart ROM | Copies **RamKernel** into RIOT `$80`, then enters it |
+| **ColdStart** | Cart ROM `$F000` | Copies **RamKernel** into RIOT `$80`, then enters it |
 | **RamKernel** | RIOT `$80`+ | VSYNC, VBLANK, overscan, preroll — no cart fetches during blanking |
-| **VisibleBars** | Cart ROM | Visible scanline prologue only; eight dual-line kernels with patched immediates |
+| **VisibleBars** | Cart ROM | Looping dual-line kernel (`g0x3e`…`g0xb6`); `AUDV0` every scanline |
 
-Blanking therefore executes from RIOT RAM. The cart is only fetched for ColdStart, the RamKernel image bytes, VisibleBars entry/RTS, and per-line immediate patches.
+Blanking therefore executes from RIOT RAM. The cart is fetched for ColdStart, the RamKernel image, the looping kernel, the end stub (joystick + RTS), and `$FE00,x` stores.
 
 Cart dispatch indexes **`addr & 0xfff`** (12-bit space). Key hook addresses:
 
 | Offset | Symbol | MCU action |
 |--------|--------|------------|
-| `$F09D` | VisibleBars entry | Title: swap display buffer. Playback: no swap (already done in blanking). Reset audio cursor, set `mc_visible_bars_vended` |
-| `$F41D` | VisibleBars RTS | End frame (`mr_endFrame`), skip blanking audio tail, set `mc_blanking_window` |
-| `$0BF`–`$40D` | Visible lines | Static bytes from `core.bin`; immediates patched via phase map → `g0x3e`…`g0xae` |
+| `$F09D` | VisibleBars entry (nop) | Title: swap display buffer. Playback: no swap (already done in blanking). Reset audio cursor, set `mc_visible_bars_vended` |
+| `$F09E`–`$F116` | right/left pair | Patch graphics/color/audio; `jmp $F09E` or `$F117` |
+| `$F135` | Visible stub RTS | End frame (`mr_endFrame`), skip blanking audio tail, set `mc_blanking_window` |
+| `$FE00+x` | gstore | Latch SWCHA / SWCHB / INPT4 / INPT5 |
 
-Audio in field files is stored **[visible lines][blanking tail]**. VisibleBars only writes `AUDV0` on the eight dual-line kernels, not every scanline and not during RIOT blanking. At `$F41D` the audio pointer skips the unplayed visible tail plus blanking samples so the next field stays aligned.
+Audio in field files is stored **[visible lines][blanking tail]**. The looping kernel writes `AUDV0` on every visible scanline. At `$F135` the audio pointer skips the unplayed blanking tail so the next field stays aligned. RamKernel still has no `AUDV0`.
 
 ### Cart bus serving
 
@@ -96,7 +97,7 @@ The stock UnoCart SDIO driver (`fatfs_sd_sdio.c`) keeps **DMA** for sector reads
 
 Every SDIO wait loop calls `moviecart_bus_yield()` (or `SD_PollDmaAndYield()` for DMA drains). Long delays use `moviecart_delay_ms()` instead of busy DWT spins.
 
-**Blanking-only SDIO control:** `mc_blanking_window_gen` increments on each VisibleBars RTS (`$F41D`). By default `moviecart_sdio_gate()` blocks until that counter advances (mount, title probe, file select). Playback command initiation and completion polling use the relaxed gate in their respective blanking intervals. The DMA itself runs asynchronously between them while the other field buffer is displayed.
+**Blanking-only SDIO control:** `mc_blanking_window_gen` increments on each VisibleBars RTS (`$F135`). By default `moviecart_sdio_gate()` blocks until that counter advances (mount, title probe, file select). Playback command initiation and completion polling use the relaxed gate in their respective blanking intervals. The DMA itself runs asynchronously between them while the other field buffer is displayed.
 
 ### Playback loop
 
@@ -116,7 +117,7 @@ FatFs cluster walks and other CPU-bound loops call `moviecart_bus_yield()` so th
 | Interval | Display | DMA target | Main-thread work |
 |----------|---------|------------|------------------|
 | Visible N | A | B (may still be filling) | Serve cart only |
-| Blanking N (`$F41D`) | — | B, then A | Finish/validate B, swap to B, start CMD18 into A |
+| Blanking N (`$F135`) | — | B, then A | Finish/validate B, swap to B, start CMD18 into A |
 | Visible N+1 | B | A | Serve cart; `$F09D` does **not** swap |
 | Blanking N+1 | — | A, then B | Finish/validate A, swap to A, start CMD18 into B |
 
@@ -124,7 +125,7 @@ FatFs cluster walks and other CPU-bound loops call `moviecart_bus_yield()` so th
 
 The first playback pass repeats the title once while the first CMD18 is primed. A failed field is retried into the same inactive buffer and is not swapped in.
 
-`beginFieldRead()` / `finishFieldRead()` each set `mc_sdio_gate_relaxed` so command start and completion polls use the current blanking window instead of waiting for a new `$F41D` edge. The DMA itself runs through the following visible interval.
+`beginFieldRead()` / `finishFieldRead()` each set `mc_sdio_gate_relaxed` so command start and completion polls use the current blanking window instead of waiting for a new `$F135` edge. The DMA itself runs through the following visible interval.
 
 #### DMA completion (frame data)
 
@@ -172,8 +173,7 @@ CCM holds all CPU data so it does not share an AHB port with DMA. The two field 
 | Path | Role |
 |------|------|
 | `src/bus_service.c` | UnoCart poll loop, yield/pump helpers |
-| `src/core.c` | Cart dispatch, RamKernel hooks, WaitCart protocol, frame diagnostics |
-| `src/core_rom.c` | Generated embed of `kernel/core.bin` |
+| `src/core.c` | Cart dispatch (looping kernel + RamKernel boot image), frame diagnostics |
 | `src/main.c` | Boot, SD milestones, title/playback loops, LED codes |
 | `src/pff.c` | Petit FatFs (read-only) |
 | `src/sd_reader.c` | Sector cache, UnoCart `disk_read` wrapper |
@@ -216,7 +216,7 @@ Once per second when healthy — worst condition since last report:
 | 1 | Nominal |
 | 2 | Line counter wrapped in visible section |
 | 3 | Line counter wrapped in end-lines section |
-| 4 | Frame length out of range (250–275 scanlines) |
+| 4 | Visible line count out of range |
 | 5 | Field load recovered after retry (`DIAG_FIELD_RETRY`) |
 
 Frozen LED: kernel stopped completing frames.
@@ -233,8 +233,6 @@ cd firmware/stm32
 make clean && make              # build/firmware.elf, .bin, .hex
 make flash                      # st-flash, if installed
 ```
-
-The build runs `make -C ../../kernel core.bin` and regenerates `src/core_rom.c` from it.
 
 Override toolchain: `make TOOLCHAIN=/path/to/arm-none-eabi/bin`
 
