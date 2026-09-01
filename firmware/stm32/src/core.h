@@ -38,13 +38,6 @@ struct coreInfo
 	uint_fast8_t	vblankState;
 	uint_fast8_t	vsyncState;
 	volatile uint_fast8_t	endState;
-	/*
-	 * Full jmp target: low byte in 0-7, high byte in 8-15. It is one value
-	 * rather than a low byte plus a computed high byte because $FFxx and the
-	 * RAM routine at $0084 do not share a page, and deciding the high byte
-	 * inside the fetch that serves it put a volatile compare on the hottest
-	 * path in the kernel.
-	 */
 	volatile uint_fast16_t	nextLineJump;
 	uint_fast8_t	data;
 
@@ -72,20 +65,6 @@ extern volatile uint8_t		mc_led_host;
 extern void			mc_diag_note(uint8_t code);
 
 /*
- * WaitCart handoff — UnoCart's sequence, in the kernel ROM we own.
- *
- * After ClearMem the 6502 copies a wait routine from ROM into $84 and RTS.
- * nextLineJump points at $0084 only while ARMED. See core.c.
- */
-#define MC_WAIT_IDLE		0u	/* boot; PrepareWait has not RTS'd */
-#define MC_WAIT_INSTALLED	2u	/* routine resident in RIOT RAM */
-#define MC_WAIT_ARMED		3u	/* next $FFF4 fetch parks; ARM is waiting */
-#define MC_WAIT_RUNNING		4u	/* 6502 in RAM: the ARM is free */
-
-extern volatile uint8_t		mc_wait_state;
-extern volatile uint8_t		mc_wait_ready;
-
-/*
  * RamKernel frame markers (see core.asm / core.bin):
  *
  *   mc_visible_bars_vended  set when the cart serves VisibleBars ($F09D) — the
@@ -94,24 +73,13 @@ extern volatile uint8_t		mc_wait_ready;
  *
  *   mc_blanking_window     set when VisibleBars RTS ($F41D) is served — visible
  *                          is done, blanking runs from RIOT, and the MCU is
- *                          free for SDIO DMA on A12-low cycles.
+ *                          free for SDIO while RamKernel runs from RIOT $80.
+ *
+ *   mc_blanking_window_gen increments on each $F41D edge. SDIO initiation and
+ *                          polling wait for gen to advance (see moviecart_sdio_gate).
  */
 extern volatile uint8_t		mc_visible_bars_vended;
 extern volatile uint8_t		mc_blanking_window;
-
-/*
- * Why an armed handoff failed to park. Non-zero means work() did NOT run.
- *
- *   1  2 s elapsed without the RAM routine fetching $FFF4. A live title after
- *      the LED goes solid is this case: the kernel never jumped to $84.
- *   2  The 6502 parked, work() ran, and the 6502 read READY and left RAM — but
- *      no end-of-frame arrived in the 250 ms after that. The park succeeded and
- *      the resume did not.
- *   3  work() ran but the 6502 never left RAM (never fetched READY).
- */
-extern volatile uint8_t		mc_wait_fault;
-
-extern void			mc_wait_install(void);
-extern void			mc_wait_handoff(void (*work)(void));
+extern volatile uint16_t	mc_blanking_window_gen;
 
 #endif

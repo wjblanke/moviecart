@@ -165,10 +165,26 @@ bus_serve_cycle(void)
 void
 moviecart_bus_yield(void)
 {
-	if (mc_wait_state == MC_WAIT_RUNNING)
-		return;
-
 	bus_serve_cycle();
+}
+
+/*
+ * First call snapshots the current gen so we always wait for the *next* $F41D
+ * edge, even if the kernel has already completed many frames before mount.
+ */
+void
+moviecart_sdio_gate(void)
+{
+	static uint16_t seen;
+	static uint8_t primed;
+
+	if (!primed) {
+		seen = mc_blanking_window_gen;
+		primed = 1;
+	}
+	while (mc_blanking_window_gen == seen)
+		bus_serve_cycle();
+	seen = mc_blanking_window_gen;
 }
 
 /*
@@ -233,13 +249,6 @@ HOTFUNC void
 moviecart_bus_pump(void (*work)(void))
 {
 	uint16_t addr;
-
-	/* Handoff in progress: no cart fetches to catch, so just make progress. */
-	if (mc_wait_state == MC_WAIT_RUNNING) {
-		if (work)
-			work();
-		return;
-	}
 
 	probe_enter();
 	while ((addr = ADDR_IN) != serve_addr_prev)

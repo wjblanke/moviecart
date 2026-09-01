@@ -2,13 +2,8 @@
  * MovieCart on DevEBox STM32F407VGT6
  *
  * The Atari is served by UnoCart's polling loop with interrupts off for the
- * entire run. That loop is the only thing on this board fast enough to hit the
- * 6507's data-valid deadline.
- *
- * SD field streaming coexists by yielding back into bus_serve_cycle() from every
- * SDIO command wait, DMA completion poll, Delayms replacement, FatFs cluster
- * hop, and updateBuffer byte batch — so main never abandons the bus for more
- * than a handful of instructions at a time.
+ * entire run. SDIO/DMA completion is polled manually in the driver; every SD
+ * wait yields back into bus_serve_cycle() so RamKernel keeps running on the 6502.
  */
 /* make NO_SD=1 builds the title-only baseline: the known-good reference. */
 #ifndef MOVIECART_ENABLE_SD
@@ -463,46 +458,6 @@ run_interleave_proof(void)
 #endif /* MOVIECART_STALL_TEST */
 
 static __attribute__((noreturn)) void fatalBlink(uint8_t code);
-static __attribute__((noreturn)) void fatalHandoff(uint8_t code);
-
-#if MOVIECART_WAITCART_PROOF
-/*
- * Prove the handoff before trusting it with the SD path.
- *
- * Burns a millisecond — the scale of a real field read — while serving the bus
- * absolutely nothing. Under the old cooperative model this is far beyond the
- * measured budget and would garble the picture outright; with the console parked
- * in RAM it should be invisible. Expect 1 flash, 2 flashes, then a clean title
- * screen and the kernel's once-per-second heartbeat.
- */
-static void
-waitcart_proof_work(void)
-{
-	uint32_t start = DWT->CYCCNT;
-	uint32_t limit = SystemCoreClock / 1000u;	/* 1 ms */
-
-	while ((DWT->CYCCNT - start) < limit)
-		;
-}
-
-static __attribute__((noreturn)) void
-run_waitcart_proof(void)
-{
-	if (!wait_title_sync(3000u))
-		fatalBlink(6);
-	flash_led(1);
-
-	mc_wait_install();
-	flash_led(2);
-
-	for (;;) {
-		waitEndFrame();
-		mc_wait_handoff(waitcart_proof_work);
-		if (mc_wait_fault)
-			fatalHandoff(mc_wait_fault);
-	}
-}
-#endif
 
 static __attribute__((noreturn)) void
 fatalBlink(uint8_t code)
@@ -529,36 +484,6 @@ fatalStrobe(void)
 		led_wait_ms(2000);
 		TESTA0_HIGH;
 		led_wait_ms(400);
-	}
-}
-
-/*
- * Report a handoff verdict: `code` slow flashes, repeating after a long gap
- * (see mc_wait_fault in core.h for the codes).
- *
- * The slow, evenly-spaced pattern with a 2 s lead-in is what distinguishes this
- * from the numbered disk faults, which are reported as a quick count. It needs
- * distinguishing because a handoff fault does not look like a fault: one that
- * never parks leaves the kernel running and the bus served, so a clean picture, a
- * live heartbeat and a mount that never completes all look like healthy hardware.
- */
-static __attribute__((noreturn)) void
-fatalHandoff(uint8_t code)
-{
-	__disable_irq();
-	mc_led_host = 1;
-	/* Off first, so this cannot be mistaken for the solid-on that
-	 * preceded it. Then `code` slow flashes, repeating. */
-	TESTA0_HIGH;
-	led_wait_ms(2000);
-	for (;;) {
-		for (uint8_t i = 0; i < code; i++) {
-			TESTA0_LOW;
-			led_wait_ms(400);
-			TESTA0_HIGH;
-			led_wait_ms(400);
-		}
-		led_wait_ms(2000);
 	}
 }
 
@@ -638,9 +563,7 @@ setupDisk(void)
 #if MOVIECART_SD_STAGE == 1
 	emulate_cartridge();
 #endif
-	mc_wait_handoff(mount_work);
-	if (mc_wait_fault)
-		fatalHandoff(mc_wait_fault);	/* the handoff broke, not the card */
+	mount_work();
 	if (!disk_mount_ok)
 		fatalBlink(5);
 	flash_led(2);
@@ -654,9 +577,7 @@ setupDisk(void)
 #endif
 	state.io_frameNumber = 1;
 	state.io_bits &= ~STATE_PLAYING;
-	mc_wait_handoff(open_work);
-	if (mc_wait_fault)
-		fatalHandoff(mc_wait_fault);
+	open_work();
 	if (!disk_open_ok)
 		fatalBlink(8);
 	flash_led(3);
@@ -803,7 +724,7 @@ runTitle(void)
 	struct frameInfo fInfo;
 	fInfo.buffer = r_coreInfo.mr_frameInfo1.colorBuf;
 	title_dst = fInfo.buffer;
-	mc_wait_handoff(title_probe_work);
+	title_probe_work();
 	if (title_probe_fault == 0xffu)
 		fatalStrobe();
 	if (title_probe_fault)
@@ -874,7 +795,7 @@ checkSelectVideo(int *which)
 		(*which)++;
 		for (;;) {
 			select_which = *which;
-			mc_wait_handoff(select_open_work);
+			select_open_work();
 			if (disk_open_ok)
 				break;
 			*which = 1;
@@ -916,9 +837,10 @@ runFrameLoop(void)
 
 		/*
 		 * VisibleBars RTS ($F41D) marks the start of the RIOT blanking
-		 * tail. prepareNextFrame() yields through SDIO reads on A12-low
-		 * cycles while RamKernel runs from RIOT $80. If the load finishes
-		 * before the next VisibleBars entry, keep serving until $F09D.
+		 * tail. prepareNextFrame() calls into FatFs/disk_read; the SDIO
+		 * driver waits for a fresh mc_blanking_window_gen edge before each
+		 * command, poll, or DMA drain. If the load finishes before the next
+		 * VisibleBars entry, keep serving until $F09D.
 		 */
 		mc_visible_bars_vended = 0;
 		uint8_t frame_fault = prepareNextFrame();
@@ -939,9 +861,9 @@ main(void)
 	dwt_init();
 
 	/*
-	 * Mask IRQs before the 6507 starts fetching, then set up SysTick so
-	 * Delayms works once a WaitCart handoff re-enables them. TM_DELAY_Init
-	 * programs the timer; the handler does not run until __enable_irq().
+	 * IRQs stay masked for the entire Atari serve run. SDIO/DMA completion is
+	 * polled in the driver; long waits use moviecart_delay_ms (yields each
+	 * iteration). TM_DELAY_Init is kept for library helpers that use TM_Time.
 	 */
 	__disable_irq();
 	TM_DELAY_Init();
@@ -954,9 +876,7 @@ main(void)
 	setupTitleBuffers();
 	loadTitlePixels();
 
-#if MOVIECART_WAITCART_PROOF
-	run_waitcart_proof();
-#elif MOVIECART_STALL_TEST == 3
+#if MOVIECART_STALL_TEST == 3
 	run_interleave_proof();
 #elif MOVIECART_STALL_TEST
 	run_stall_sweep();
@@ -965,20 +885,6 @@ main(void)
 	if (!wait_title_sync(3000u))
 		fatalBlink(6);
 	flash_led(1);
-
-#if MOVIECART_WAITCART
-	/*
-	 * The 6502 copies the wait routine during boot (JSR $FFEC after
-	 * ClearMem). Title sync means that already happened. Then solid LED:
-	 *   title still live after ~2 s, LED goes off, 1 slow flash
-	 *     = never fetched $FFF4 from RAM (jmp $0084 did not run)
-	 *   LED goes off immediately, picture dies = parked; mount is running
-	 */
-	mc_wait_install();
-	led_wait_frames(36);
-	mc_led_host = 1;
-	TESTA0_LOW;
-#endif
 
 	setupDisk();
 

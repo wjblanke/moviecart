@@ -138,17 +138,6 @@ ifneq ($(FASTPATH),)
 DEFS += -DMOVIECART_SD_DMA_FASTPATH=$(FASTPATH)
 endif
 
-# WaitCart handoff: make WAITCART=0 reverts to interleaving SD work into spare
-# Atari cycles (see defines.h).
-ifneq ($(WAITCART),)
-DEFS += -DMOVIECART_WAITCART=$(WAITCART)
-endif
-
-# Handoff proof: 1 ms stall per frame, no SD code at all. make WAITCART_PROOF=1
-ifneq ($(WAITCART_PROOF),)
-DEFS += -DMOVIECART_WAITCART_PROOF=$(WAITCART_PROOF)
-endif
-
 CFLAGS = \
 	-MT $@ -MMD -MP -MF $(DEPDIR)/$*.d \
 	$(DEFS) \

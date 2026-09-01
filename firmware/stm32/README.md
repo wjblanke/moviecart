@@ -40,11 +40,9 @@ System clock: HSI → PLL @ 168 MHz (same as UnoCart DevEBox); SDIOCLK 48 MHz.
 │   emulate_cartridge() / bus_serve_cycle()  ← UnoCart poll loop  │
 │   bus_dispatch()                           ← core.bin + patches │
 │                                                                 │
-│ Blocking SD (mount, open, probes, select):                      │
-│   mc_wait_handoff() → 6502 in RIOT $84, IRQs on, bus tri-stated │
-│                                                                 │
-│ Playback: between frames, prepareNextFrame() loads next field   │
-│   while still serving RamKernel blanking from RIOT              │
+│ All SD (mount, open, probe, select, playback field loads):      │
+│   DMA + manual completion poll in fatfs_sd_sdio.c               │
+│   every wait yields → bus_serve_cycle() while RamKernel runs    │
 └───────────────────────────┬─────────────────────────────────────┘
                             │ SDIO DMA → SRAM2 field buffers
 ┌───────────────────────────▼─────────────────────────────────────┐
@@ -62,7 +60,7 @@ The Atari-side kernel is built with DASM in `kernel/` and embedded as `mc_core_r
 | **RamKernel** | RIOT `$80`+ | VSYNC, VBLANK, overscan, preroll — no cart fetches during blanking |
 | **VisibleBars** | Cart ROM | Visible scanline prologue only; eight dual-line kernels with patched immediates |
 
-Blanking therefore executes from RIOT RAM. The cart is only fetched for ColdStart, the RamKernel image bytes, the VisibleBars entry/RTS, per-line immediate patches, and the WaitCart poll at `$FFF4`.
+Blanking therefore executes from RIOT RAM. The cart is only fetched for ColdStart, the RamKernel image bytes, VisibleBars entry/RTS, and per-line immediate patches.
 
 Cart dispatch indexes **`addr & 0xfff`** (12-bit space). Key hook addresses:
 
@@ -71,7 +69,6 @@ Cart dispatch indexes **`addr & 0xfff`** (12-bit space). Key hook addresses:
 | `$F09D` | VisibleBars entry | Buffer swap, reset audio cursor, set `mc_visible_bars_vended` |
 | `$F41D` | VisibleBars RTS | End frame (`mr_endFrame`), skip blanking audio tail, set `mc_blanking_window` |
 | `$0BF`–`$40D` | Visible lines | Static bytes from `core.bin`; immediates patched via phase map → `g0x3e`…`g0xae` |
-| `$FFF4` | WaitCart poll | `$5A` = READY; parks/releases 6502 for SD handoffs |
 
 Audio in field files is stored **[visible lines][blanking tail]**. VisibleBars only writes `AUDV0` on the eight dual-line kernels, not every scanline and not during RIOT blanking. At `$F41D` the audio pointer skips the unplayed visible tail plus blanking samples so the next field stays aligned.
 
@@ -91,29 +88,24 @@ Critical rules (measured on this hardware):
 - **Bus code runs from flash** (`.hottext`, ART-line aligned), not SRAM. The `romData` jump table stays in SRAM so table lookups do not contend with instruction fetch.
 - Per-cycle budget is ~**100 ns**; one missed ~838 ns cycle can desync the scanline counter.
 
-`moviecart_bus_yield()` is a single `bus_serve_cycle()` (returns immediately during WaitCart when the 6502 is in RIOT RAM). `moviecart_bus_pump(work)` runs `work` only on A12-low cycles where the cart drives nothing.
+`moviecart_bus_yield()` is a single `bus_serve_cycle()`. `moviecart_bus_pump(work)` runs `work` only on A12-low cycles where the cart drives nothing.
 
-### WaitCart handoff (blocking SD)
+### SD I/O (no IRQs, no WaitCart)
 
-Long SDIO work cannot fit between cart cycles. For mount, file open, title geometry probe, and file selection, the firmware uses UnoCart's **WaitCart** pattern:
+The stock UnoCart SDIO driver (`fatfs_sd_sdio.c`) keeps **DMA** for sector reads. Completion flags (`TransferEnd`, `DMAEndOfTransfer`) are set by calling `SD_ProcessIRQSrc()` and `SD_ProcessDMAIRQ()` from the wait loops — not from interrupt handlers. **IRQs stay masked** for the entire Atari serve run.
 
-1. During boot, the 6502 copies a 16-byte wait routine from cart ROM into RIOT `$84` (`JSR $FFEC` after ClearMem).
-2. `mc_wait_handoff(work)` arms `$84` as the blanking jump target; on the next blanking line the 6502 parks in RAM and polls `$FFF4`.
-3. The MCU tri-states the data bus, **enables IRQs**, and runs `work()` — stock UnoCart SDIO (`fatfs_sd_sdio.c`) with DMA completion via SDIO/DMA IRQ handlers.
-4. `$FFF4` returns `$5A` (READY); the MCU reloads kernel state and waits for one `mr_endFrame` before returning.
+Every SDIO wait loop calls `moviecart_bus_yield()` (or `SD_PollDmaAndYield()` for DMA drains). Long delays use `moviecart_delay_ms()` instead of busy DWT spins.
 
-The copy slot is at **`$FF2D`** (after RESP1, before the WSYNC at `$FF31`). Do not move it into the RESP timing window or past `$FF33`.
-
-`make WAITCART=0` calls `work()` directly with IRQs still masked — useful only for comparison; it will glitch the picture during SD I/O.
+**Blanking-only SDIO:** `mc_blanking_window_gen` increments on each VisibleBars RTS (`$F41D`). `moviecart_sdio_gate()` blocks until that counter advances, then SDIO initiation (commands, data-path setup, DMA arm) and polling (`SDIO->STA`, IRQ/DMA flag drains) run only inside that fresh blanking window. Between edges the firmware serves the cart only. Mount, open, title probe, file select, and per-frame field loads all use this path.
 
 ### Playback loop
 
 After the embedded title screen and SD mount:
 
-1. **`runTitle()`** — title hold; geometry probe via WaitCart handoff.
+1. **`runTitle()`** — title hold; geometry probe reads one field sector while yielding.
 2. **`runFrameLoop()`** — each frame:
    - `waitEndFrame()` — blocked on `mr_endFrame` (set at VisibleBars RTS).
-   - `checkSelectVideo()` / `updateTransport()` — console controls; file change uses WaitCart.
+   - `checkSelectVideo()` / `updateTransport()` — console controls; file change opens the next movie file while yielding.
    - **`prepareNextFrame()`** — load the next MovieCart field into the **inactive** ping-pong buffer (`mr_buffer1` / `mr_buffer2` in SRAM2). Retries up to four times with cache invalidation on header/geometry failure.
    - Wait until **`mc_visible_bars_vended`** — next VisibleBars entry (`$F09D`) before the newly loaded buffer is displayed.
 
@@ -171,14 +163,6 @@ Separating DMA destinations (SRAM2) from the stack and dispatch hot data (SRAM1)
 
 **Long 2 s strobe** (not a count): field signature found in scratch buffer but not in the target field buffer — DMA destination issue.
 
-### WaitCart faults (`fatalHandoff`)
-
-| Code | Meaning |
-|------|---------|
-| 1 | Timed out waiting for 6502 to enter RAM routine |
-| 2 | Left RAM but no end-of-frame within 250 ms |
-| 3 | Parked in RAM, never saw READY |
-
 ### Kernel heartbeat (during playback)
 
 Once per second when healthy — worst condition since last report:
@@ -215,8 +199,6 @@ Override toolchain: `make TOOLCHAIN=/path/to/arm-none-eabi/bin`
 | Make flag | Purpose |
 |-----------|---------|
 | `NO_SD=1` | Title + heartbeat only — pixel-perfect baseline |
-| `WAITCART=0` | Disable WaitCart; SD runs with IRQs masked (expect glitches) |
-| `WAITCART_PROOF=1` | Handoff with 1 ms stall, no SD — proves parking |
 | `SD_STAGE=1\|2\|3` | Stop after title sync / mount / file open |
 | `MOUNT_PHASE=1\|2` | Bisect inside `pf_mount` (init vs first sector read) |
 | `STALL_TEST=1\|2\|3` | Bus timing measurement sweeps (see `defines.h`) |

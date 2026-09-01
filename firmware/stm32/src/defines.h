@@ -82,26 +82,6 @@
 #define MOVIECART_SD_DMA_FASTPATH	1
 #endif
 
-/*
- * WaitCart handoff (make WAITCART=0 to disable).
- *
- * Park the 6502 in a routine it copied from this ROM into Atari RAM, so it
- * stops fetching from the cartridge and SD work can own the CPU. The ARM
- * only drops the bus when that RAM code fetches $FFF4 — the same "command
- * from RAM" shape as UnoCart's LDA $1E00,X.
- *
- * With this off, mc_wait_handoff() simply calls its work function directly and
- * the old cooperative path is unchanged. See core.c for the protocol.
- */
-#ifndef MOVIECART_WAITCART
-#define MOVIECART_WAITCART		1
-#endif
-
-/* make WAITCART_PROOF=1: handoff exercised with a 1 ms stall and no SD code. */
-#ifndef MOVIECART_WAITCART_PROOF
-#define MOVIECART_WAITCART_PROOF	0
-#endif
-
 #ifndef MOVIECART_SD_SKIP_CARD_READY
 #define MOVIECART_SD_SKIP_CARD_READY	0
 #endif

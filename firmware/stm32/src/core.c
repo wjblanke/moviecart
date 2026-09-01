@@ -17,10 +17,7 @@
 #define MC_LINE_CYCLE			0x079u
 #define MC_PHASE_DYNAMIC_MAX		0x070u	/* g0x3e..g0xae; g0xaf+ from ROM */
 
-/* Legacy jmp targets (WaitCart resume only). */
 #define JMP_VISIBLE_BARS		0xf09du
-#define JMP_END_LINES			0xf40eu
-#define JMP_WAIT_RAM			0x0084u
 
 /*
  * Data on PD8-PD15 (high byte). Address PE0-PE12.
@@ -118,273 +115,12 @@ mc_diag_note(uint8_t code)
 	DIAG_NOTE(code);
 }
 
-/*
- * ---------------------------------------------------------------------------
- * WaitCart handoff — UnoCart's sequence, in a ROM we own
- * ---------------------------------------------------------------------------
- *
- * UnoCart's 6502 copies WaitCartRoutine from its menu ROM into $84, then JSR $84.
- * The ARM only leaves the serve loop when it sees a cart fetch issued from RAM.
- * MovieCart owns every opcode in this file, so it does the same: the kernel
- * copies a wait routine out of ROM after ClearMem.
- *
- * The blanking kernel is exactly 76 cycles with no WSYNC. Do not JMP $84 while
- * playing — that desyncs the kernel (black title, then a solid LED because the
- * frame-based park timeout never ticks). Point nextLineJump at $0084 only when
- * ARMED. JMP high byte is $00 for RAM, $FF for $3E/$B7.
- *
- *   1. JSR $FFEC from $FF2D — after RESP0/RESP1 and before the WSYNC at $FF31,
- *      so the copy's length is invisible to the display. PrepareWait copies into
- *      $84, does the lda #$20 / sta HMP1 the JSR displaced, and RTS. A JSR
- *      after HMOVE skipped wait_cnt and jammed the 6507 (black, 6 flashes).
- *   2. Title uses stock $B7/$3E. Handoff sets nextLineJump = $0084.
- *   3. RAM: STA WSYNC, LDA $FFF4. Not READY → loop. READY → VBLANK off,
- *      JMP $FF31 (the boot path that WSYNCs, HMOVEs, and falls into right_line
- *      on-cycle). JMP $FFB7 at the wrong phase blacks the kernel.
- *   4. $FFF4 while ARMED → RUNNING, work(), READY, reload the visible field.
- *      The data bus is tri-stated for the whole of work(); the park loop runs
- *      from RIOT RAM and driving it would contend on every A12-low fetch.
- *
- * Nothing here may add work to a dispatch case the title fetches. The budget is
- * ~100 ns per cycle, so every decision that depends on the handoff state is
- * precomputed into mc_jmp_after_* / mc_gstore_page and the hot cases only load
- * a value, exactly as the baseline did.
- */
-#define MC_WAIT_READY		0x5au
-#define ADDR_WAIT_DOORBELL	0xf4u	/* $FFF4: only the RAM routine LDAs this */
-
-/*
- * Copied to $84 by PrepareWait. Branch offsets are relative to that base.
- *
- * Park is STA WSYNC + poll $FFF4. Resume is JMP $FF31, not a cycle-counted
- * drop into end_lines: $31 WSYNCs, HMOVEs at @03, wait_cnt, then right_line
- * at the same phase as a cold boot. ARM reloads the visible field on READY
- * so graphBuf is not left pointing at the end of the previous section.
- *
- * VBLANK and VSYNC are both cleared before resuming. Whichever section the
- * kernel happened to end when it parked left its own value in them, and nothing
- * on the path back through right_line rewrites either one — parking out of the
- * vsync section would otherwise resume with VSYNC still asserted and no picture.
- *
- *   84: sta WSYNC
- *   86: lda $fff4
- *   89: cmp #READY
- *   8b: bne $84
- *   8d: ldx #0
- *   8f: stx VBLANK
- *   91: stx VSYNC
- *   93: jmp $ff31
- */
-static const uint8_t mc_wait_code[] = {
-	0x85, 0x02,
-	0xad, ADDR_WAIT_DOORBELL, 0xff,
-	0xc9, MC_WAIT_READY,
-	0xd0, 0xf7,			/* bne $84; PC after = $8d */
-	0xa2, 0x00,
-	0x86, 0x01,
-	0x86, 0x00,
-	0x4c, 0x9d, 0xf0
-};
-
-/*
- * Where the kernel jumps at the end of a section. Written only by the handoff,
- * read by the two dispatch cases that end a section, so those cases cost one
- * load instead of a volatile compare against mc_wait_state.
- */
-static volatile uint_fast16_t	mc_jmp_after_visible = JMP_END_LINES;
-static volatile uint_fast16_t	mc_jmp_after_blank = JMP_VISIBLE_BARS;
-
-/*
- * What gstore drives. PrepareWait's `lda $1E00,y` lands here, so during the one
- * boot copy this page holds mc_wait_code; afterwards it is all zeros, which is
- * the value the joystick reads (`lda $FE00,x`) have always been served. Serving
- * it from a table keeps gstore a single indexed load — the copy needs no test on
- * the hot path, and this case runs four times per blanking line.
- */
-static uint8_t			mc_gstore_page[256];
-
-volatile uint8_t	mc_wait_state;
-volatile uint8_t	mc_wait_ready;
-volatile uint8_t	mc_wait_fault;
 volatile uint8_t	mc_visible_bars_vended;
 volatile uint8_t	mc_blanking_window;
+volatile uint16_t	mc_blanking_window_gen;
 
 static uint16_t		mc_cart_off;
-
-static uint8_t		mc_poll_byte;
 static volatile uint_fast8_t	mc_store_dummy;	/* gstore sink before joystick setup */
-
-#define MC_WAIT_PARK		1u	/* $FFF4 value meaning "stay in RAM" */
-
-/*
- * After SD work, drop back into the visible kernel the same way a cold boot
- * does: $FF31 WSYNC / HMOVE / wait_cnt / right_line. Reload the field that
- * endState 3 would have loaded, so graphBuf is not left at the end of the
- * section we parked out of (that walks the title through SRAM).
- */
-static void
-mc_wait_restart_visible(void)
-{
-	const struct frameInfo *src = r_coreInfo.mr_bufferIndex
-		? &r_coreInfo.mr_frameInfo1
-		: &r_coreInfo.mr_frameInfo2;
-
-	r_coreInfo.frameInfo.colorBuf = src->colorBuf;
-	r_coreInfo.frameInfo.colorBKBuf = src->colorBKBuf;
-	r_coreInfo.frameInfo.audioBuf = src->audioBuf;
-	r_coreInfo.frameInfo.graphBuf = src->graphBuf;
-	r_coreInfo.frameInfo.visibleLines = src->visibleLines;
-	r_coreInfo.frameInfo.overscanLines = src->overscanLines;
-	r_coreInfo.frameInfo.vsyncLines = src->vsyncLines;
-	r_coreInfo.frameInfo.blankLines = src->blankLines;
-	r_coreInfo.frameInfo.totalLines = src->totalLines;
-	r_coreInfo.frameInfo.odd = src->odd;
-	r_coreInfo.mr_bufferIndex = !r_coreInfo.mr_bufferIndex;
-
-	r_coreInfo.lines = r_coreInfo.frameInfo.visibleLines;
-	r_coreInfo.endState = 0;
-	r_coreInfo.vblankState = ST_OFF;
-	r_coreInfo.vsyncState = ST_OFF;
-	r_coreInfo.nextLineJump = JMP_VISIBLE_BARS;
-	mc_jmp_after_visible = JMP_END_LINES;
-	mc_jmp_after_blank = JMP_VISIBLE_BARS;
-	frameLines = 0;
-}
-
-#define MC_WAIT_CHECK_EVERY	256u	/* DWT sampled this often, not per serve */
-
-/*
- * The 6502 copies the routine itself during boot (JSR $FFEC after ClearMem).
- * By the time the title is up, that RTS has already run. This just waits for
- * it if we got here first.
- */
-void
-mc_wait_install(void)
-{
-	while (mc_wait_state != MC_WAIT_INSTALLED)
-		bus_serve_cycle();
-
-	/* Copy source is no longer needed; gstore goes back to driving zeros. */
-	for (unsigned i = 0; i < sizeof(mc_wait_code); i++)
-		mc_gstore_page[i] = 0;
-}
-
-void
-mc_wait_handoff(void (*work)(void))
-{
-	if (mc_wait_state != MC_WAIT_INSTALLED) {
-		__enable_irq();
-		work();
-		__disable_irq();
-		return;
-	}
-
-	mc_wait_ready = 0;
-	mc_poll_byte = MC_WAIT_PARK;
-	mc_wait_fault = 0;
-	mc_wait_state = MC_WAIT_ARMED;
-	mc_jmp_after_visible = JMP_WAIT_RAM;
-	mc_jmp_after_blank = JMP_WAIT_RAM;
-	r_coreInfo.nextLineJump = JMP_WAIT_RAM;
-
-	/*
-	 * Time out on DWT, not kernel frames. Sample the counter every 256
-	 * serves — a read after every cycle is the gap that jams the 6507, and
-	 * this wait runs against a live title.
-	 */
-	uint32_t t0 = DWT->CYCCNT;
-	uint32_t lim = SystemCoreClock * 2u;
-	unsigned check = MC_WAIT_CHECK_EVERY;
-
-	while (mc_wait_state != MC_WAIT_RUNNING) {
-		bus_serve_cycle();
-		if (--check == 0) {
-			check = MC_WAIT_CHECK_EVERY;
-			if ((DWT->CYCCNT - t0) > lim) {
-				mc_wait_state = MC_WAIT_INSTALLED;
-				mc_poll_byte = MC_WAIT_READY;
-				mc_jmp_after_visible = JMP_END_LINES;
-				mc_jmp_after_blank = JMP_VISIBLE_BARS;
-				r_coreInfo.nextLineJump = JMP_END_LINES;
-				mc_wait_fault = 1;
-				return;
-			}
-		}
-	}
-
-	/*
-	 * Tri-state the data bus for the whole of work(), exactly as UnoCart does
-	 * at its `got_cmd:` label before it goes off to touch the card.
-	 *
-	 * Driving a constant PARK here instead looks like the safer choice — it
-	 * guarantees the parked 6502 cannot read a floating $FFF4 as something that
-	 * matches READY — and it is the bug that made every resume fail. The park
-	 * loop lives in RIOT RAM, so all of it except the one $FFF4 poll is A12-low:
-	 * opcode and operand fetches that the RIOT is driving. Holding PD8-PD15
-	 * enabled through that means the STM32 and the RIOT drive the same wires on
-	 * every one of those cycles, and the 6502 executes whatever wins. It limped
-	 * out of the loop eventually — which is why mount and open both completed
-	 * and reported success — but by then its instruction stream was corrupt, so
-	 * the jump back into the kernel never produced frames.
-	 *
-	 * A floating read cannot false-trigger READY here: the 6502 sees the last
-	 * value driven on the bus, and the cycle before the $FFF4 data cycle is that
-	 * instruction's own $FF operand fetch, so the poll reads ~$FF and fails the
-	 * cmp against $5A. That is the same reasoning behind UnoCart's $D8 sentinel.
-	 */
-	TESTA0_HIGH;
-	DATA_INPUT;
-	__enable_irq();
-	work();
-	__disable_irq();
-
-	/*
-	 * Rebuild ARM kernel state *before* READY, not on the $FFF4 fetch.
-	 * The 6502 is still in RAM; that fetch must be SET_DATA and a store,
-	 * same as every other title cycle. Doing the pointer reload there put
-	 * tens of stores on the first instruction of the resume.
-	 */
-	mc_wait_restart_visible();
-	mc_wait_ready = 1;
-	mc_poll_byte = MC_WAIT_READY;
-
-	t0 = DWT->CYCCNT;
-	lim = SystemCoreClock / 4u;	/* 250 ms */
-	check = MC_WAIT_CHECK_EVERY;
-	while (mc_wait_state == MC_WAIT_RUNNING) {
-		bus_serve_cycle();
-		if (--check == 0) {
-			check = MC_WAIT_CHECK_EVERY;
-			if ((DWT->CYCCNT - t0) > lim) {
-				mc_wait_fault = 3;	/* parked, never left RAM */
-				return;
-			}
-		}
-	}
-
-	/*
-	 * Leaving RAM is not the same as running again. Demand one end-of-frame
-	 * before returning. Same 256-serve sample: this loop *is* the resume, and
-	 * a DWT read after every cycle is enough to stop the kernel completing
-	 * the frame we are waiting for — which reported as fault 2 on a 1 ms
-	 * empty stall with no SD code at all.
-	 */
-	t0 = DWT->CYCCNT;
-	lim = SystemCoreClock / 4u;
-	check = MC_WAIT_CHECK_EVERY;
-	r_coreInfo.mr_endFrame = 0;
-	while (!r_coreInfo.mr_endFrame) {
-		bus_serve_cycle();
-		if (--check == 0) {
-			check = MC_WAIT_CHECK_EVERY;
-			if ((DWT->CYCCNT - t0) > lim) {
-				mc_wait_fault = 2;
-				return;
-			}
-		}
-	}
-	r_coreInfo.mr_endFrame = 0;
-}
 
 static inline void
 diagFrameTick(void)
@@ -416,6 +152,7 @@ coreInit(void)
 	r_coreInfo.mr_bufferIndex = false;
 	mc_visible_bars_vended = 0;
 	mc_blanking_window = 0;
+	mc_blanking_window_gen = 0;
 
 	r_coreInfo.mr_swcha = 0xff;
 	r_coreInfo.mr_swchb = 0xff;
@@ -444,10 +181,6 @@ coreInit(void)
 	r_coreInfo.nextLineJump = JMP_VISIBLE_BARS;
 	r_coreInfo.data = 0;
 	r_coreInfo.storeAddress = &mc_store_dummy;
-
-	/* PrepareWait's copy source, read as $1E00,Y. Cleared once installed. */
-	for (unsigned i = 0; i < sizeof(mc_wait_code); i++)
-		mc_gstore_page[i] = mc_wait_code[i];
 
 	SET_DATA_MODE_IN;
 }
@@ -544,6 +277,7 @@ static void
 mc_on_visible_bars_rts(void)
 {
 	mc_blanking_window = 1;
+	mc_blanking_window_gen++;
 	mc_visible_bars_vended = 0;
 	mc_audio_skip_blanking();
 
@@ -598,8 +332,11 @@ bus_dispatch(uint16_t cart_off, uint8_t addr_low8)
 		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
 		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
 		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
-		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&g0xec, &&g0xed, &&g0xee, &&g0xef,
-		&&g0xf0, &&g0xf1, &&g0xf2, &&g0xf3, &&g0xf4, &&g0xf5, &&g0xf6, &&g0xf7, &&g0xf8, &&g0xf9, &&g0xfa, &&g0xfb, &&g0xfc, &&g0xfd, &&g0xfe, &&g0xff
+		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
+		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
+		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
+		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
+		&&g0xfc, &&g0xfd, &&g0xfe, &&g0xff
 	};
 
 	mc_cart_off = cart_off;
@@ -633,20 +370,16 @@ bus_dispatch(uint16_t cart_off, uint8_t addr_low8)
 		EMULATE_DONE
 	}
 
-	if (cart_off == 0x0ff4u)
-		goto g0xf4;
-
 	SET_DATA(mc_core_rom[cart_off]);
 	EMULATE_DONE
 
 gstore:
 	*r_coreInfo.storeAddress = addr_low8;
 	/*
-	 * PrepareWait copies from $1E00,Y. Joystick LDA $FE00,X uses this page
-	 * for the address bits, not the data, and wants a stable value (PAL 7800
-	 * bios); mc_gstore_page is zero except during the boot copy.
+	 * Joystick LDA $FE00,X uses this page for address bits, not data; serve
+	 * zero (stable PAL 7800 bios behaviour).
 	 */
-	SET_DATA(mc_gstore_page[addr_low8]);
+	SET_DATA(0);
 	EMULATE_DONE
 
 mc_cart_rom_ld:
@@ -1398,106 +1131,6 @@ g0xad:
 
 g0xae:
 	SET_DATA(0xa9);	// lda #$80 	// 2
-	EMULATE_DONE
-
-/*
- * $FFEC-$FFFB: PrepareWait. JSR from $FF2D, RTS to $FF30.
- *
- *   FFEC: ldy #(sizeof(mc_wait_code)-1)
- *   FFEE: lda $1E00,y
- *   FFF1: sta $0084,y
- *   FFF4: dey
- *   FFF5: bpl $FFEE
- *   FFF7: lda #$20
- *   FFF9: sta HMP1
- *   FFFB: rts          ; 6507 has no NMI; $FFFA-$FFFB are free
- *
- * The lda/sta pair is the one the JSR displaced at $FF2D, moved here verbatim.
- * It has to be a plain store; an `inc` of a write-only TIA register reads back
- * stale bus data instead of the value it is meant to increment, which is how an
- * earlier `inc VDELP1` here left VDELP1 as bit 0 of whatever the bus last held.
- *
- * Exactly 16 bytes, filling $FFEC-$FFFB. Growing mc_wait_code costs no ROM here
- * and no longer perturbs the display either, because the WSYNC at $FF31 absorbs
- * however long the copy takes.
- *
- * $FFF4 is dey during that one copy (IDLE). After INSTALLED it is the doorbell.
- */
-g0xec:
-	SET_DATA(0xa0);
-	EMULATE_DONE
-
-g0xed:
-	SET_DATA((uint8_t)(sizeof(mc_wait_code) - 1));	/* ldy #N-1 */
-	EMULATE_DONE
-
-g0xee:
-	SET_DATA(0xb9);
-	EMULATE_DONE
-
-g0xef:
-	SET_DATA(0x00);
-	EMULATE_DONE
-
-g0xf0:
-	SET_DATA(0x1e);
-	EMULATE_DONE
-
-g0xf1:
-	SET_DATA(0x99);
-	EMULATE_DONE
-
-g0xf2:
-	SET_DATA(0x84);
-	EMULATE_DONE
-
-g0xf3:
-	SET_DATA(0x00);
-	EMULATE_DONE
-
-g0xf4:
-	if (mc_wait_state == MC_WAIT_IDLE)
-		SET_DATA(0x88);	/* dey, PrepareWait copy only */
-	else
-		SET_DATA(mc_poll_byte);	/* PARK or READY */
-	if (mc_wait_state == MC_WAIT_ARMED) {
-		mc_wait_state = MC_WAIT_RUNNING;
-	} else if (mc_wait_state == MC_WAIT_RUNNING &&
-		   mc_poll_byte == MC_WAIT_READY) {
-		mc_wait_state = MC_WAIT_INSTALLED;
-	}
-	EMULATE_DONE
-
-g0xf5:
-	SET_DATA(0x10);	/* bpl */
-	EMULATE_DONE
-
-g0xf6:
-	SET_DATA(0xf7);	/* bpl $FFEE: $FFF7 + (-9) */
-	EMULATE_DONE
-
-g0xf7:
-	SET_DATA(0xa9);	/* lda #$20 */
-	EMULATE_DONE
-
-g0xf8:
-	SET_DATA(0x20);
-	EMULATE_DONE
-
-g0xf9:
-	SET_DATA(0x85);	/* sta HMP1 */
-	EMULATE_DONE
-
-g0xfa:
-	SET_DATA(0x21);
-	EMULATE_DONE
-
-g0xfb:
-	SET_DATA(0x60); /* rts; 6507 has no NMI pin */
-	if (mc_wait_state == MC_WAIT_IDLE) {
-		mc_wait_state = MC_WAIT_INSTALLED;
-		mc_poll_byte = MC_WAIT_READY;
-	}
 	EMULATE_DONE
 
    // break a number of times to make sure the system is actually stable

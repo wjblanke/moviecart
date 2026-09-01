@@ -12,6 +12,13 @@
 void moviecart_bus_yield(void);
 
 /*
+ * Block until mc_blanking_window_gen advances (a fresh $F41D blanking edge).
+ * Call immediately before every SDIO register access, command launch, or DMA
+ * arm — the driver polls SDIO only inside blanking windows.
+ */
+void moviecart_sdio_gate(void);
+
+/*
  * Serve one cycle, and on a non-cart (A12-low) cycle only — where the cart
  * drives nothing and the whole ~838 ns is free — run one step of `work`.
  *

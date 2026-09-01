@@ -26,10 +26,8 @@ static struct diskInfo dinfo;
 static uint8_t diskBuffer[512] __attribute__((aligned(16), section(".sram2")));
 
 /*
- * UnoCart's disk_read path, one sector at a time: SD_ReadMultiBlocks,
- * SD_WaitReadOperation, then SD_GetStatus until the card is idle. Completion
- * is IRQ-driven, so this must only run inside a WaitCart handoff (IRQs on,
- * 6502 parked in RAM).
+ * UnoCart disk_read path, one sector at a time. SDIO/DMA completion is polled
+ * manually in the driver (IRQs stay masked); every wait yields to bus_serve_cycle.
  */
 static bool
 disk_read_block_raw(uint32_t sector, uint8_t *buf)

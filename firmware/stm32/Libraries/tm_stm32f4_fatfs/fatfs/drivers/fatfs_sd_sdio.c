@@ -233,6 +233,42 @@
 */
 #define logf(x)
 
+#include "moviecart_yield.h"
+
+static void
+SDIO_DataConfigGated(SDIO_DataInitTypeDef *cfg)
+{
+	moviecart_sdio_gate();
+	SDIO_DataConfig(cfg);
+}
+
+static void
+SDIO_SendCommandGated(SDIO_CmdInitTypeDef *cmd)
+{
+	moviecart_sdio_gate();
+	SDIO_SendCommand(cmd);
+}
+
+/*
+ * IRQs stay masked while the Atari bus is served. DMA completion and SDIO
+ * status flags are polled manually; every wait loop yields so RamKernel keeps
+ * running on the 6502 side. Initiation and polling both wait for a fresh
+ * mc_blanking_window_gen edge before touching SDIO.
+ */
+static void
+SD_PollDmaAndYield(void)
+{
+	moviecart_sdio_gate();
+	SD_ProcessIRQSrc();
+	SD_ProcessDMAIRQ();
+	moviecart_bus_yield();
+}
+
+static void
+SD_CmdYield(void)
+{
+	moviecart_bus_yield();
+}
 
 static uint32_t CardType = SDIO_STD_CAPACITY_SD_CARD_V1_1;
 static uint32_t CSD_Tab[4], CID_Tab[4], RCA = 0;
@@ -308,7 +344,7 @@ DSTATUS TM_FATFS_SD_SDIO_disk_initialize(void) {
 		SD_Error err = SD_ERROR;
 		for (attempt = 0; attempt < 5; attempt++) {
 			if (attempt)
-				Delayms(50);
+				moviecart_delay_ms(50);
 			err = SD_Init();
 			if (err == SD_OK)
 				break;
@@ -378,7 +414,13 @@ DRESULT TM_FATFS_SD_SDIO_disk_read(BYTE *buff, DWORD sector, UINT count) {
 
 		Status = SD_WaitReadOperation();
 
-		while ((State = SD_GetStatus()) == SD_TRANSFER_BUSY);
+		for (;;) {
+			moviecart_sdio_gate();
+			State = SD_GetStatus();
+			if (State != SD_TRANSFER_BUSY)
+				break;
+			moviecart_bus_yield();
+		}
 
 		if ((State == SD_TRANSFER_ERROR) || (Status != SD_OK)) {
 			return RES_ERROR;
@@ -426,7 +468,13 @@ DRESULT TM_FATFS_SD_SDIO_disk_write(const BYTE *buff, DWORD sector, UINT count) 
 
 		Status = SD_WaitWriteOperation(); // Check if the Transfer is finished
 
-		while ((State = SD_GetStatus()) == SD_TRANSFER_BUSY); // BUSY, OK (DONE), ERROR (FAIL)
+		for (;;) {
+			moviecart_sdio_gate();
+			State = SD_GetStatus();
+			if (State != SD_TRANSFER_BUSY)
+				break;
+			moviecart_bus_yield();
+		}
 
 		if ((State == SD_TRANSFER_ERROR) || (Status != SD_OK)) {
 			return RES_ERROR;
@@ -658,7 +706,7 @@ SD_Error SD_PowerON (void)
 	SDIO_ClockCmd (ENABLE);
 
 	/* >=74 SD clocks + card power settle before first CMD0 */
-	Delayms(2);
+	moviecart_delay_ms(2);
 
 	/*!< CMD0: GO_IDLE_STATE ---------------------------------------------------*/
 	/*!< No CMD response required */
@@ -667,7 +715,7 @@ SD_Error SD_PowerON (void)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_No;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdError ();
 
@@ -687,7 +735,7 @@ SD_Error SD_PowerON (void)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp7Error ();
 
@@ -701,7 +749,7 @@ SD_Error SD_PowerON (void)
 		SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 		SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 		SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-		SDIO_SendCommand (&SDIO_CmdInitStructure);
+		SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 		errorstatus = CmdResp1Error (SD_CMD_APP_CMD );
 	}
 	
@@ -711,7 +759,7 @@ SD_Error SD_PowerON (void)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 	errorstatus = CmdResp1Error (SD_CMD_APP_CMD );
 
 	/*!< If errorstatus is Command TimeOut, it is a MMC card */
@@ -727,7 +775,7 @@ SD_Error SD_PowerON (void)
 			SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 			SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 			SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-			SDIO_SendCommand (&SDIO_CmdInitStructure);
+			SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 			errorstatus = CmdResp1Error (SD_CMD_APP_CMD );
 
@@ -739,7 +787,7 @@ SD_Error SD_PowerON (void)
 			SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 			SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 			SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-			SDIO_SendCommand (&SDIO_CmdInitStructure);
+			SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 			errorstatus = CmdResp3Error ();
 			if (errorstatus != SD_OK) {
@@ -749,6 +797,7 @@ SD_Error SD_PowerON (void)
 			response = SDIO_GetResponse (SDIO_RESP1);
 			validvoltage = (((response >> 31) == 1) ? 1 : 0);
 			count++;
+			SD_CmdYield();
 		}
 		if (count >= SD_MAX_VOLT_TRIAL ) {
 			errorstatus = SD_INVALID_VOLTRANGE;
@@ -802,7 +851,7 @@ SD_Error SD_InitializeCards (void)
 		SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Long;
 		SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 		SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-		SDIO_SendCommand (&SDIO_CmdInitStructure);
+		SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 		errorstatus = CmdResp2Error ();
 
@@ -829,7 +878,7 @@ SD_Error SD_InitializeCards (void)
 		SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 		SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 		SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-		SDIO_SendCommand (&SDIO_CmdInitStructure);
+		SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 		errorstatus = CmdResp6Error (SD_CMD_SET_REL_ADDR, &rca);
 
@@ -847,7 +896,7 @@ SD_Error SD_InitializeCards (void)
 		SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Long;
 		SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 		SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-		SDIO_SendCommand (&SDIO_CmdInitStructure);
+		SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 		errorstatus = CmdResp2Error ();
 
@@ -1220,7 +1269,7 @@ SD_Error SD_SelectDeselect (uint64_t addr)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_SEL_DESEL_CARD );
 
@@ -1248,6 +1297,7 @@ SD_Error SD_ReadBlock (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize)
 	uint32_t count = 0, *tempbuff = (uint32_t *)readbuff;
 #endif
 
+	moviecart_sdio_gate();
 	TransferError = SD_OK;
 	TransferEnd = 0;
 	StopCondition = 0;
@@ -1271,7 +1321,7 @@ SD_Error SD_ReadBlock (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_SET_BLOCKLEN );
 
@@ -1285,7 +1335,7 @@ SD_Error SD_ReadBlock (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize)
 	SDIO_DataInitStructure.SDIO_TransferDir = SDIO_TransferDir_ToSDIO;
 	SDIO_DataInitStructure.SDIO_TransferMode = SDIO_TransferMode_Block;
 	SDIO_DataInitStructure.SDIO_DPSM = SDIO_DPSM_Enable;
-	SDIO_DataConfig (&SDIO_DataInitStructure);
+	SDIO_DataConfigGated(&SDIO_DataInitStructure);
 
 	/*!< Send CMD17 READ_SINGLE_BLOCK */
 	SDIO_CmdInitStructure.SDIO_Argument = (uint32_t) ReadAddr;
@@ -1293,7 +1343,7 @@ SD_Error SD_ReadBlock (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_READ_SINGLE_BLOCK );
 
@@ -1363,6 +1413,8 @@ SD_Error SD_ReadBlock (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize)
 SD_Error SD_ReadMultiBlocks (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize, uint32_t NumberOfBlocks)
 {
 	SD_Error errorstatus = SD_OK;
+
+	moviecart_sdio_gate();
 	TransferError = SD_OK;
 	TransferEnd = 0;
 	StopCondition = 1;
@@ -1386,7 +1438,7 @@ SD_Error SD_ReadMultiBlocks (uint8_t *readbuff, uint64_t ReadAddr, uint16_t Bloc
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_SET_BLOCKLEN );
 
@@ -1400,7 +1452,7 @@ SD_Error SD_ReadMultiBlocks (uint8_t *readbuff, uint64_t ReadAddr, uint16_t Bloc
 	SDIO_DataInitStructure.SDIO_TransferDir = SDIO_TransferDir_ToSDIO;
 	SDIO_DataInitStructure.SDIO_TransferMode = SDIO_TransferMode_Block;
 	SDIO_DataInitStructure.SDIO_DPSM = SDIO_DPSM_Enable;
-	SDIO_DataConfig (&SDIO_DataInitStructure);
+	SDIO_DataConfigGated(&SDIO_DataInitStructure);
 
 	/*!< Send CMD18 READ_MULT_BLOCK with argument data address */
 	SDIO_CmdInitStructure.SDIO_Argument = (uint32_t) ReadAddr;
@@ -1408,7 +1460,7 @@ SD_Error SD_ReadMultiBlocks (uint8_t *readbuff, uint64_t ReadAddr, uint16_t Bloc
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_READ_MULT_BLOCK );
 
@@ -1421,6 +1473,8 @@ SD_Error SD_ReadMultiBlocks (uint8_t *readbuff, uint64_t ReadAddr, uint16_t Bloc
 
 SD_Error SD_ReadMultiBlocksFIXED(uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize, uint32_t NumberOfBlocks) {
 	SD_Error errorstatus = SD_OK;
+
+	moviecart_sdio_gate();
 	TransferError = SD_OK;
 	TransferEnd = 0;
 	StopCondition = 1;
@@ -1439,7 +1493,7 @@ SD_Error SD_ReadMultiBlocksFIXED(uint8_t *readbuff, uint64_t ReadAddr, uint16_t 
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand(&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error(SD_CMD_SET_BLOCKLEN);
 
@@ -1453,7 +1507,7 @@ SD_Error SD_ReadMultiBlocksFIXED(uint8_t *readbuff, uint64_t ReadAddr, uint16_t 
 	SDIO_DataInitStructure.SDIO_TransferDir = SDIO_TransferDir_ToSDIO;
 	SDIO_DataInitStructure.SDIO_TransferMode = SDIO_TransferMode_Block;
 	SDIO_DataInitStructure.SDIO_DPSM = SDIO_DPSM_Enable;
-	SDIO_DataConfig(&SDIO_DataInitStructure);
+	SDIO_DataConfigGated(&SDIO_DataInitStructure);
 
 	/*!< Send CMD18 READ_MULT_BLOCK with argument data address */
 	SDIO_CmdInitStructure.SDIO_Argument = (uint32_t)ReadAddr;
@@ -1461,7 +1515,7 @@ SD_Error SD_ReadMultiBlocksFIXED(uint8_t *readbuff, uint64_t ReadAddr, uint16_t 
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand(&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error(SD_CMD_READ_MULT_BLOCK);
 
@@ -1492,6 +1546,7 @@ SD_Error SD_WaitReadOperation (void)
 	timeout = SD_DATATIMEOUT;
 
 	while ((DMAEndOfTransfer == 0x00) && (TransferEnd == 0) && (TransferError == SD_OK) && (timeout > 0)) {
+		SD_PollDmaAndYield();
 		timeout--;
 	}
 	
@@ -1499,8 +1554,12 @@ SD_Error SD_WaitReadOperation (void)
 
 	timeout = SD_DATATIMEOUT;
 
-	while (((SDIO ->STA & SDIO_FLAG_RXACT)) && (timeout > 0)) {
+	while (timeout > 0) {
+		moviecart_sdio_gate();
+		if (!(SDIO ->STA & SDIO_FLAG_RXACT))
+			break;
 		timeout--;
+		moviecart_bus_yield();
 	}
 
 	if (StopCondition == 1) {
@@ -1544,6 +1603,7 @@ SD_Error SD_WriteBlock (uint8_t *writebuff, uint64_t WriteAddr, uint16_t BlockSi
 	uint32_t *tempbuff = (uint32_t *)writebuff;
 #endif
 
+	moviecart_sdio_gate();
 	TransferError = SD_OK;
 	TransferEnd = 0;
 	StopCondition = 0;
@@ -1567,7 +1627,7 @@ SD_Error SD_WriteBlock (uint8_t *writebuff, uint64_t WriteAddr, uint16_t BlockSi
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_SET_BLOCKLEN );
 
@@ -1581,7 +1641,7 @@ SD_Error SD_WriteBlock (uint8_t *writebuff, uint64_t WriteAddr, uint16_t BlockSi
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_WRITE_SINGLE_BLOCK );
 
@@ -1595,7 +1655,7 @@ SD_Error SD_WriteBlock (uint8_t *writebuff, uint64_t WriteAddr, uint16_t BlockSi
 	SDIO_DataInitStructure.SDIO_TransferDir = SDIO_TransferDir_ToCard;
 	SDIO_DataInitStructure.SDIO_TransferMode = SDIO_TransferMode_Block;
 	SDIO_DataInitStructure.SDIO_DPSM = SDIO_DPSM_Enable;
-	SDIO_DataConfig (&SDIO_DataInitStructure);
+	SDIO_DataConfigGated(&SDIO_DataInitStructure);
 
 	/*!< In case of single data block transfer no need of stop command at all */
 #if defined (SD_POLLING_MODE) 
@@ -1656,6 +1716,7 @@ SD_Error SD_WriteBlock (uint8_t *writebuff, uint64_t WriteAddr, uint16_t BlockSi
 SD_Error SD_WriteMultiBlocks (uint8_t *writebuff, uint64_t WriteAddr, uint16_t BlockSize, uint32_t NumberOfBlocks) {
 	SD_Error errorstatus = SD_OK;
 
+	moviecart_sdio_gate();
 	TransferError = SD_OK;
 	TransferEnd = 0;
 	StopCondition = 1;
@@ -1678,7 +1739,7 @@ SD_Error SD_WriteMultiBlocks (uint8_t *writebuff, uint64_t WriteAddr, uint16_t B
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_SET_BLOCKLEN );
 
@@ -1692,7 +1753,7 @@ SD_Error SD_WriteMultiBlocks (uint8_t *writebuff, uint64_t WriteAddr, uint16_t B
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_APP_CMD );
 
@@ -1706,7 +1767,7 @@ SD_Error SD_WriteMultiBlocks (uint8_t *writebuff, uint64_t WriteAddr, uint16_t B
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_SET_BLOCK_COUNT );
 
@@ -1720,7 +1781,7 @@ SD_Error SD_WriteMultiBlocks (uint8_t *writebuff, uint64_t WriteAddr, uint16_t B
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_WRITE_MULT_BLOCK );
 
@@ -1734,7 +1795,7 @@ SD_Error SD_WriteMultiBlocks (uint8_t *writebuff, uint64_t WriteAddr, uint16_t B
 	SDIO_DataInitStructure.SDIO_TransferDir = SDIO_TransferDir_ToCard;
 	SDIO_DataInitStructure.SDIO_TransferMode = SDIO_TransferMode_Block;
 	SDIO_DataInitStructure.SDIO_DPSM = SDIO_DPSM_Enable;
-	SDIO_DataConfig (&SDIO_DataInitStructure);
+	SDIO_DataConfigGated(&SDIO_DataInitStructure);
 
 	return (errorstatus);
 }
@@ -1757,6 +1818,7 @@ SD_Error SD_WriteMultiBlocks (uint8_t *writebuff, uint64_t WriteAddr, uint16_t B
 SD_Error SD_WriteMultiBlocksFIXED (uint8_t *writebuff, uint64_t WriteAddr, uint16_t BlockSize, uint32_t NumberOfBlocks) {
 	SD_Error errorstatus = SD_OK;
 
+	moviecart_sdio_gate();
 	TransferError = SD_OK;
 	TransferEnd = 0;
 	StopCondition = 1;
@@ -1774,7 +1836,7 @@ SD_Error SD_WriteMultiBlocksFIXED (uint8_t *writebuff, uint64_t WriteAddr, uint1
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand(&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error(SD_CMD_SET_BLOCKLEN);
 
@@ -1788,7 +1850,7 @@ SD_Error SD_WriteMultiBlocksFIXED (uint8_t *writebuff, uint64_t WriteAddr, uint1
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand(&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 
 	errorstatus = CmdResp1Error(SD_CMD_APP_CMD);
@@ -1802,7 +1864,7 @@ SD_Error SD_WriteMultiBlocksFIXED (uint8_t *writebuff, uint64_t WriteAddr, uint1
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand(&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error(SD_CMD_SET_BLOCK_COUNT);
 
@@ -1817,7 +1879,7 @@ SD_Error SD_WriteMultiBlocksFIXED (uint8_t *writebuff, uint64_t WriteAddr, uint1
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand(&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error(SD_CMD_WRITE_MULT_BLOCK);
 
@@ -1831,7 +1893,7 @@ SD_Error SD_WriteMultiBlocksFIXED (uint8_t *writebuff, uint64_t WriteAddr, uint1
 	SDIO_DataInitStructure.SDIO_TransferDir = SDIO_TransferDir_ToCard;
 	SDIO_DataInitStructure.SDIO_TransferMode = SDIO_TransferMode_Block;
 	SDIO_DataInitStructure.SDIO_DPSM = SDIO_DPSM_Enable;
-	SDIO_DataConfig(&SDIO_DataInitStructure);
+	SDIO_DataConfigGated(&SDIO_DataInitStructure);
 
 	SDIO->MASK |= (SDIO_IT_DCRCFAIL | SDIO_IT_DTIMEOUT | SDIO_IT_DATAEND | SDIO_IT_RXOVERR | SDIO_IT_STBITERR);
 	SDIO_DMACmd(ENABLE);
@@ -1856,15 +1918,20 @@ SD_Error SD_WaitWriteOperation (void)
 	timeout = SD_DATATIMEOUT;
 
 	while ((DMAEndOfTransfer == 0x00) && (TransferEnd == 0) && (TransferError == SD_OK) && (timeout > 0)) {
+		SD_PollDmaAndYield();
 		timeout--;
 	}
-
+	
 	DMAEndOfTransfer = 0x00;
 
 	timeout = SD_DATATIMEOUT;
 
-	while (((SDIO ->STA & SDIO_FLAG_TXACT)) && (timeout > 0)) {
+	while (timeout > 0) {
+		moviecart_sdio_gate();
+		if (!(SDIO ->STA & SDIO_FLAG_TXACT))
+			break;
 		timeout--;
+		moviecart_bus_yield();
 	}
 
 	if (StopCondition == 1) {
@@ -1918,7 +1985,7 @@ SD_Error SD_StopTransfer (void)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_STOP_TRANSMISSION );
 
@@ -1964,7 +2031,7 @@ SD_Error SD_Erase (uint64_t startaddr, uint64_t endaddr)
 		SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 		SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 		SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-		SDIO_SendCommand (&SDIO_CmdInitStructure);
+		SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 		errorstatus = CmdResp1Error (SD_CMD_SD_ERASE_GRP_START );
 		if (errorstatus != SD_OK) {
@@ -1977,7 +2044,7 @@ SD_Error SD_Erase (uint64_t startaddr, uint64_t endaddr)
 		SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 		SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 		SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-		SDIO_SendCommand (&SDIO_CmdInitStructure);
+		SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 		errorstatus = CmdResp1Error (SD_CMD_SD_ERASE_GRP_END );
 		if (errorstatus != SD_OK) {
@@ -1991,7 +2058,7 @@ SD_Error SD_Erase (uint64_t startaddr, uint64_t endaddr)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_ERASE );
 
@@ -2006,6 +2073,7 @@ SD_Error SD_Erase (uint64_t startaddr, uint64_t endaddr)
 	delay = SD_DATATIMEOUT;
 	while ((delay > 0) && (errorstatus == SD_OK) && ((SD_CARD_PROGRAMMING == cardstate) || (SD_CARD_RECEIVING == cardstate))) {
 		errorstatus = IsCardProgramming (&cardstate);
+		SD_CmdYield();
 		delay--;
 	}
 
@@ -2032,7 +2100,7 @@ SD_Error SD_SendStatus (uint32_t *pcardstatus)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_SEND_STATUS );
 
@@ -2067,7 +2135,7 @@ SD_Error SD_SendSDStatus (uint32_t *psdstatus)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_SET_BLOCKLEN );
 
@@ -2081,7 +2149,7 @@ SD_Error SD_SendSDStatus (uint32_t *psdstatus)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 	errorstatus = CmdResp1Error (SD_CMD_APP_CMD );
 
 	if (errorstatus != SD_OK) {
@@ -2094,7 +2162,7 @@ SD_Error SD_SendSDStatus (uint32_t *psdstatus)
 	SDIO_DataInitStructure.SDIO_TransferDir = SDIO_TransferDir_ToSDIO;
 	SDIO_DataInitStructure.SDIO_TransferMode = SDIO_TransferMode_Block;
 	SDIO_DataInitStructure.SDIO_DPSM = SDIO_DPSM_Enable;
-	SDIO_DataConfig (&SDIO_DataInitStructure);
+	SDIO_DataConfigGated(&SDIO_DataInitStructure);
 
 	/*!< Send ACMD13 SD_APP_STAUS  with argument as card's RCA.*/
 	SDIO_CmdInitStructure.SDIO_Argument = 0;
@@ -2102,7 +2170,7 @@ SD_Error SD_SendSDStatus (uint32_t *psdstatus)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 	errorstatus = CmdResp1Error (SD_CMD_SD_APP_STAUS );
 
 	if (errorstatus != SD_OK) {
@@ -2214,8 +2282,12 @@ static SD_Error CmdError (void)
 
 	timeout = SDIO_CMD0TIMEOUT; /*!< 10000 */
 
-	while ((timeout > 0) && (SDIO_GetFlagStatus (SDIO_FLAG_CMDSENT) == RESET)) {
+	while (timeout > 0) {
+		moviecart_sdio_gate();
+		if (SDIO_GetFlagStatus (SDIO_FLAG_CMDSENT) != RESET)
+			break;
 		timeout--;
+		moviecart_bus_yield();
 	}
 
 	if (timeout == 0) {
@@ -2240,11 +2312,13 @@ static SD_Error CmdResp7Error (void)
 	uint32_t status;
 	uint32_t timeout = SDIO_CMD0TIMEOUT;
 
-	status = SDIO ->STA;
-
-	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT)) && (timeout > 0)) {
-		timeout--;
+	while (timeout > 0) {
+		moviecart_sdio_gate();
 		status = SDIO ->STA;
+		if (status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))
+			break;
+		timeout--;
+		moviecart_bus_yield();
 	}
 
 	if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
@@ -2275,12 +2349,14 @@ static SD_Error CmdResp1Error (uint8_t cmd)
 	uint32_t response_r1;
 	uint32_t timeout;
 
-	status = SDIO ->STA;
-
 	timeout = SDIO_CMD0TIMEOUT;
-	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT)) && (timeout > 0)) {
-		timeout--;
+	while (timeout > 0) {
+		moviecart_sdio_gate();
 		status = SDIO ->STA;
+		if (status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))
+			break;
+		timeout--;
+		moviecart_bus_yield();
 	}
 
 	if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
@@ -2398,12 +2474,14 @@ static SD_Error CmdResp3Error (void)
         uint32_t status;
         uint32_t timeout;
 
-        status = SDIO ->STA;
-
         timeout = SDIO_CMD0TIMEOUT;
-        while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT)) && (timeout > 0)) {
-                timeout--;
+        while (timeout > 0) {
+                moviecart_sdio_gate();
                 status = SDIO ->STA;
+                if (status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))
+                        break;
+                timeout--;
+                moviecart_bus_yield();
         }
 
         if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
@@ -2427,12 +2505,14 @@ static SD_Error CmdResp2Error (void)
 	uint32_t status;
 	uint32_t timeout;
 
-	status = SDIO ->STA;
-
 	timeout = SDIO_CMD0TIMEOUT;
-	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND)) && (timeout > 0)) {
-		timeout--;
+	while (timeout > 0) {
+		moviecart_sdio_gate();
 		status = SDIO ->STA;
+		if (status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND))
+			break;
+		timeout--;
+		moviecart_bus_yield();
 	}
 
 	if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
@@ -2465,12 +2545,14 @@ static SD_Error CmdResp6Error (uint8_t cmd, uint16_t *prca)
 	uint32_t response_r1;
 	uint32_t timeout;
 
-	status = SDIO ->STA;
-
 	timeout = SDIO_CMD0TIMEOUT;
-	while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND)) && (timeout > 0)) {
-		timeout--;
+	while (timeout > 0) {
+		moviecart_sdio_gate();
 		status = SDIO ->STA;
+		if (status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND))
+			break;
+		timeout--;
+		moviecart_bus_yield();
 	}
 
 	if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
@@ -2549,7 +2631,7 @@ static SD_Error SDEnWideBus (FunctionalState NewState)
 			SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 			SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 			SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-			SDIO_SendCommand (&SDIO_CmdInitStructure);
+			SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 			errorstatus = CmdResp1Error (SD_CMD_APP_CMD );
 
@@ -2563,7 +2645,7 @@ static SD_Error SDEnWideBus (FunctionalState NewState)
 			SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 			SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 			SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-			SDIO_SendCommand (&SDIO_CmdInitStructure);
+			SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 			errorstatus = CmdResp1Error (SD_CMD_APP_SD_SET_BUSWIDTH );
 
@@ -2584,7 +2666,7 @@ static SD_Error SDEnWideBus (FunctionalState NewState)
 			SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 			SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 			SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-			SDIO_SendCommand (&SDIO_CmdInitStructure);
+			SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 			errorstatus = CmdResp1Error (SD_CMD_APP_CMD );
 
@@ -2598,7 +2680,7 @@ static SD_Error SDEnWideBus (FunctionalState NewState)
 			SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 			SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 			SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-			SDIO_SendCommand (&SDIO_CmdInitStructure);
+			SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 			errorstatus = CmdResp1Error (SD_CMD_APP_SD_SET_BUSWIDTH );
 
@@ -2629,14 +2711,18 @@ static SD_Error IsCardProgramming (uint8_t *pstatus)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
-	status = SDIO ->STA;
 	{
 		uint32_t timeout = SDIO_CMD0TIMEOUT;
-		while (!(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT)) && (timeout > 0)) {
-			timeout--;
+
+		while (timeout > 0) {
+			moviecart_sdio_gate();
 			status = SDIO ->STA;
+			if (status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))
+				break;
+			timeout--;
+			moviecart_bus_yield();
 		}
 		if (timeout == 0 && !(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))) {
 			errorstatus = SD_CMD_RSP_TIMEOUT;
@@ -2773,7 +2859,7 @@ static SD_Error FindSCR (uint16_t rca, uint32_t *pscr)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_SET_BLOCKLEN );
 
@@ -2787,7 +2873,7 @@ static SD_Error FindSCR (uint16_t rca, uint32_t *pscr)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_APP_CMD );
 
@@ -2801,7 +2887,7 @@ static SD_Error FindSCR (uint16_t rca, uint32_t *pscr)
 	SDIO_DataInitStructure.SDIO_TransferDir = SDIO_TransferDir_ToSDIO;
 	SDIO_DataInitStructure.SDIO_TransferMode = SDIO_TransferMode_Block;
 	SDIO_DataInitStructure.SDIO_DPSM = SDIO_DPSM_Enable;
-	SDIO_DataConfig (&SDIO_DataInitStructure);
+	SDIO_DataConfigGated(&SDIO_DataInitStructure);
 
 	/*!< Send ACMD51 SD_APP_SEND_SCR with argument as 0 */
 	SDIO_CmdInitStructure.SDIO_Argument = 0x0;
@@ -2809,7 +2895,7 @@ static SD_Error FindSCR (uint16_t rca, uint32_t *pscr)
 	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommand (&SDIO_CmdInitStructure);
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 
 	errorstatus = CmdResp1Error (SD_CMD_SD_APP_SEND_SCR );
 
@@ -2906,7 +2992,7 @@ SD_Error SD_HighSpeed (void)
 		SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 		SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 		SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-		SDIO_SendCommand (&SDIO_CmdInitStructure);
+		SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 		
 		errorstatus = CmdResp1Error (SD_CMD_SET_BLOCKLEN);
 		
@@ -2920,7 +3006,7 @@ SD_Error SD_HighSpeed (void)
 		SDIO_DataInitStructure.SDIO_TransferDir = SDIO_TransferDir_ToSDIO;
 		SDIO_DataInitStructure.SDIO_TransferMode = SDIO_TransferMode_Block;
 		SDIO_DataInitStructure.SDIO_DPSM = SDIO_DPSM_Enable;
-		SDIO_DataConfig (&SDIO_DataInitStructure);
+		SDIO_DataConfigGated(&SDIO_DataInitStructure);
 
 		/*!< Send CMD6 switch mode */
 		SDIO_CmdInitStructure.SDIO_Argument = 0x80FFFF01;
@@ -2928,7 +3014,7 @@ SD_Error SD_HighSpeed (void)
 		SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
 		SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
 		SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-		SDIO_SendCommand (&SDIO_CmdInitStructure);
+		SDIO_SendCommandGated(&SDIO_CmdInitStructure);
 		errorstatus = CmdResp1Error (SD_CMD_HS_SWITCH );
 
 		if (errorstatus != SD_OK) {
