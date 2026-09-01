@@ -175,6 +175,12 @@ moviecart_bus_yield(void)
 void
 moviecart_sdio_gate(void)
 {
+	if (mc_sdio_gate_relaxed) {
+		while (!mc_blanking_window)
+			bus_serve_cycle();
+		return;
+	}
+
 	static uint16_t seen;
 	static uint8_t primed;
 

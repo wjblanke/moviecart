@@ -96,7 +96,7 @@ The stock UnoCart SDIO driver (`fatfs_sd_sdio.c`) keeps **DMA** for sector reads
 
 Every SDIO wait loop calls `moviecart_bus_yield()` (or `SD_PollDmaAndYield()` for DMA drains). Long delays use `moviecart_delay_ms()` instead of busy DWT spins.
 
-**Blanking-only SDIO:** `mc_blanking_window_gen` increments on each VisibleBars RTS (`$F41D`). `moviecart_sdio_gate()` blocks until that counter advances, then SDIO initiation (commands, data-path setup, DMA arm) and polling (`SDIO->STA`, IRQ/DMA flag drains) run only inside that fresh blanking window. Between edges the firmware serves the cart only. Mount, open, title probe, file select, and per-frame field loads all use this path.
+**Blanking-only SDIO:** `mc_blanking_window_gen` increments on each VisibleBars RTS (`$F41D`). By default `moviecart_sdio_gate()` blocks until that counter advances (mount, title probe, file select). During **`loadField()`** only, `mc_sdio_gate_relaxed` is set: the gate waits for `mc_blanking_window` but does not require a new gen edge, so a multi-sector field read can use one blanking tail. Between gates the firmware serves the cart only.
 
 ### Playback loop
 

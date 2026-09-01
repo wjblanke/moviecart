@@ -118,6 +118,7 @@ mc_diag_note(uint8_t code)
 volatile uint8_t	mc_visible_bars_vended;
 volatile uint8_t	mc_blanking_window;
 volatile uint16_t	mc_blanking_window_gen;
+volatile uint8_t	mc_sdio_gate_relaxed;
 
 static uint16_t		mc_cart_off;
 static volatile uint_fast8_t	mc_store_dummy;	/* gstore sink before joystick setup */
@@ -153,6 +154,7 @@ coreInit(void)
 	mc_visible_bars_vended = 0;
 	mc_blanking_window = 0;
 	mc_blanking_window_gen = 0;
+	mc_sdio_gate_relaxed = 0;
 
 	r_coreInfo.mr_swcha = 0xff;
 	r_coreInfo.mr_swchb = 0xff;

@@ -592,32 +592,45 @@ static uint8_t
 loadField(struct frameInfo *fInfo, uint32_t offset)
 {
 	uint8_t *dst = fInfo->buffer;
+	uint8_t fault = 0;
+
+	mc_sdio_gate_relaxed = 1;
 
 	pf_seek_block(offset);
 
-	if (!pf_read_block(dst))
-		return BLINK_SECTOR_READ;
+	if (!pf_read_block(dst)) {
+		fault = BLINK_SECTOR_READ;
+		goto out;
+	}
 	dst += 512;
 
 	/* Every field starts with "MVC\0". Reject a bad sector/header before its
 	 * geometry can turn into an out-of-bounds DMA destination below. */
-	if (memcmp(fInfo->buffer, "MVC\0", 4) != 0)
-		return BLINK_FIELD_HEADER;
+	if (memcmp(fInfo->buffer, "MVC\0", 4) != 0) {
+		fault = BLINK_FIELD_HEADER;
+		goto out;
+	}
 
 	frameInit(fInfo);
 	if (!fInfo->visibleLines || !fInfo->numBlocks ||
-	    fInfo->numBlocks > FIELD_MAX_BLOCKS)
-		return BLINK_FIELD_GEOMETRY;
+	    fInfo->numBlocks > FIELD_MAX_BLOCKS) {
+		fault = BLINK_FIELD_GEOMETRY;
+		goto out;
+	}
 
 	int nb = fInfo->numBlocks - 1;
 	while (nb) {
-		if (!pf_read_block(dst))
-			return BLINK_SECTOR_READ;
+		if (!pf_read_block(dst)) {
+			fault = BLINK_SECTOR_READ;
+			goto out;
+		}
 		dst += 512;
 		nb--;
 	}
 
-	return 0;
+out:
+	mc_sdio_gate_relaxed = 0;
+	return fault;
 }
 
 /*

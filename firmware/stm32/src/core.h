@@ -76,10 +76,12 @@ extern void			mc_diag_note(uint8_t code);
  *                          free for SDIO while RamKernel runs from RIOT $80.
  *
  *   mc_blanking_window_gen increments on each $F41D edge. SDIO initiation and
- *                          polling wait for gen to advance (see moviecart_sdio_gate).
+ *                          polling wait for gen to advance (see moviecart_sdio_gate),
+ *                          except during playback field loads (mc_sdio_gate_relaxed).
  */
 extern volatile uint8_t		mc_visible_bars_vended;
 extern volatile uint8_t		mc_blanking_window;
 extern volatile uint16_t	mc_blanking_window_gen;
+extern volatile uint8_t		mc_sdio_gate_relaxed;
 
 #endif

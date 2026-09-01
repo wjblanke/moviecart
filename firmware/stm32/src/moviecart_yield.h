@@ -12,9 +12,9 @@
 void moviecart_bus_yield(void);
 
 /*
- * Block until mc_blanking_window_gen advances (a fresh $F41D blanking edge).
- * Call immediately before every SDIO register access, command launch, or DMA
- * arm — the driver polls SDIO only inside blanking windows.
+ * Block until SDIO may run:
+ *   - default: fresh mc_blanking_window_gen edge (mount, probe, select)
+ *   - mc_sdio_gate_relaxed: mc_blanking_window set (playback field load only)
  */
 void moviecart_sdio_gate(void);
 
