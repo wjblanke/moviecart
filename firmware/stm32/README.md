@@ -106,9 +106,9 @@ After the embedded title screen and SD mount:
 2. **`runFrameLoop()`** — two-buffer DMA pipeline:
    - `waitEndFrame()` — blocked on `mr_endFrame` (set at VisibleBars RTS).
    - `checkSelectVideo()` / `updateTransport()` — console controls; file change opens the next movie file while yielding.
-   - Finish and validate the CMD18 DMA started in the preceding blanking interval; only then set `mc_buffer_swap_ready`.
+   - Finish and validate the CMD18 DMA started in the preceding blanking interval, then swap display pointers **during that same blanking window**.
    - Start one CMD18 DMA for the following field into the buffer whose visible use just ended. The title probe caches `numBlocks`, so all 1–6 contiguous sectors use one transfer.
-   - At **`mc_visible_bars_vended`** (`$F09D`), swap only when the completed buffer is ready. The first pipeline pass repeats the title/current field once while priming DMA.
+   - At **`$F09D`** VisibleBars starts using the already-swapped buffer. The first pipeline pass repeats the title once while priming DMA.
 
 Field files: FAT32 root, first playable file by default; `MVC\0` header, 1–6 sectors (≤ 3 KiB field buffer). Controls match stock MovieCart (Select advances files, etc.).
 

@@ -63,6 +63,7 @@ extern volatile uint8_t		mc_led_host;
 #define DIAG_FIELD_RETRY	5
 
 extern void			mc_diag_note(uint8_t code);
+extern void			mc_field_swap_to_display(void);
 
 /*
  * RamKernel frame markers (see core.asm / core.bin):
@@ -84,6 +85,5 @@ extern volatile uint8_t		mc_blanking_window;
 extern volatile uint16_t	mc_blanking_window_gen;
 extern volatile uint8_t		mc_sdio_gate_relaxed;
 extern volatile uint8_t		mc_playback_pipeline;
-extern volatile uint8_t		mc_buffer_swap_ready;
 
 #endif

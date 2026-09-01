@@ -596,14 +596,6 @@ static uint8_t pending_attempt;
 static uint8_t field_dma_pending;
 
 static struct frameInfo *
-displayFrameInfo(void)
-{
-	return r_coreInfo.mr_bufferIndex
-		? &r_coreInfo.mr_frameInfo2
-		: &r_coreInfo.mr_frameInfo1;
-}
-
-static struct frameInfo *
 inactiveFrameInfo(void)
 {
 	return r_coreInfo.mr_bufferIndex
@@ -668,7 +660,7 @@ finishFieldRead(void)
 
 	if (!fault) {
 		updateBuffer(&state, pending_frame);
-		mc_buffer_swap_ready = 1;
+		mc_field_swap_to_display();
 		return 0;
 	}
 
@@ -808,7 +800,6 @@ checkSelectVideo(int *which)
 	    ((state.i_swchb & 0x02) && !((uint8_t)r_coreInfo.mr_swchb & 0x02))) {
 		selected = true;
 		state.io_bits &= ~STATE_END;
-		mc_buffer_swap_ready = 0;
 
 		(*which)++;
 		for (;;) {
@@ -860,12 +851,10 @@ static void
 runFrameLoop(void)
 {
 	int which = 1;
-	bool bootstrap = true;
 
 	state.io_frameNumber = 1;
 	state.io_bits = STATE_PLAYING;
 	field_dma_pending = 0;
-	mc_buffer_swap_ready = 0;
 	mc_playback_pipeline = 1;
 
 	while (1) {
@@ -882,29 +871,24 @@ runFrameLoop(void)
 			}
 		}
 
-		if (checkSelectVideo(&which)) {
-			bootstrap = true;
-			mc_buffer_swap_ready = 0;
-		}
+		checkSelectVideo(&which);
 		updateTransport(&state);
 
 		/*
-		 * Complete the prior field at one $F41D and start the next field's
-		 * single CMD18 DMA into the buffer whose visible use just ended.
-		 * The first pass fills the inactive buffer and intentionally repeats
-		 * the title/current field once. Thereafter DMA and display alternate
-		 * buffers every frame.
+		 * After $F41D the 6502 is in RIOT blanking. Finish the previous
+		 * field's DMA, validate it, and swap display pointers here — still
+		 * in blanking — then start the next CMD18 into the buffer whose
+		 * visible use just ended. $F09D only begins VisibleBars; it does
+		 * not swap. The first pass fills the inactive buffer and repeats
+		 * the title once.
 		 */
 		mc_visible_bars_vended = 0;
-		struct frameInfo *target = bootstrap
-			? inactiveFrameInfo()
-			: displayFrameInfo();
 		uint32_t offset =
 			(uint32_t)(state.io_frameNumber * FIELD_NUM_BLOCKS);
-		uint8_t start_fault = beginFieldRead(target, offset, 0);
+		uint8_t start_fault =
+			beginFieldRead(inactiveFrameInfo(), offset, 0);
 		if (start_fault)
 			fatalBlink(start_fault);
-		bootstrap = false;
 
 		while (!mc_visible_bars_vended)
 			bus_serve_cycle();
