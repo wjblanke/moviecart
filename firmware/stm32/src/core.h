@@ -86,6 +86,14 @@ extern volatile uint8_t		mc_wait_state;
 extern volatile uint8_t		mc_wait_ready;
 
 /*
+ * Set when the bus serves $FF31 (sta WSYNC → HMOVE → right_line) — the MovieCart
+ * visible-kernel entry ($FF31 sta WSYNC before right_line)
+ * landing in VisibleBars. Main uses this to start the next double-buffered field
+ * DMA after that instruction stream is vended, instead of right after end-of-frame.
+ */
+extern volatile uint8_t		mc_visible_bars_vended;
+
+/*
  * Why an armed handoff failed to park. Non-zero means work() did NOT run.
  *
  *   1  2 s elapsed without the RAM routine fetching $FFF4. A live title after

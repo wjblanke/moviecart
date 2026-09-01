@@ -198,6 +198,7 @@ static uint8_t			mc_gstore_page[256];
 volatile uint8_t	mc_wait_state;
 volatile uint8_t	mc_wait_ready;
 volatile uint8_t	mc_wait_fault;
+volatile uint8_t	mc_visible_bars_vended;
 
 static uint8_t		mc_poll_byte;
 static volatile uint_fast8_t	mc_store_dummy;	/* gstore sink before joystick setup */
@@ -401,6 +402,7 @@ coreInit(void)
 {
 	r_coreInfo.mr_endFrame = 1;
 	r_coreInfo.mr_bufferIndex = false;
+	mc_visible_bars_vended = 0;
 
 	r_coreInfo.mr_swcha = 0xff;
 	r_coreInfo.mr_swchb = 0xff;
@@ -708,6 +710,8 @@ g0x30:
 
 g0x31:
 	SET_DATA(0x85); // sta WSYNC
+	/* VisibleBars entry: $31 path is vended once per frame after blanking. */
+	mc_visible_bars_vended = 1;
 	EMULATE_DONE
 
 g0x32:

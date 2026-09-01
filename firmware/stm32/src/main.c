@@ -71,6 +71,21 @@ waitEndFrame(void)
 }
 
 /*
+ * Block until the kernel's VisibleBars entry ($FF31) is served to the 6502.
+ * That is the visible-kernel entry moment (sta WSYNC @ $FF31 before right_line):
+ * blanking is done, the visible dual-line kernel is about to run, and the
+ * inactive field buffer can be filled for the next swap.
+ */
+static void
+waitVisibleBarsVended(void)
+{
+	mc_visible_bars_vended = 0;
+	while (!mc_visible_bars_vended)
+		bus_serve_cycle();
+	mc_visible_bars_vended = 0;
+}
+
+/*
  * Blink by counting the kernel's own frames, not wall-clock milliseconds.
  *
  * Blinks used to be timed by moviecart_delay_ms, i.e. served through
@@ -916,11 +931,12 @@ runFrameLoop(void)
 		updateTransport(&state);
 
 		/*
-		 * The field is read with the console parked in RAM for part of the
-		 * vertical blank, so the read owns the CPU outright instead of
-		 * squeezing between Atari cycles. Falls back to a direct call if
-		 * the routine was never installed.
+		 * Wait until $FF31 (VisibleBars / right_line entry) is vended, then
+		 * park via WaitCart and DMA the next field into the inactive
+		 * buffer. Handoff resumes at $FF31 so the visible kernel still
+		 * runs; the double-buffer swap at end-of-frame picks up the data.
 		 */
+		waitVisibleBarsVended();
 		frame_fault = 0;
 		mc_wait_handoff(loadFrameWork);
 		if (frame_fault)

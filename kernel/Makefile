@@ -1,8 +1,21 @@
+# MovieCart kernel — core.asm (RamKernel blanking + cart visible kernel)
+#
+#   make      → core.bin via dasm
+#   make run  → Stella
 
-core.bin: core.asm 
-	./dasm/dasm.exe core.asm -f3 -Idasm/machines/atari2600/ -ocore.bin -lcore.lst -score.sym
-	"C:/Program Files/Stella/Stella.exe" -debug core.bin &
-#	../utils/expand_bin core.bin
+DASM = ./dasm/dasm.exe
+DASM_FLAGS = -f3 -Idasm/machines/atari2600/
+STELLA ?= "C:/Program Files/Stella/Stella.exe"
+
+.PHONY: all run clean
+
+all: core.bin
+
+core.bin core.lst core.sym: core.asm
+	$(DASM) core.asm $(DASM_FLAGS) -ocore.bin -lcore.lst -score.sym
+
+run: core.bin
+	$(STELLA) -debug core.bin &
 
 clean:
-	rm -rf core.bin core.lst core.sym
+	rm -f core.bin core.lst core.sym riot_sprite_swcha.bin

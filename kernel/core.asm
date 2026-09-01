@@ -1,10 +1,14 @@
+; MovieCart demo kernel — RamKernel in RIOT $80 (generate_title_rom shape).
+; Cart ROM: ColdStart, RamKernel image, VisibleBars only.
+; Visible scanlines: kernel macro + line0..end_lines (unchanged).
+;
+; Build: make (dasm → core.bin)
 
 	processor 6502
 	include vcs.h
 
-;user memory 128 to 255
-DUMMY			equ $80
-FIELD			equ $81
+RAM_BASE	equ $80
+FIELD		equ $F1
 
 GAUDIO	equ #0
 NUM_LINES equ	8
@@ -12,34 +16,32 @@ PREROLL			equ 50
 
 #if 1	; NTSC
 VISIBLE_LINES	equ (192 - NUM_LINES*2 - PREROLL + 1)
-GCOL0			equ $42	;red
-GCOL5			equ $36	;orange
-GCOL1			equ $EC	;yellow
-GCOL6			equ $D8	;light green
-GCOL2			equ $72	;blue
-GCOL7			equ $64	;purple
-GCOL3			equ $B8	;cyan
-GCOL8			equ $6C	;light purple
-GCOL4			equ $06	;dark grey
-GCOL9			equ $0A	;light grey
-GBKCOLOR		equ $02 ;dark grey
+GCOL0			equ $42
+GCOL5			equ $36
+GCOL1			equ $EC
+GCOL6			equ $D8
+GCOL2			equ $72
+GCOL7			equ $64
+GCOL3			equ $B8
+GCOL8			equ $6C
+GCOL4			equ $06
+GCOL9			equ $0A
+GBKCOLOR		equ $02
 
-#else	; PAl
+#else	; PAL
 
 VISIBLE_LINES	equ (242 - NUM_LINES*2 - PREROLL + 1)
-GCOL0			equ $44	;red
-GCOL5			equ $46	;orange
-GCOL1			equ $2C	;yellow
-GCOL6			equ $36	;green
-GCOL2			equ $B2	;blue
-GCOL7			equ $C4	;purple
-
-GCOL3			equ $9A	;cyan
-GCOL8			equ $AC	;light purple
-
-GCOL4			equ $F8	;dark grey
-GCOL9			equ $FC	;light grey
-GBKCOLOR		equ $04 ;dark grey
+GCOL0			equ $44
+GCOL5			equ $46
+GCOL1			equ $2C
+GCOL6			equ $36
+GCOL2			equ $B2
+GCOL7			equ $C4
+GCOL3			equ $9A
+GCOL8			equ $AC
+GCOL4			equ $F8
+GCOL9			equ $FC
+GBKCOLOR		equ $04
 #endif
 
 
@@ -123,22 +125,22 @@ GBKCOLOR		equ $04 ;dark grey
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-	org $FC00 
+	org $F000
 
-main_start
+;------------------------------------------------------------------------------
+ColdStart
+	sei
+	cld
+	ldx #$FF
+	txs
 
-	sei	
-	cld  	
-	ldx #$FF	
-	txs	
+	lda #0
+ClearMem
+	sta 0,x
+	dex
+	bne ClearMem
 
-	;zero memory
-	lda #0		
-ClearMem 
-	sta 0,X		
-	dex		
-	bne ClearMem	
-
+	; RESP while still locked to ClearMem WSYNC — before RamKernel copy
 	lda #1
 	sta VDELP1
 
@@ -149,13 +151,13 @@ ClearMem
 	lda #$CC
 	sta PF2
 
-	ldx #$30  ; going into HMP0 later
+	ldx #$30
 	sta RESP0
 	nop
 	sta RESP1
-	lda #$06  ;3 copies medium
+	lda #$06
 	sta NUSIZ0
-	lda #$02  ;2 copies medium
+	lda #$02
 	sta NUSIZ1
 
 	stx HMP0
@@ -163,15 +165,115 @@ ClearMem
 	lda #$20
 	sta HMP1
 
-	; HMOVE needs to be after WSYNC here
 	sta WSYNC
 	sta HMOVE
 
 	ldx #12
-wait_cnt
+.cold_wait
 	dex
-	bne wait_cnt
+	bne .cold_wait
 
+	sta HMCLR
+	nop
+	nop
+
+	ldx #(RamKernelEnd - RamKernel - 1)
+.copy
+	lda RamKernel,x
+	sta RAM_BASE,x
+	dex
+	bpl .copy
+
+	jmp RAM_BASE
+
+;------------------------------------------------------------------------------
+; Copied to RIOT $80. Original frame order: visible, then blanking tail.
+; Sole cart call: jsr VisibleBars. Tail continues in RIOT after rts.
+RamKernel
+	jsr VisibleBars
+
+	inc FIELD
+	lda FIELD
+	lsr
+	bcc .rk_even
+
+	ldx #30
+	ldy #(PREROLL+1)
+	jmp .rk_os
+
+.rk_even
+	ldx #29
+	ldy #PREROLL
+
+.rk_os
+	sta WSYNC
+	dex
+	bne .rk_os
+
+	lda #2
+	sta VSYNC
+	ldx #3
+.rk_vsync
+	sta WSYNC
+	dex
+	bne .rk_vsync
+	lda #0
+	sta VSYNC
+
+	lda #2
+	sta VBLANK
+	ldx #37
+.rk_vblank
+	sta WSYNC
+	dex
+	bne .rk_vblank
+	lda #0
+	sta VBLANK
+
+	tya
+	tax
+.rk_pr
+	sta WSYNC
+	dex
+	bne .rk_pr
+
+	ldx #7
+.rk_busy
+	dex
+	bne .rk_busy
+	lda #0
+	sta $82
+	sta $82
+	sta $82
+	sta $82
+	nop
+
+	jmp RAM_BASE
+RamKernelEnd
+
+;------------------------------------------------------------------------------
+; Visible scanlines only — kernel macro + line0..end_lines unchanged.
+; SyncToRight in cart (same cycle phase as original HMCLR/nop/nop/line0 entry).
+VisibleBars
+	sta WSYNC
+	ldx #6
+.vb_resp
+	dex
+	bne .vb_resp
+	nop
+	ldx #$30
+	sta RESP0
+	nop
+	sta RESP1
+	stx HMP0
+	lda #$20
+	sta HMP1
+	sta WSYNC
+	sta HMOVE
+	ldx #12
+.vb_sync
+	dex
+	bne .vb_sync
 	sta HMCLR
 	nop
 	nop
@@ -188,88 +290,20 @@ line0
 
 end_lines
 
-	;clear
 	lda #0
 	sta GRP0
 	sta GRP1
 	sta GRP0
 
 	ldx #VISIBLE_LINES
-	jsr wait_lines
-
-
-	inc FIELD
-    lda FIELD
-    lsr
-    bcc .start_odd
-
-.start_even
-
-	ldx #29	; overscan
-	ldy #PREROLL
-	jmp	.start3
-
-.start_odd
-
-	ldx #30	; overscan
-	ldy #(PREROLL+1)
-
-.start3
-
-	jsr wait_lines
-
-	; vsync 3
-	lda  #2
-	sta  VSYNC	
-		ldx #3
-		jsr wait_lines
-	lda  #0
-	sta  VSYNC	
-
-	; vblank 37
-	lda  #2
-	sta  VBLANK	
-		ldx #37
-		jsr wait_lines
-	lda  #0
-	sta  VBLANK	
-
-	; preroll
-	tya
-	tax
-	jsr wait_lines
-
-
-	;; wait...
-
-	lda  #0
-	sta DUMMY
-	sta DUMMY
-	sta DUMMY
-	sta DUMMY
-
-	ldx #7
-busy_wait
-	dex		
-	bne	busy_wait
-
-	sta DUMMY
-	sta DUMMY
-	nop
-
-	jmp line0
-
-wait_lines 
+.vb_wait
 	sta WSYNC
-	dex		
-	bne wait_lines	
+	dex
+	bne .vb_wait
+
 	rts
 
-
 	org $FFFA
-reset_loop
-	.word main_start		;NMI 
-	.word main_start		;RESET
-	.word main_start 		;IRQ/BRK
-
-
+	.word ColdStart
+	.word ColdStart
+	.word ColdStart
