@@ -767,6 +767,9 @@ runTitle(void)
 		if (state.io_bits & STATE_PLAYING)
 			break;
 	}
+
+	if (!mc_sd_prepare_playback_read())
+		fatalBlink(BLINK_SECTOR_READ);
 }
 
 /*

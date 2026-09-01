@@ -303,6 +303,46 @@ static volatile DSTATUS TM_FATFS_SD_SDIO_Stat = STA_NOINIT;	/* Physical drive st
 
 #define BLOCK_SIZE            512
 
+/*
+ * CMD16 SET_BLOCKLEN(512) is invariant for MovieCart playback. Mount sends it on
+ * every read; after SD_PreparePlaybackRead() (or the first successful CMD16)
+ * sector reads skip the redundant command.
+ */
+static uint8_t	sd_blocklen512_done;
+
+static SD_Error
+SD_SetBlockLen512(void)
+{
+	SD_Error errorstatus;
+
+	SDIO_CmdInitStructure.SDIO_Argument = 512;
+	SDIO_CmdInitStructure.SDIO_CmdIndex = SD_CMD_SET_BLOCKLEN;
+	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
+	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
+	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
+	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
+
+	errorstatus = CmdResp1Error(SD_CMD_SET_BLOCKLEN);
+	if (errorstatus == SD_OK)
+		sd_blocklen512_done = 1;
+	return errorstatus;
+}
+
+static SD_Error
+SD_EnsureBlockLen512(uint16_t BlockSize)
+{
+	if (sd_blocklen512_done && BlockSize == 512)
+		return SD_OK;
+	return SD_SetBlockLen512();
+}
+
+SD_Error
+SD_PreparePlaybackRead(void)
+{
+	moviecart_sdio_gate();
+	return SD_SetBlockLen512();
+}
+
 uint8_t TM_FATFS_SDIO_WriteEnabled(void) {
 #if FATFS_USE_WRITEPROTECT_PIN > 0
 	return !TM_GPIO_GetInputPinValue(FATFS_USE_WRITEPROTECT_PIN_PORT, FATFS_USE_WRITEPROTECT_PIN_PIN);
@@ -337,6 +377,7 @@ DSTATUS TM_FATFS_SD_SDIO_disk_initialize(void) {
 	
 	SD_LowLevel_DeInit();
 	SD_LowLevel_Init();
+	sd_blocklen512_done = 0;
 
 	/* Card power / CMD0 can fail intermittently on DevEBox — retry a few times. */
 	{
@@ -407,7 +448,11 @@ DRESULT TM_FATFS_SD_SDIO_disk_read(BYTE *buff, DWORD sector, UINT count) {
 		return res;
 	}
 
-	Status = SD_ReadMultiBlocks(buff, sector << 9, BLOCK_SIZE, count);
+	if (count == 1) {
+		Status = SD_ReadBlock(buff, sector << 9, BLOCK_SIZE);
+	} else {
+		Status = SD_ReadMultiBlocks(buff, sector << 9, BLOCK_SIZE, count);
+	}
 
 	if (Status == SD_OK) {
 		SDTransferState State;
@@ -1316,17 +1361,9 @@ SD_Error SD_ReadBlock (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize)
 	}
 
 	/* Set Block Size for Card */
-	SDIO_CmdInitStructure.SDIO_Argument = (uint32_t) BlockSize;
-	SDIO_CmdInitStructure.SDIO_CmdIndex = SD_CMD_SET_BLOCKLEN;
-	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
-	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
-	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
-
-	errorstatus = CmdResp1Error (SD_CMD_SET_BLOCKLEN );
-
-	if (SD_OK != errorstatus) {
-		return (errorstatus);
+	errorstatus = SD_EnsureBlockLen512(BlockSize);
+	if (errorstatus != SD_OK) {
+		return errorstatus;
 	}
 
 	SDIO_DataInitStructure.SDIO_DataTimeOut = SD_DATATIMEOUT;
@@ -1433,17 +1470,9 @@ SD_Error SD_ReadMultiBlocks (uint8_t *readbuff, uint64_t ReadAddr, uint16_t Bloc
 	}
 
 	/*!< Set Block Size for Card */
-	SDIO_CmdInitStructure.SDIO_Argument = (uint32_t) BlockSize;
-	SDIO_CmdInitStructure.SDIO_CmdIndex = SD_CMD_SET_BLOCKLEN;
-	SDIO_CmdInitStructure.SDIO_Response = SDIO_Response_Short;
-	SDIO_CmdInitStructure.SDIO_Wait = SDIO_Wait_No;
-	SDIO_CmdInitStructure.SDIO_CPSM = SDIO_CPSM_Enable;
-	SDIO_SendCommandGated(&SDIO_CmdInitStructure);
-
-	errorstatus = CmdResp1Error (SD_CMD_SET_BLOCKLEN );
-
-	if (SD_OK != errorstatus) {
-		return (errorstatus);
+	errorstatus = SD_EnsureBlockLen512(BlockSize);
+	if (errorstatus != SD_OK) {
+		return errorstatus;
 	}
 
 	SDIO_DataInitStructure.SDIO_DataTimeOut = SD_DATATIMEOUT;

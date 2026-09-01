@@ -498,6 +498,7 @@ extern SD_Error SD_GetCardInfo (SD_CardInfo *cardinfo);
 extern SD_Error SD_GetCardStatus (SD_CardStatus *cardstatus);
 extern SD_Error SD_EnableWideBusOperation (uint32_t WideMode);
 extern SD_Error SD_SelectDeselect (uint64_t addr);
+extern SD_Error SD_PreparePlaybackRead (void);
 extern SD_Error SD_ReadBlock (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize);
 extern SD_Error SD_ReadMultiBlocks (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize, uint32_t NumberOfBlocks);
 extern SD_Error SD_ReadMultiBlocksFIXED (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize, uint32_t NumberOfBlocks);

@@ -81,6 +81,12 @@ disk_read_block2(uint32_t sector, uint8_t *dst)
 }
 
 bool
+mc_sd_prepare_playback_read(void)
+{
+	return SD_PreparePlaybackRead() == SD_OK;
+}
+
+bool
 mc_disk_initialize(void)
 {
 	dinfo.sector1 = 0xffffffffu;
