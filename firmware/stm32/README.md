@@ -157,6 +157,98 @@ After the flags trip, the finish path also:
 
 Then `finishFieldRead()` checks `MVC\0` and geometry against the title-probe cache (`playback_field_blocks`). Only a valid field calls `updateBuffer()` and `mc_field_swap_to_display()`.
 
+### RamKernel timing budget
+
+Window is VisibleBars RTS (`$F135`) through the next `jsr $F09D`. Line math is NTSC (76 CPU cycles at 1.193182 MHz = 63.695 µs). SD peak is 8 MHz × 4-bit = 4 MB/s (`DMA_CLKDIV=0x04`). Figures are calculated from the source, not scoped on the board.
+
+| | |
+|--|--|
+| Even-field budget | **7.58 ms** (119 lines) |
+| Odd-field budget | **7.71 ms** (121 lines) |
+| Typical playback work | **0.35–0.80 ms** (~9% of even-field) |
+| Worst must-fit stack | **1.9 ms** (FAT miss + OSD + slow CMD13) |
+| Pathological | **3.4 ms** (plus leftover DMA still on the wire) |
+
+Playback work that must finish before `$F09D` is typically under 11% of the interval. Mount, title probe, and file-select are sliced across many frames by the strict SDIO gate and do not have to finish in one blanking.
+
+#### Window breakdown
+
+After VisibleBars `rts` the 6502 stays in RIOT `$80`. VBLANK is cleared before preroll, so those 50/51 lines are black picture, but they are still RamKernel — no cart fetch until `jsr $F09D`.
+
+| Segment | Even (lines) | Odd (lines) | Even (ms) | Odd (ms) |
+|---------|-------------:|------------:|----------:|---------:|
+| Overscan WSYNC | 29 | 30 | 1.85 | 1.91 |
+| VSYNC on + 3 WSYNC + off | 3 | 3 | 0.19 | 0.19 |
+| VBLANK on + 37 WSYNC + off | 37 | 37 | 2.36 | 2.36 |
+| Preroll WSYNC (VBLANK already off) | 50 | 51 | 3.18 | 3.25 |
+| Busy-wait + `jmp $80` | 0 | 0 | 0.002 | 0.002 |
+| **Total RTS → `$F09D`** | **119** | **121** | **7.58** | **7.71** |
+
+PAL files still get these NTSC RamKernel counts; `visibleLines` comes from the field header.
+
+#### Case-by-case
+
+| Case | Where | Gate | Typical | Worst | One window? |
+|------|-------|------|---------|-------|-------------|
+| 1. Nominal playback | Every field after `waitEndFrame` | Relaxed | 0.35–0.80 ms | 1.2 ms | Yes — this is the budget case |
+| 2. Playback + FAT miss | `pf_seek_block` → `get_fat` uncached | Relaxed | +0.3–0.5 ms | +0.8–1.0 ms | Yes; still under 2 ms stacked |
+| 3. Playback + OSD | `updateColor` level bars / timecode | Relaxed | +40–80 µs | +0.10 ms | Yes; yields every 4–8 bytes |
+| 4. DMA leftover at RTS | `finishFieldRead` poll before DATAEND | Relaxed | 0 (DMA done in visible) | 0.8–1.5 ms | Yes; should not happen if CMD18 started last blanking |
+| 5. Field retry | finish fails, `beginFieldRead` again | Relaxed | +0.4 ms | +1.0 ms | Yes; then waits for `$F09D` and skips swap |
+| 6. Title probe | `runTitle` `pf_seek` + 1-sector read | Strict | 1–3 frames | Several frames | No — one SDIO touch per edge |
+| 7. File select | `checkSelectVideo` open + probe + wipe | Strict, then relaxed wipe | Many frames | Directory walk + 30-frame hold | No |
+| 8. Mount / `SD_Init` | `setupDisk` before playback | Strict + `delay_ms` | Hundreds of ms to seconds | 5× (`SD_Init` + 50 ms) | No — title is already looping |
+| 9. RTS / entry hooks | `$F135` and `$F09D` dispatch | On the cart cycle | <2 µs | <5 µs | Cycle budget (~100 ns), not RamKernel |
+
+#### Playback blanking — step timings
+
+`runFrameLoop` after `waitEndFrame`: `finishFieldRead` → `checkSelectVideo` (usually a compare) → `updateTransport` → `beginFieldRead`. Then it serves until `$F09D`.
+
+| Step | What | Typical | Worst | Notes |
+|------|------|---------|-------|-------|
+| finish: wait DMA | `SD_WaitReadOperation` flags | 0 µs | 800–1500 µs | 5–6×512 B at 2–4 MB/s if still in flight |
+| finish: RXACT + CMD12 | `StopTransfer` after CMD18 | 80–150 µs | 250 µs | Always; field is multi-block |
+| finish: CMD13 busy | `SD_GetStatus` until not `TRANSFER_BUSY` | 50–200 µs | 500 µs | Card-dependent |
+| finish: validate | `memcmp MVC\0` + `frameInit` | <10 µs | 20 µs | Pointer math only |
+| `updateVolume` | `totalLines` table remap, yield /4 | 45 µs | 60 µs | 262 NTSC / ~312 PAL stores |
+| `updateColor` | bright/B&W on 5×visible + BK | 250–300 µs | 350 µs | OSD overlays add ~50–80 µs |
+| `mc_field_swap_to_display` | Copy buffer pointers | <5 µs | 10 µs | No pixel copy |
+| `updateTransport` | Joystick → `frameNumber` step | <10 µs | 20 µs | No disk |
+| `pf_seek_block` hit | Queue scan, same cluster | 10–50 µs | 50 µs | 128-entry queue, yield /16 |
+| `pf_seek_block` FAT miss | `get_fat` → CMD17 512 B | 300–500 µs | 800–1000 µs | Same relaxed window as CMD18 |
+| CMD18 arm | DMA setup + CMD16? + CMD18 | 100–200 µs | 250 µs | Payload runs in the next visible |
+
+Stacked totals in one window (168 MHz CPU, 8 MHz 4-bit SDIO):
+
+| Stack | Sum | Share of 7.58 ms |
+|-------|-----|------------------|
+| Sequential + cache hit | finish 0.20 + volume 0.05 + color 0.27 + seek 0.03 + CMD18 0.15 = **0.70 ms** | 9% |
+| FAT miss + OSD + slow busy | finish 0.50 + volume 0.06 + color 0.35 + FAT 0.80 + CMD18 0.20 = **1.91 ms** | 25% |
+| Plus leftover DMA | add 1.5 ms for a full PAL field still on the wire = **3.41 ms** | 45% |
+
+#### Work that is not a single-window max
+
+`moviecart_sdio_gate()` in strict mode waits for a new `mc_blanking_window_gen` on every call. Each `SendCommand` / `DataConfig` / poll therefore consumes at most one RamKernel, then sleeps until the next RTS. Per-window STM32 time is one command or one status poll.
+
+| Path | Per-window slice | How it spans frames |
+|------|------------------|---------------------|
+| `SD_Init` / mount (400 kHz, then 8 MHz) | One CMD + response, or 2 ms / 50 ms `delay_ms` pump | Init clock 48 MHz/(0x76+2) ≈ 400 kHz. `delay_ms` yields on A12-low. |
+| Title probe (1 sector) | CMD17 data 128 µs + commands ~200–400 µs if it all landed in one window; usually split | Each `gate()` inside `WaitReadOperation` waits for the next edge. |
+| `pf_open_file` / directory walk | One 512 B directory or FAT sector | Repeats until the first playable file is found. |
+| `clearFieldBuffers` after select | ~100–200 µs (6 KiB memset, yield /64) | Then 30× `waitEndFrame` hold. Not SDIO. |
+| Rewind cluster walk | One `get_fat`; FAT sector often cached after the first read | Checkpoint every 63 clusters (`pff.c` `skip &= 63`). Comment: stutter ~19 min reverse on a formatted card. |
+
+#### What is not charged to RamKernel
+
+| Work | When it runs | Duration |
+|------|--------------|----------|
+| Field CMD18 payload (5–6 × 512 B) | Visible interval after `beginFieldRead` | 0.64 ms peak (4 MB/s, 5 sectors) · ~0.77 ms PAL 6 sectors · up to ~1.5 ms on a 2 MB/s card |
+| Looping visible kernel dispatch | Every cart cycle of ~192 lines | Must stay under ~100 ns per fetch |
+| `$F135` RTS hook (skip audio, diag, `mr_endFrame`) | Last visible cart cycle, not RIOT yet | <2 µs on that cycle |
+| Title buffer swap at `$F09D` | Entry cycle that ends RamKernel | Pointer copies, <2 µs |
+
+For a healthy playback field: plan on **0.7 ms typical, 1.9 ms** if the FAT sector is cold and OSD is on. That is the number that must stay under 7.58 ms. Everything else either runs in visible (DMA payload) or is gated to one short SDIO touch per blanking (mount, probe, select).
+
 ### Memory map
 
 | Region | Contents |
