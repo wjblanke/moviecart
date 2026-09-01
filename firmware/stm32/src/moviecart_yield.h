@@ -4,10 +4,9 @@
 #include <stdint.h>
 
 /*
- * Serve one Atari cart cycle, then return. Call from every SDIO/FatFs busy-wait
- * and from CPU-bound loops that would otherwise miss a fetch. With IRQs masked
- * for the bus, this is also how SDIO/DMA completion is kept moving — the wait
- * sites pump the SDIO handlers, then yield.
+ * Serve one Atari cart cycle during visible, or during blanking only when A12
+ * is high (cart addressed — includes $F09D that ends blanking). Skip serve on
+ * A12-low cycles during blanking so SDIO wait loops run faster.
  */
 void moviecart_bus_yield(void);
 

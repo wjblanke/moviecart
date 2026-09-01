@@ -157,15 +157,16 @@ bus_serve_cycle(void)
  * blinks: a diagnostic that damages the system it measures is worse than none.
  */
 /*
- * During a WaitCart handoff the 6502 is executing from Atari RAM and makes no
- * cartridge fetches, so there is nothing to serve and every yield is pure
- * overhead. Returning immediately is what lets the unmodified SDIO driver run at
- * full speed: its busy-waits keep calling these, and here they cost nothing.
+ * During visible, always serve. During RIOT blanking skip A12-low cycles (TIA/
+ * RIOT/WSYNC only) so SDIO polls run faster — but still serve A12-high cart
+ * fetches. VisibleBars entry ($F09D) is a cart fetch that clears
+ * mc_blanking_window; missing it leaves the flag stuck at 1 and visible dead.
  */
 void
 moviecart_bus_yield(void)
 {
-	bus_serve_cycle();
+	if (!mc_blanking_window || (ADDR_IN & 0x1000))
+		bus_serve_cycle();
 }
 
 /*

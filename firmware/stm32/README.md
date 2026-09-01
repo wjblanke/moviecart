@@ -88,7 +88,7 @@ Critical rules (measured on this hardware):
 - **Bus code runs from flash** (`.hottext`, ART-line aligned), not SRAM. The `romData` jump table stays in SRAM so table lookups do not contend with instruction fetch.
 - Per-cycle budget is ~**100 ns**; one missed ~838 ns cycle can desync the scanline counter.
 
-`moviecart_bus_yield()` is a single `bus_serve_cycle()`. `moviecart_bus_pump(work)` runs `work` only on A12-low cycles where the cart drives nothing.
+`moviecart_bus_yield()` serves every cycle while visible; during blanking it serves **A12-high (cart) cycles only** so `$F09D` is not missed and `mc_blanking_window` clears. A12-low blanking cycles are skipped for faster SDIO polls.
 
 ### SD I/O (no IRQs, no WaitCart)
 
