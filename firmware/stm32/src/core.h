@@ -27,22 +27,10 @@ struct coreInfo
 	volatile uint_fast8_t	mr_inpt5;	// not used
 	struct frameInfo		mr_frameInfo1 , mr_frameInfo2;
 
-	// following only used by interrupt code
+	// following only used by the bus loop
 
-	uint_fast8_t	peekBus;
-	volatile uint_fast8_t*	storeAddress;
-	uint_fast8_t	breakLoops;
 	volatile uint_fast8_t	lines;
-
-	uint_fast8_t	hiAddress;
-	uint_fast8_t	vblankState;
-	uint_fast8_t	vsyncState;
-	volatile uint_fast8_t	endState;
-	volatile uint_fast16_t	nextLineJump;
 	uint_fast8_t	data;
-
-	bool			audioPushed;
-	uint_fast8_t	audioVal;
 
 	struct frameInfo	frameInfo;
 };

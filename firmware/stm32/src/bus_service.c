@@ -62,8 +62,7 @@ emulate_cartridge(void)
 		/* got a stable address */
 		if (addr & 0x1000)
 		{ /* A12 high */
-			bus_dispatch((uint16_t)(addr & 0xfffu),
-				     (uint8_t)(addr & 0xffu));
+			bus_dispatch((uint16_t)(addr & 0xfffu));
 			SET_DATA_MODE_OUT
 #if MOVIECART_STALL_TEST == 3
 			bus_interleave_step();
@@ -127,8 +126,7 @@ bus_serve_cycle(void)
 	while ((addr = ADDR_IN) != serve_addr_prev)
 		serve_addr_prev = addr;
 	if (addr & 0x1000) {
-		bus_dispatch((uint16_t)(addr & 0xfffu),
-			     (uint8_t)(addr & 0xffu));
+		bus_dispatch((uint16_t)(addr & 0xfffu));
 		SET_DATA_MODE_OUT
 #if MOVIECART_STALL_TEST == 3
 		bus_interleave_step();
@@ -265,8 +263,7 @@ moviecart_bus_pump(void (*work)(void))
 	while ((addr = ADDR_IN) != serve_addr_prev)
 		serve_addr_prev = addr;
 	if (addr & 0x1000) {
-		bus_dispatch((uint16_t)(addr & 0xfffu),
-			     (uint8_t)(addr & 0xffu));
+		bus_dispatch((uint16_t)(addr & 0xfffu));
 		SET_DATA_MODE_OUT
 		while (ADDR_IN == addr)
 			;

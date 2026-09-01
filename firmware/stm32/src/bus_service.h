@@ -17,7 +17,7 @@ void bus_serve_cycle(void);
  */
 
 /* MovieCart kernel dispatch (core.c). */
-void bus_dispatch(uint16_t lo_address, uint8_t addr_low8);
+void bus_dispatch(uint16_t lo_address);
 
 #include "defines.h"
 

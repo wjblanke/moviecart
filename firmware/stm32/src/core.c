@@ -6,9 +6,6 @@
 #include "cartridge_io.h"
 #include "bus_service.h"
 
-#define ST_OFF					0x86	/* stx(0) */
-#define ST_ON					0x84	/* sty(2) */
-
 /* core.asm / core.bin cart layout (org $F000). */
 #define MC_OFF_VISIBLE_ENTRY		0x09du
 #define MC_OFF_LINE0			0x0bfu
@@ -16,8 +13,6 @@
 #define MC_OFF_VISIBLE_RTS		0x41du
 #define MC_LINE_CYCLE			0x079u
 #define MC_PHASE_DYNAMIC_MAX		0x070u	/* g0x3e..g0xae; g0xaf+ from ROM */
-
-#define JMP_VISIBLE_BARS		0xf09du
 
 /*
  * Data on PD8-PD15 (high byte). Address PE0-PE12.
@@ -121,9 +116,6 @@ volatile uint16_t	mc_blanking_window_gen;
 volatile uint8_t	mc_sdio_gate_relaxed;
 volatile uint8_t	mc_playback_pipeline;
 
-static uint16_t		mc_cart_off;
-static volatile uint_fast8_t	mc_store_dummy;	/* gstore sink before joystick setup */
-
 static inline void
 diagFrameTick(void)
 {
@@ -163,28 +155,8 @@ coreInit(void)
 	r_coreInfo.mr_inpt4 = 0xff;
 	r_coreInfo.mr_inpt5 = 0xff;
 
-	r_coreInfo.peekBus = 0xff;
-	r_coreInfo.storeAddress = &r_coreInfo.peekBus;
-
-	/*
-	 * Original dsPIC value is 255 (settle through 255 BRK loops before the
-	 * kernel starts). On this breadboard port that multiplies the number of
-	 * window-first-fetches before anything runs — each one a chance for the
-	 * 6502 to swallow a JAM opcode and halt for good. Every build that ever
-	 * reached the blue title had 0 here: start the kernel on the first
-	 * vector fetch, then rely on BRK recovery.
-	 */
-	r_coreInfo.breakLoops = 0;
-
 	r_coreInfo.lines = 190;
-
-	r_coreInfo.hiAddress = 0xf0;
-	r_coreInfo.vblankState = ST_OFF;
-	r_coreInfo.vsyncState = ST_OFF;
-	r_coreInfo.endState = 0;
-	r_coreInfo.nextLineJump = JMP_VISIBLE_BARS;
 	r_coreInfo.data = 0;
-	r_coreInfo.storeAddress = &mc_store_dummy;
 
 	SET_DATA_MODE_IN;
 }
@@ -299,54 +271,22 @@ mc_on_visible_bars_rts(void)
 
 
 HOTFUNC void
-bus_dispatch(uint16_t cart_off, uint8_t addr_low8)
+bus_dispatch(uint16_t cart_off)
 {
-	/* In SRAM: a flash-resident table costs wait states per lookup, right
-	 * on the data-valid critical path. */
-	static const void* const romData[512] __attribute__((section(".ramfunc.romtable"))) =
+	/* Visible-line patch slots only (phase 0 = g0x3e). In SRAM so the
+	 * lookup does not take flash wait states on the data-valid path. */
+	static const void* const romData[MC_PHASE_DYNAMIC_MAX + 1]
+		__attribute__((section(".ramfunc.romtable"))) =
 	{
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-		&&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore, &&gstore,
-
-		&&g0x00, &&g0x01, &&g0x02, &&g0x03, &&g0x04, &&g0x05, &&g0x06, &&g0x07, &&g0x08, &&g0x09, &&g0x0a, &&g0x0b, &&g0x0c, &&g0x0d, &&g0x0e, &&g0x0f,
-		&&g0x10, &&g0x11, &&g0x12, &&g0x13, &&g0x14, &&g0x15, &&g0x16, &&g0x17, &&g0x18, &&g0x19, &&g0x1a, &&g0x1b, &&g0x1c, &&g0x1d, &&g0x1e, &&g0x1f,
-		&&g0x20, &&g0x21, &&g0x22, &&g0x23, &&g0x24, &&g0x25, &&g0x26, &&g0x27, &&g0x28, &&g0x29, &&g0x2a, &&g0x2b, &&g0x2c, &&g0x2d, &&g0x2e, &&g0x2f,
-		&&g0x30, &&g0x31, &&g0x32, &&g0x33, &&g0x34, &&g0x35, &&g0x36, &&g0x37, &&g0x38, &&g0x39, &&g0x3a, &&g0x3b, &&g0x3c, &&g0x3d, &&g0x3e, &&g0x3f,
-		&&g0x40, &&g0x41, &&g0x42, &&g0x43, &&g0x44, &&g0x45, &&g0x46, &&g0x47, &&g0x48, &&g0x49, &&g0x4a, &&g0x4b, &&g0x4c, &&g0x4d, &&g0x4e, &&g0x4f,
-		&&g0x50, &&g0x51, &&g0x52, &&g0x53, &&g0x54, &&g0x55, &&g0x56, &&g0x57, &&g0x58, &&g0x59, &&g0x5a, &&g0x5b, &&g0x5c, &&g0x5d, &&g0x5e, &&g0x5f,
-		&&g0x60, &&g0x61, &&g0x62, &&g0x63, &&g0x64, &&g0x65, &&g0x66, &&g0x67, &&g0x68, &&g0x69, &&g0x6a, &&g0x6b, &&g0x6c, &&g0x6d, &&g0x6e, &&g0x6f,
-		&&g0x70, &&g0x71, &&g0x72, &&g0x73, &&g0x74, &&g0x75, &&g0x76, &&g0x77, &&g0x78, &&g0x79, &&g0x7a, &&g0x7b, &&g0x7c, &&g0x7d, &&g0x7e, &&g0x7f,
-		&&g0x80, &&g0x81, &&g0x82, &&g0x83, &&g0x84, &&g0x85, &&g0x86, &&g0x87, &&g0x88, &&g0x89, &&g0x8a, &&g0x8b, &&g0x8c, &&g0x8d, &&g0x8e, &&g0x8f,
-		&&g0x90, &&g0x91, &&g0x92, &&g0x93, &&g0x94, &&g0x95, &&g0x96, &&g0x97, &&g0x98, &&g0x99, &&g0x9a, &&g0x9b, &&g0x9c, &&g0x9d, &&g0x9e, &&g0x9f,
-		&&g0xa0, &&g0xa1, &&g0xa2, &&g0xa3, &&g0xa4, &&g0xa5, &&g0xa6, &&g0xa7, &&g0xa8, &&g0xa9, &&g0xaa, &&g0xab, &&g0xac, &&g0xad, &&g0xae,
-		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
-		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
-		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
-		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
-		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
-		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
-		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
-		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
-		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
-		&&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld, &&mc_cart_rom_ld,
-		&&g0xfc, &&g0xfd, &&g0xfe, &&g0xff
+		&&g0x3e, &&g0x3f, &&g0x40, &&g0x41, &&g0x42, &&g0x43, &&g0x44, &&g0x45, &&g0x46, &&g0x47, &&g0x48, &&g0x49, &&g0x4a, &&g0x4b, &&g0x4c, &&g0x4d,
+		&&g0x4e, &&g0x4f, &&g0x50, &&g0x51, &&g0x52, &&g0x53, &&g0x54, &&g0x55, &&g0x56, &&g0x57, &&g0x58, &&g0x59, &&g0x5a, &&g0x5b, &&g0x5c, &&g0x5d,
+		&&g0x5e, &&g0x5f, &&g0x60, &&g0x61, &&g0x62, &&g0x63, &&g0x64, &&g0x65, &&g0x66, &&g0x67, &&g0x68, &&g0x69, &&g0x6a, &&g0x6b, &&g0x6c, &&g0x6d,
+		&&g0x6e, &&g0x6f, &&g0x70, &&g0x71, &&g0x72, &&g0x73, &&g0x74, &&g0x75, &&g0x76, &&g0x77, &&g0x78, &&g0x79, &&g0x7a, &&g0x7b, &&g0x7c, &&g0x7d,
+		&&g0x7e, &&g0x7f, &&g0x80, &&g0x81, &&g0x82, &&g0x83, &&g0x84, &&g0x85, &&g0x86, &&g0x87, &&g0x88, &&g0x89, &&g0x8a, &&g0x8b, &&g0x8c, &&g0x8d,
+		&&g0x8e, &&g0x8f, &&g0x90, &&g0x91, &&g0x92, &&g0x93, &&g0x94, &&g0x95, &&g0x96, &&g0x97, &&g0x98, &&g0x99, &&g0x9a, &&g0x9b, &&g0x9c, &&g0x9d,
+		&&g0x9e, &&g0x9f, &&g0xa0, &&g0xa1, &&g0xa2, &&g0xa3, &&g0xa4, &&g0xa5, &&g0xa6, &&g0xa7, &&g0xa8, &&g0xa9, &&g0xaa, &&g0xab, &&g0xac, &&g0xad,
+		&&g0xae
 	};
-
-	mc_cart_off = cart_off;
 
 	/*
 	 * VisibleBars scanlines: eight inlined kernel pairs from core.asm. Only
@@ -357,7 +297,7 @@ bus_dispatch(uint16_t cart_off, uint8_t addr_low8)
 		uint16_t phase = (uint16_t)((cart_off - MC_OFF_LINE0) % MC_LINE_CYCLE);
 
 		if (phase <= MC_PHASE_DYNAMIC_MAX)
-			goto *romData[0x13Eu + phase];
+			goto *romData[phase];
 
 		SET_DATA(mc_core_rom[cart_off]);
 		if (phase == 0x76u)
@@ -378,284 +318,6 @@ bus_dispatch(uint16_t cart_off, uint8_t addr_low8)
 	}
 
 	SET_DATA(mc_core_rom[cart_off]);
-	EMULATE_DONE
-
-gstore:
-	*r_coreInfo.storeAddress = addr_low8;
-	/*
-	 * Joystick LDA $FE00,X uses this page for address bits, not data; serve
-	 * zero (stable PAL 7800 bios behaviour).
-	 */
-	SET_DATA(0);
-	EMULATE_DONE
-
-mc_cart_rom_ld:
-	SET_DATA(mc_core_rom[mc_cart_off]);
-	EMULATE_DONE
-
-g0x00:
-	SET_DATA(0x78); // sei
-	EMULATE_DONE
-
-g0x01:
-	SET_DATA(0xd8); // cld
-	EMULATE_DONE
-
-g0x02:
-	SET_DATA(0xa2); // ldx #$FF
-	EMULATE_DONE
-
-g0x03:
-	SET_DATA(0xff);
-	EMULATE_DONE
-
-g0x04:
-	SET_DATA(0x9a); // txs
-	EMULATE_DONE
-
-g0x05:
-	SET_DATA(0xa9); // lda #0	//zero memory
-	EMULATE_DONE
-
-g0x06:
-	SET_DATA(0x00);
-	EMULATE_DONE
-
-g0x07:
-	SET_DATA(0x95); // sta 0,X	// ClearMem
-	EMULATE_DONE
-
-g0x08:
-	SET_DATA(0x00);
-	EMULATE_DONE
-
-g0x09:
-	SET_DATA(0xca); // dex
-	EMULATE_DONE
-
-g0x0a:
-	SET_DATA(0xd0); // bne ClearMem
-	EMULATE_DONE
-
-g0x0b:
-	SET_DATA(0xfb);
-	EMULATE_DONE
-
-g0x0c:
-	SET_DATA(0xa9); // lda #1
-	EMULATE_DONE
-
-g0x0d:
-	SET_DATA(0x01);
-	EMULATE_DONE
-
-g0x0e:
-	SET_DATA(0x85); // sta VDELP1
-	EMULATE_DONE
-
-g0x0f:
-	SET_DATA(0x26);
-	EMULATE_DONE
-
-g0x10:
-	SET_DATA(0xa9); // lda #$CF
-	EMULATE_DONE
-
-g0x11:
-	SET_DATA(0xcf);
-	EMULATE_DONE
-
-g0x12:
-	SET_DATA(0x85); // sta PF0
-	EMULATE_DONE
-
-g0x13:
-	SET_DATA(0x0d);
-	EMULATE_DONE
-
-g0x14:
-	SET_DATA(0xa9); // lda #$33
-	EMULATE_DONE
-
-g0x15:
-	SET_DATA(0x33);
-	EMULATE_DONE
-
-g0x16:
-	SET_DATA(0x85); // sta PF1
-	EMULATE_DONE
-
-g0x17:
-	SET_DATA(0x0e);
-	EMULATE_DONE
-
-g0x18:
-	SET_DATA(0xa9); // lda #$CC
-	EMULATE_DONE
-
-g0x19:
-	SET_DATA(0xcc);
-	EMULATE_DONE
-
-g0x1a:
-	SET_DATA(0x85); //sta PF2
-	EMULATE_DONE
-
-g0x1b:
-	SET_DATA(0x0f);
-	EMULATE_DONE
-
-g0x1c:
-	SET_DATA(0xa2); // ldx #$30
-	EMULATE_DONE
-
-g0x1d:
-	SET_DATA(0x30);
-	EMULATE_DONE
-
-g0x1e:
-	SET_DATA(0x85); // sta RESP0
-	EMULATE_DONE
-
-g0x1f:
-	SET_DATA(0x10);
-	EMULATE_DONE
-
-
-g0x20:
-	SET_DATA(0xea); // nop
-	EMULATE_DONE
-
-g0x21:
-	SET_DATA(0x85); //sta RESP1
-	EMULATE_DONE
-
-g0x22:
-	SET_DATA(0x11);
-	EMULATE_DONE
-
-g0x23:
-	SET_DATA(0xa9); // lda #$06	//3 copies medium
-	EMULATE_DONE
-
-g0x24:
-	SET_DATA(0x06); // lda #$06	//3 copies medium
-	EMULATE_DONE
-
-g0x25:
-	SET_DATA(0x85); // sta NUSIZ0
-	EMULATE_DONE
-
-g0x26:
-	SET_DATA(0x04);
-	EMULATE_DONE
-
-g0x27:
-	SET_DATA(0xa9); // lda #$02	//2 copies medium
-	EMULATE_DONE
-
-g0x28:
-	SET_DATA(0x02);
-	EMULATE_DONE
-
-g0x29:
-	SET_DATA(0x85); // sta NUSIZ1
-	EMULATE_DONE
-
-g0x2a:
-	SET_DATA(0x05);
-	EMULATE_DONE
-
-g0x2b:
-	SET_DATA(0x86); // stx HMP0
-	EMULATE_DONE
-
-g0x2c:
-	SET_DATA(0x20);
-	EMULATE_DONE
-
-/*
- * $FF2D: jsr PrepareWait, in place of the `lda #$20 / sta HMP1` that moved into
- * the routine. This slot is chosen for what surrounds it, not for its length.
- *
- * RESP0/RESP1 ($FF1E/$FF21) are the only writes whose column depends on where
- * the CPU is within a scanline, and ClearMem anchors them: `sta $00,x` hits
- * WSYNC when x reaches $02, so every cycle from there to RESP is fixed. A JSR
- * placed *before* RESP (the earlier $FF0C) inserted 267 cycles into that window
- * — 39 mod 76, i.e. 117 pixels of sprite displacement, which is the corrupt
- * title. Placed here, after RESP1 and before the WSYNC at $FF31, the copy is
- * bracketed by an anchor on the far side, so its length cannot be observed at
- * all: HMOVE, wait_cnt and the entry into right_line are all timed from that
- * WSYNC. Do not move it past $FF33 — after HMOVE it skips wait_cnt and jams the
- * 6507 (black, 6 flashes).
- */
-g0x2d:
-	SET_DATA(0x20); // jsr PrepareWait ($FFEC)
-	EMULATE_DONE
-
-g0x2e:
-	SET_DATA(0xec);
-	EMULATE_DONE
-
-g0x2f:
-	SET_DATA(0xff);
-	EMULATE_DONE
-
-
-g0x30:
-	SET_DATA(0xea); // nop (HMP1 is set in PrepareWait)
-	EMULATE_DONE
-
-g0x31:
-	SET_DATA(0x85); // sta WSYNC
-	EMULATE_DONE
-
-g0x32:
-	SET_DATA(0x02);
-	EMULATE_DONE
-
-g0x33:
-	SET_DATA(0x85); // sta HMOVE
-	EMULATE_DONE
-
-g0x34:
-	SET_DATA(0x2a);
-	EMULATE_DONE
-
-g0x35:
-	SET_DATA(0xa2); // ldx #12
-	EMULATE_DONE
-
-g0x36:
-	SET_DATA(0x0c);
-	EMULATE_DONE
-
-g0x37:
-	SET_DATA(0xca); // dex ; wait_cnt
-	EMULATE_DONE
-
-g0x38:
-	SET_DATA(0xd0); // bne wait_cnt
-	EMULATE_DONE
-
-g0x39:
-	SET_DATA(0xfd);
-	EMULATE_DONE
-
-g0x3a:
-	SET_DATA(0x85); // sta HMCLR
-	EMULATE_DONE
-
-g0x3b:
-	SET_DATA(0x2b);
-	EMULATE_DONE
-
-g0x3c:
-	SET_DATA(0xea); // nop
-	EMULATE_DONE
-
-g0x3d:
-	SET_DATA(0xea); // nop
 	EMULATE_DONE
 
 g0x3e:
@@ -687,12 +349,11 @@ g0x43:
 
 g0x44:
 	SET_DATA(0xa9); // lda #AUD_DATA 	// 2
-	r_coreInfo.data = r_coreInfo.audioPushed ? r_coreInfo.audioVal : *r_coreInfo.frameInfo.audioBuf++;
+	r_coreInfo.data = *r_coreInfo.frameInfo.audioBuf++;
 	EMULATE_DONE
 
 g0x45:
 	SET_DATA(r_coreInfo.data);
-	r_coreInfo.audioPushed = false;
 	EMULATE_DONE
 
 g0x46:
@@ -1138,26 +799,6 @@ g0xad:
 
 g0xae:
 	SET_DATA(0xa9);	// lda #$80 	// 2
-	EMULATE_DONE
-
-   // break a number of times to make sure the system is actually stable
-
-g0xfc:
-g0xfe:
-	if (r_coreInfo.breakLoops)
-	{
-		SET_DATA(0xf0); // .word.w main_start	// RESET / IRQ
-		r_coreInfo.breakLoops--;
-	}
-	else
-	{
-		SET_DATA(0x00);
-	}
-	EMULATE_DONE
-
-g0xfd:
-g0xff:
-	SET_DATA(0xff);
 	EMULATE_DONE
 
 }
