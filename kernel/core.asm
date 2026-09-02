@@ -1,31 +1,34 @@
-; Stella-runnable title ROM (RamKernel + unrolled VisibleBars).
-; STM32 firmware does not assemble or embed this file. ColdStart, the
-; RamKernel image, the phase pad, and the pack window are frozen in
-; firmware/stm32/src/core.c. Visible playback is the looping jump table.
+; Stella-runnable title ROM — upstream logo kernels plus the STM32
+; RamKernel / 6-line cart nibble copy (firmware/stm32/src/core.c).
 ;
-; A Stella assemble of the unrolled VisibleBars overlaps $F136/$F140/$F200.
-; Those orgs document the firmware cart map; do not treat core.bin as the
-; hardware image.
+;   $F000     ColdStart (TIA setup, copy $F200 → $80, jmp $80)
+;   $F140     CartPack (32 bytes; leave zeros if audio is uninitialized)
+;   $F160     OsHead (6 lines: AUDV0 + copy pack → $D0, joystick, WSYNC, RTS)
+;   $F200     RamKernel image (copied to RIOT $80)
+;   $F280     VisibleBars (preroll + HMOVE pad + 7 logo pairs + wait, jmp OsHead)
 ;
-; Build (optional Stella test): make (dasm → core.bin)
+; Firmware does not assemble this file. Build for Stella: make
+;
+; NTSC 261/262: 192 visible + 6 OsHead + 23/24 OS + 3 VS + 37 VB.
+; PAL still uses the NTSC RamKernel counts.
 
 	processor 6502
 	include vcs.h
 
 RAM_BASE	equ $80
-PACK		equ $D7		; 35 packed blanking nibbles ($D7–$F9)
-FIELD		equ $FB		; RIOT even/odd only (not the STM32 field)
+PACK		equ $D0		; 32 packed nibbles ($D0–$EF)
+FIELD		equ $FB		; even/odd (OS 23/24). Not $FE/$FF (jsr stack)
 AUDIDX		equ $FC
+DUMMY		equ $FD		; zp scratch (not $80 — that is RamKernel)
 CARTPACK	equ $F140
-PHASEPAD	equ $F136
-; $FE/$FF are the jsr stack — do not store FIELD or AUDIDX there
 
-GAUDIO	equ #0
-NUM_LINES equ	8
-PREROLL			equ 50
-
+GAUDIO		equ #0
+KERNEL_PAIRS	equ 7
+NUM_LINES	equ 8		; upstream count (7 pairs; keeps VISIBLE_LINES)
+PREROLL		equ 50
 #if 1	; NTSC
-VISIBLE_LINES	equ (192 - NUM_LINES*2 - PREROLL + 1)
+VISIBLE_TOTAL	equ 192
+VISIBLE_LINES	equ (VISIBLE_TOTAL - NUM_LINES*2 - PREROLL + 1)
 GCOL0			equ $42
 GCOL5			equ $36
 GCOL1			equ $EC
@@ -37,10 +40,9 @@ GCOL8			equ $6C
 GCOL4			equ $06
 GCOL9			equ $0A
 GBKCOLOR		equ $02
-
 #else	; PAL
-
-VISIBLE_LINES	equ (242 - NUM_LINES*2 - PREROLL + 1)
+VISIBLE_TOTAL	equ 242
+VISIBLE_LINES	equ (VISIBLE_TOTAL - NUM_LINES*2 - PREROLL + 1)
 GCOL0			equ $44
 GCOL5			equ $46
 GCOL1			equ $2C
@@ -54,7 +56,6 @@ GCOL9			equ $FC
 GBKCOLOR		equ $04
 #endif
 
-
 	seg
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -62,7 +63,6 @@ GBKCOLOR		equ $04
 	MAC kernel
 
 	; right_line
-
 
 	lda #{4}		; 2
 	sta GRP1		; 3 VDELed
@@ -79,26 +79,25 @@ GBKCOLOR		equ $04
 	sta COLUP0		; 3
 	lda #{8}		; 2
 	sta GRP1		; 3 VDELed
-	lda #GBKCOLOR	; 2
-	sta COLUBK		; 3 background color
+	lda #GBKCOLOR		; 2
+	sta COLUBK		; 3
 	lda #GCOL7		; 2
-	sta COLUP0		; 3 @42! end of GRP0a display
+	sta COLUP0		; 3 @42
 	lda #{6}		; 2
-	sta GRP0		; 3 @47! end of GRP1a display
+	sta GRP0		; 3 @47
 	lda #GCOL8		; 2
 	sta COLUP1		; 3 @52
 	stx GRP0		; 3 @55
 	sty COLUP0		; 3 @58<=@60
-	lda #$00		; 2 turn off background color
-	sta COLUBK		; 3 background color
+	lda #$00		; 2
+	sta COLUBK		; 3
 	sta HMCLR		; 3
-
 
 	; left_line
 
 	lda #$00		; 2 dummy
 	lda #{3}		; 2
-	sta HMOVE		;back 8, late hmove    ;needs to be on cycle 71
+	sta HMOVE		; late hmove @71
 	sta GRP1		; 3 VDELed
 	lda #GCOL1		; 2
 	sta COLUP1		; 3
@@ -106,23 +105,23 @@ GBKCOLOR		equ $04
 	sta AUDV0		; 3 @10
 	ldx #{9}		; 2
 	ldy #GCOL4		; 2
-	lda #{1} 		; 2
+	lda #{1}		; 2
 	sta GRP0		; 3
 	lda #GCOL0		; 2
 	sta COLUP0		; 3
 	lda #{7}		; 2
 	sta GRP1		; 3 VDELed
-	lda #GBKCOLOR	; 2 playfield color
-	sta COLUPF		; 3 playfield color
+	lda #GBKCOLOR		; 2
+	sta COLUPF		; 3
 	lda #GCOL2		; 2
-	sta COLUP0		; 3 @39! end of GRP0a display
+	sta COLUP0		; 3 @39
 	lda #{5}		; 2
-	sta GRP0		; 3 @44! end of GRP1a display
+	sta GRP0		; 3 @44
 	lda #GCOL3		; 2
 	sta COLUP1		; 3 @49
 	stx GRP0		; 3 @52
 	sty COLUP0		; 3 @55<=@57
-	lda #$00		; 2 turn off playfield
+	lda #$00		; 2
 	sta COLUPF		; 3
 	lda #$80		; 2
 	sta HMP0		; 3
@@ -136,8 +135,6 @@ GBKCOLOR		equ $04
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 	org $F000
-
-;------------------------------------------------------------------------------
 ColdStart
 	sei
 	cld
@@ -150,7 +147,6 @@ ClearMem
 	dex
 	bne ClearMem
 
-	; RESP while still locked to ClearMem WSYNC — before RamKernel copy
 	lda #1
 	sta VDELP1
 
@@ -171,7 +167,6 @@ ClearMem
 	sta NUSIZ1
 
 	stx HMP0
-
 	lda #$20
 	sta HMP1
 
@@ -179,9 +174,9 @@ ClearMem
 	sta HMOVE
 
 	ldx #12
-.cold_wait
+.wait
 	dex
-	bne .cold_wait
+	bne .wait
 
 	sta HMCLR
 	nop
@@ -197,36 +192,74 @@ ClearMem
 	jmp RAM_BASE
 
 ;------------------------------------------------------------------------------
-; After preroll: restore the old busy/sta $82 cycle count so the first
-; visible pair still hits HMOVE at the same phase. Cart, A12-high, after SDIO.
-	org $F136
-PhasePad
-	ldx #9
-.pp	dex
-	bne .pp
-	bit 0
-	jmp RAM_BASE
-
 	org $F140
 CartPack
-	ds 35, 0
+	ds 32, 0
+
+; First 6 overscan lines: play 6 tail samples, copy 32 pack bytes into RIOT.
+	org $F160
+OsHead
+	lda #0
+	sta GRP0
+	sta GRP1
+	sta GRP0
+	ldx #0
+	ldy #5
+.os6
+	lda #0			; sample (zeros unless CartPack/this immediate is filled)
+	sta AUDV0
+	lda CARTPACK,x
+	sta PACK,x
+	inx
+	lda CARTPACK,x
+	sta PACK,x
+	inx
+	lda CARTPACK,x
+	sta PACK,x
+	inx
+	lda CARTPACK,x
+	sta PACK,x
+	inx
+	lda CARTPACK,x
+	sta PACK,x
+	inx
+	lda CARTPACK,x
+	sta PACK,x
+	inx
+	dey
+	sta WSYNC
+	bne .os6
+	lda #0
+	sta AUDV0
+	lda CARTPACK,x
+	sta PACK,x
+	inx
+	lda CARTPACK,x
+	sta PACK,x
+	inx
+	ldx SWCHA
+	lda $FE00,x
+	ldx SWCHB
+	lda $FE00,x
+	ldx INPT4
+	lda $FE00,x
+	ldx INPT5
+	lda $FE00,x
+	sta WSYNC
+	rts
 
 ;------------------------------------------------------------------------------
-; Copied to RIOT $80. jsr VisibleBars, play packed tail in OS/VS/VB (no cart),
-; copy next field's 35 bytes from $F140 during preroll (one byte per line).
+; Copied to RIOT $80. Remaining OS 23/24 + VS 3 + VB 37 from PACK. No preroll.
 	org $F200
 	rorg $80
 RamKernel
 	jsr VisibleBars
-
 	inc FIELD
 	lda FIELD
 	lsr
-	ldx #29
-	ldy #PREROLL
+	ldx #23
 	bcc .rk_even
 	inx
-	iny
 .rk_even
 	jsr Play
 	lda #2
@@ -240,32 +273,24 @@ RamKernel
 	jsr Play
 	stx VBLANK
 	stx AUDIDX
-
-.rk_pr
-	cpx #35
-	bcs .rk_ws
-	lda CARTPACK,x
-	sta PACK,x
-.rk_ws
-	inx
-	sta WSYNC
-	dey
-	bne .rk_pr
-
-	jmp PHASEPAD
+	ldx #7
+.rk_pad
+	dex
+	bne .rk_pad
+	nop
+	bit 0
+	jmp RAM_BASE
 
 Play
 	lda AUDIDX
 	lsr
-	sta PlayLoad+1		; self-mod lda PACK+index (Y stays preroll)
-PlayLoad
-	lda $00
+	tay
+	lda PACK,y
 	bcc .lo
 	lsr
 	lsr
 	lsr
 	lsr
-	.byte $2C
 .lo	and #$0F
 	sta AUDV0
 	inc AUDIDX
@@ -277,35 +302,37 @@ RamKernelEnd
 	rend
 
 ;------------------------------------------------------------------------------
-; Visible scanlines only — kernel macro + line0..end_lines unchanged.
-; SyncToRight in cart (same cycle phase as original HMCLR/nop/nop/line0 entry).
-	org $F09D
+; Upstream unrolled logo (github.com/lodefmode/moviecart kernel/core.asm).
+; Lives after the $F140/$F160/$F200 map so the pairs do not overlap it.
+	org $F280
 VisibleBars
-	sta WSYNC
-	ldx #6
-.vb_resp
+	; Same preroll as upstream (50 even / 51 odd) so the digits sit
+	; mid-screen. Last WSYNC + pad + first HMOVE are one scanline.
+	lda FIELD
+	lsr
+	ldx #PREROLL
+	bcc .even_pre
+	inx
+.even_pre
+	jsr WaitLines
+
+	; Cycle-match github.com/lodefmode/moviecart kernel/core.asm after
+	; preroll so right-line HMOVE is @3. DUMMY is $FD, not $80.
+	lda #0
+	sta DUMMY
+	sta DUMMY
+	sta DUMMY
+	sta DUMMY
+	ldx #7
+.busy_wait
 	dex
-	bne .vb_resp
+	bne .busy_wait
+	sta DUMMY
+	sta DUMMY
 	nop
-	ldx #$30
-	sta RESP0
-	nop
-	sta RESP1
-	stx HMP0
-	lda #$20
-	sta HMP1
-	sta WSYNC
-	sta HMOVE
-	ldx #12
-.vb_sync
-	dex
-	bne .vb_sync
-	sta HMCLR
-	nop
-	nop
+	jmp line0
 
 line0
-
 	kernel %01111100, %00110000, %01111100, %01111100, %00011100, %11111110, %01111100, %11111110, %01111100, %01111100
 	kernel %10000110, %01010000, %10000010, %10000010, %00100100, %10000000, %10000010, %00000010, %10000010, %10000010
 	kernel %10001010, %10010000, %00000100, %00000100, %01000100, %10000000, %10000000, %00000100, %10000010, %10000001
@@ -315,19 +342,23 @@ line0
 	kernel %01111100, %11111110, %11111110, %01111100, %00000100, %01111100, %01111100, %01000000, %01111100, %11111110
 
 end_lines
-
 	lda #0
 	sta GRP0
 	sta GRP1
 	sta GRP0
 
 	ldx #VISIBLE_LINES
-.vb_wait
+	jsr WaitLines
+	jmp OsHead
+
+WaitLines
 	sta WSYNC
 	dex
-	bne .vb_wait
-
+	bne WaitLines
 	rts
+
+	org $FE00
+	ds 256, 0		; lda $FE00,x (firmware gstore; unused here)
 
 	org $FFFA
 	.word ColdStart
