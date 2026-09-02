@@ -311,13 +311,9 @@ RamKernelEnd
 ; Lives after the $F140/$F160/$F200 map so the pairs do not overlap it.
 	org $F280
 VisibleBars
-	; preroll
-	lda FIELD
-	lsr
+	; preroll — always 50. The even/odd extra line is overscan
+	; (Play 23/24), not here; +1 here bobs the digits every field.
 	ldx #PREROLL
-	bcc .even_pre
-	inx
-.even_pre
 	jsr wait_lines
 
 	;; wait...
