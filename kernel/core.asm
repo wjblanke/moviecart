@@ -15,6 +15,7 @@
 	processor 6502
 	include vcs.h
 
+;user memory 128 to 255
 RAM_BASE	equ $80
 PACK		equ $D0		; 32 packed nibbles ($D0–$EF)
 FIELD		equ $FB		; even/odd (OS 23/24). Not $FE/$FF (jsr stack)
@@ -24,36 +25,36 @@ CARTPACK	equ $F140
 
 GAUDIO		equ #0
 KERNEL_PAIRS	equ 7
-NUM_LINES	equ 8		; upstream count (7 pairs; keeps VISIBLE_LINES)
+NUM_LINES	equ 8
 PREROLL		equ 50
 #if 1	; NTSC
 VISIBLE_TOTAL	equ 192
 VISIBLE_LINES	equ (VISIBLE_TOTAL - NUM_LINES*2 - PREROLL + 1)
-GCOL0			equ $42
-GCOL5			equ $36
-GCOL1			equ $EC
-GCOL6			equ $D8
-GCOL2			equ $72
-GCOL7			equ $64
-GCOL3			equ $B8
-GCOL8			equ $6C
-GCOL4			equ $06
-GCOL9			equ $0A
-GBKCOLOR		equ $02
-#else	; PAL
+GCOL0			equ $42	;red
+GCOL5			equ $36	;orange
+GCOL1			equ $EC	;yellow
+GCOL6			equ $D8	;light green
+GCOL2			equ $72	;blue
+GCOL7			equ $64	;purple
+GCOL3			equ $B8	;cyan
+GCOL8			equ $6C	;light purple
+GCOL4			equ $06	;dark grey
+GCOL9			equ $0A	;light grey
+GBKCOLOR		equ $02	;dark grey
+#else	; PAl
 VISIBLE_TOTAL	equ 242
 VISIBLE_LINES	equ (VISIBLE_TOTAL - NUM_LINES*2 - PREROLL + 1)
-GCOL0			equ $44
-GCOL5			equ $46
-GCOL1			equ $2C
-GCOL6			equ $36
-GCOL2			equ $B2
-GCOL7			equ $C4
-GCOL3			equ $9A
-GCOL8			equ $AC
-GCOL4			equ $F8
-GCOL9			equ $FC
-GBKCOLOR		equ $04
+GCOL0			equ $44	;red
+GCOL5			equ $46	;orange
+GCOL1			equ $2C	;yellow
+GCOL6			equ $36	;green
+GCOL2			equ $B2	;blue
+GCOL7			equ $C4	;purple
+GCOL3			equ $9A	;cyan
+GCOL8			equ $AC	;light purple
+GCOL4			equ $F8	;dark grey
+GCOL9			equ $FC	;light grey
+GBKCOLOR		equ $04	;dark grey
 #endif
 
 	seg
@@ -80,24 +81,24 @@ GBKCOLOR		equ $04
 	lda #{8}		; 2
 	sta GRP1		; 3 VDELed
 	lda #GBKCOLOR		; 2
-	sta COLUBK		; 3
+	sta COLUBK		; 3 background color
 	lda #GCOL7		; 2
-	sta COLUP0		; 3 @42
+	sta COLUP0		; 3 @42! end of GRP0a display
 	lda #{6}		; 2
-	sta GRP0		; 3 @47
+	sta GRP0		; 3 @47! end of GRP1a display
 	lda #GCOL8		; 2
 	sta COLUP1		; 3 @52
 	stx GRP0		; 3 @55
 	sty COLUP0		; 3 @58<=@60
-	lda #$00		; 2
-	sta COLUBK		; 3
+	lda #$00		; 2 turn off background color
+	sta COLUBK		; 3 background color
 	sta HMCLR		; 3
 
 	; left_line
 
 	lda #$00		; 2 dummy
 	lda #{3}		; 2
-	sta HMOVE		; late hmove @71
+	sta HMOVE		;back 8, late hmove ;needs to be on cycle 71
 	sta GRP1		; 3 VDELed
 	lda #GCOL1		; 2
 	sta COLUP1		; 3
@@ -111,17 +112,17 @@ GBKCOLOR		equ $04
 	sta COLUP0		; 3
 	lda #{7}		; 2
 	sta GRP1		; 3 VDELed
-	lda #GBKCOLOR		; 2
-	sta COLUPF		; 3
+	lda #GBKCOLOR		; 2 playfield color
+	sta COLUPF		; 3 playfield color
 	lda #GCOL2		; 2
-	sta COLUP0		; 3 @39
+	sta COLUP0		; 3 @39! end of GRP0a display
 	lda #{5}		; 2
-	sta GRP0		; 3 @44
+	sta GRP0		; 3 @44! end of GRP1a display
 	lda #GCOL3		; 2
 	sta COLUP1		; 3 @49
 	stx GRP0		; 3 @52
 	sty COLUP0		; 3 @55<=@57
-	lda #$00		; 2
+	lda #$00		; 2 turn off playfield
 	sta COLUPF		; 3
 	lda #$80		; 2
 	sta HMP0		; 3
@@ -141,6 +142,7 @@ ColdStart
 	ldx #$FF
 	txs
 
+	;zero memory
 	lda #0
 ClearMem
 	sta 0,x
@@ -157,26 +159,27 @@ ClearMem
 	lda #$CC
 	sta PF2
 
-	ldx #$30
+	ldx #$30		; going into HMP0 later
 	sta RESP0
 	nop
 	sta RESP1
-	lda #$06
+	lda #$06		;3 copies medium
 	sta NUSIZ0
-	lda #$02
+	lda #$02		;2 copies medium
 	sta NUSIZ1
 
 	stx HMP0
 	lda #$20
 	sta HMP1
 
+	; HMOVE needs to be after WSYNC here
 	sta WSYNC
 	sta HMOVE
 
 	ldx #12
-.wait
+.wait_cnt
 	dex
-	bne .wait
+	bne .wait_cnt
 
 	sta HMCLR
 	nop
@@ -257,16 +260,18 @@ RamKernel
 	inc FIELD
 	lda FIELD
 	lsr
-	ldx #23
+	ldx #23			; overscan
 	bcc .rk_even
 	inx
 .rk_even
 	jsr Play
+	; vsync 3
 	lda #2
 	sta VSYNC
 	ldx #3
 	jsr Play
 	stx VSYNC
+	; vblank 37
 	lda #2
 	sta VBLANK
 	ldx #37
@@ -306,30 +311,32 @@ RamKernelEnd
 ; Lives after the $F140/$F160/$F200 map so the pairs do not overlap it.
 	org $F280
 VisibleBars
-	; Same preroll as upstream (50 even / 51 odd) so the digits sit
-	; mid-screen. Last WSYNC + pad + first HMOVE are one scanline.
+	; preroll
 	lda FIELD
 	lsr
 	ldx #PREROLL
 	bcc .even_pre
 	inx
 .even_pre
-	jsr WaitLines
+	jsr wait_lines
 
-	; Cycle-match github.com/lodefmode/moviecart kernel/core.asm after
-	; preroll so right-line HMOVE is @3. DUMMY is $FD, not $80.
+	;; wait...
+
 	lda #0
 	sta DUMMY
 	sta DUMMY
 	sta DUMMY
 	sta DUMMY
+
 	ldx #7
-.busy_wait
+busy_wait
 	dex
-	bne .busy_wait
+	bne busy_wait
+
 	sta DUMMY
 	sta DUMMY
 	nop
+
 	jmp line0
 
 line0
@@ -342,25 +349,28 @@ line0
 	kernel %01111100, %11111110, %11111110, %01111100, %00000100, %01111100, %01111100, %01000000, %01111100, %11111110
 
 end_lines
+
+	;clear
 	lda #0
 	sta GRP0
 	sta GRP1
 	sta GRP0
 
 	ldx #VISIBLE_LINES
-	jsr WaitLines
+	jsr wait_lines
 	jmp OsHead
 
-WaitLines
+wait_lines
 	sta WSYNC
 	dex
-	bne WaitLines
+	bne wait_lines
 	rts
 
 	org $FE00
 	ds 256, 0		; lda $FE00,x (firmware gstore; unused here)
 
 	org $FFFA
-	.word ColdStart
-	.word ColdStart
-	.word ColdStart
+reset_loop
+	.word ColdStart	;NMI
+	.word ColdStart	;RESET
+	.word ColdStart	;IRQ/BRK
