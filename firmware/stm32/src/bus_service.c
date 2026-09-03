@@ -71,6 +71,10 @@ emulate_cartridge(void)
 			while (ADDR_IN == addr) ;
 			SET_DATA_MODE_IN
 		}
+		else if (mc_swap_pending)
+		{ /* First A12-low cycle after OsHead enters long RIOT blanking. */
+			mc_service_blanking_work();
+		}
 	}
 }
 
@@ -133,6 +137,10 @@ bus_serve_cycle(void)
 #endif
 		while (ADDR_IN == addr) ;
 		SET_DATA_MODE_IN
+	}
+	else if (mc_swap_pending)
+	{
+		mc_service_blanking_work();
 	}
 	probe_exit();
 }

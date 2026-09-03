@@ -284,6 +284,7 @@ RamKernel
 	bne .rk_pad
 	nop
 	bit 0
+	bit 0
 	jmp RAM_BASE
 
 Play

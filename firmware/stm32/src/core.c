@@ -14,16 +14,16 @@
  *   $F09E–$F116  right/left pair, jmp $F09E until lines == 0
  *   $F140–$F15F  32-byte packed tail (after the 6 cart overscan samples)
  *   $F160–$F1C1  overscan head: 5×6 + 2 copy, 6 AUDV0, joystick, WSYNC, RTS
- *   $F200+       RamKernel source (76 bytes, copied to $80)
+ *   $F200+       RamKernel source (78 bytes, copied to $80)
  *   $FE00–$FEFF  gstore (SWCHA/SWCHB/INPT4/INPT5)
  *   $FFFA–$FFFF  reset → $F000
  *
  * Last picture pair jmps $F160 (same 3-cycle jmp as the loop). Joystick sits
  * on the 6th cart line, then WSYNC, so RTS + first Play stay under 76 cycles.
- * After VBLANK, an in-RIOT pad (ldx #7 / nop / bit $00) matches the working
+ * After VBLANK, an in-RIOT pad (ldx #7 / nop / 2×bit $00) matches the working
  * title-kernel arrival at $F09E. A12 stays low until jsr VisibleBars.
  *
- * RIOT after copy: kernel $80–$CB, pack $D0–$EF, FIELD $FB, AUDIDX $FC.
+ * RIOT after copy: kernel $80–$CD, pack $D0–$EF, FIELD $FB, AUDIDX $FC.
  * $FE/$FF are the 6502 stack (jsr VisibleBars / jsr Play). Do not store
  * FIELD or AUDIDX there. No preroll.
  *
@@ -33,7 +33,9 @@
 #define MC_OFF_BOOT_END		0x04au
 #define MC_OFF_VISIBLE_ENTRY	0x09du
 #define ADDR_RIGHT_LINE		0x9eu
+#define ADDR_RIGHT_LINE_HI	0xf0u
 #define ADDR_END_LINES		0x60u
+#define ADDR_END_LINES_HI	0xf1u
 #define MC_OFF_PACK		0x140u
 #define MC_RIOT_PACK		0xd0u
 #define MC_AUD_HEAD_LINES	6u
@@ -91,9 +93,10 @@ volatile uint8_t	mc_blanking_window;
 volatile uint16_t	mc_blanking_window_gen;
 volatile uint8_t	mc_sdio_gate_relaxed;
 volatile uint8_t	mc_playback_pipeline;
+volatile uint8_t	mc_swap_pending;
 
 /*
- * ColdStart only ($F000–$F04A). Copies 76 bytes from $F200 → $80, jmp $80.
+ * ColdStart only ($F000–$F04A). Copies 78 bytes from $F200 → $80, jmp $80.
  * TIA/RESP/HMOVE setup is unchanged; the copy source is the RamKernel image.
  */
 static const uint8_t mc_boot_rom[MC_OFF_BOOT_END + 1]
@@ -101,7 +104,7 @@ static const uint8_t mc_boot_rom[MC_OFF_BOOT_END + 1]
 	0x78, 0xd8, 0xa2, 0xff, 0x9a, 0xa9, 0x00, 0x95, 0x00, 0xca, 0xd0, 0xfb, 0xa9, 0x01, 0x85, 0x26,
 	0xa9, 0xcf, 0x85, 0x0d, 0xa9, 0x33, 0x85, 0x0e, 0xa9, 0xcc, 0x85, 0x0f, 0xa2, 0x30, 0x85, 0x10,
 	0xea, 0x85, 0x11, 0xa9, 0x06, 0x85, 0x04, 0xa9, 0x02, 0x85, 0x05, 0x86, 0x20, 0xa9, 0x20, 0x85,
-	0x21, 0x85, 0x02, 0x85, 0x2a, 0xa2, 0x0c, 0xca, 0xd0, 0xfd, 0x85, 0x2b, 0xea, 0xea, 0xa2, 0x4b,
+	0x21, 0x85, 0x02, 0x85, 0x2a, 0xa2, 0x0c, 0xca, 0xd0, 0xfd, 0x85, 0x2b, 0xea, 0xea, 0xa2, 0x4d,
 	0xbd, 0x00, 0xf2, 0x95, 0x80, 0xca, 0x10, 0xf8, 0x4c, 0x80, 0x00
 };
 
@@ -123,17 +126,18 @@ static const uint8_t mc_oshead[] __attribute__((section(".ccmram"))) = {
 
 /*
  * RamKernel at RIOT $80. Remaining OS 23/24 + VS 3 + VB 37 from pack at $D0
- * (A12 low). Play is a plain nibble unpack (no BIT-skip). Phase pad is in
- * RIOT after VBLANK off. Even: 63 nibbles (drop 64th). Odd: 64.
+ * (A12 low). Play is a plain nibble unpack (no BIT-skip). The phase pad after
+ * VBLANK off makes the first visible HMOVE land three cycles later, at the
+ * phase expected by the visible kernel. Even: 63 nibbles (drop 64th). Odd: 64.
  */
 static const uint8_t mc_ram_kernel[] __attribute__((section(".ccmram"))) = {
 	0x20, 0x9d, 0xf0, 0xe6, 0xfb, 0xa5, 0xfb, 0x4a, 0xa2, 0x17, 0x90, 0x01,
-	0xe8, 0x20, 0xb3, 0x00, 0xa9, 0x02, 0x85, 0x00, 0xa2, 0x03, 0x20, 0xb3,
-	0x00, 0x86, 0x00, 0xa9, 0x02, 0x85, 0x01, 0xa2, 0x25, 0x20, 0xb3, 0x00,
+	0xe8, 0x20, 0xb5, 0x00, 0xa9, 0x02, 0x85, 0x00, 0xa2, 0x03, 0x20, 0xb5,
+	0x00, 0x86, 0x00, 0xa9, 0x02, 0x85, 0x01, 0xa2, 0x25, 0x20, 0xb5, 0x00,
 	0x86, 0x01, 0x86, 0xfc, 0xa2, 0x07, 0xca, 0xd0, 0xfd, 0xea, 0x24, 0x00,
-	0x4c, 0x80, 0x00, 0xa5, 0xfc, 0x4a, 0xa8, 0xb9, 0xd0, 0x00, 0x90, 0x04,
-	0x4a, 0x4a, 0x4a, 0x4a, 0x29, 0x0f, 0x85, 0x19, 0xe6, 0xfc, 0x85, 0x02,
-	0xca, 0xd0, 0xe8, 0x60
+	0x24, 0x00, 0x4c, 0x80, 0x00, 0xa5, 0xfc, 0x4a, 0xa8, 0xb9, 0xd0, 0x00,
+	0x90, 0x04, 0x4a, 0x4a, 0x4a, 0x4a, 0x29, 0x0f, 0x85, 0x19, 0xe6, 0xfc,
+	0x85, 0x02, 0xca, 0xd0, 0xe8, 0x60
 };
 
 /* Writable; cannot share .ccmram with the const boot/kernel images. */
@@ -174,6 +178,7 @@ coreInit(void)
 	mc_blanking_window_gen = 0;
 	mc_sdio_gate_relaxed = 0;
 	mc_playback_pipeline = 0;
+	mc_swap_pending = 0;
 
 	r_coreInfo.mr_swcha = 0xff;
 	r_coreInfo.mr_swchb = 0xff;
@@ -182,6 +187,7 @@ coreInit(void)
 
 	r_coreInfo.lines = 190;
 	r_coreInfo.nextLineJump = ADDR_RIGHT_LINE;
+	r_coreInfo.nextLineJumpHi = ADDR_RIGHT_LINE_HI;
 	r_coreInfo.storeAddress = &r_coreInfo.mr_swcha;
 	r_coreInfo.data = 0;
 
@@ -294,14 +300,31 @@ mc_audio_skip_blanking(void)
 static void
 mc_on_visible_bars_entry(void)
 {
-	if (!mc_playback_pipeline)
-		mc_field_swap_to_display();
 	mc_audio_begin_visible();
 	if (r_coreInfo.frameInfo.visibleLines)
 		r_coreInfo.lines = r_coreInfo.frameInfo.visibleLines;
 	r_coreInfo.nextLineJump = ADDR_RIGHT_LINE;
+	r_coreInfo.nextLineJumpHi = ADDR_RIGHT_LINE_HI;
 	mc_blanking_window = 0;
 	mc_visible_bars_vended = 1;
+}
+
+/*
+ * The title and NO_SD paths need a field swap once per frame, but the swap
+ * copies pointer state and repacks blanking audio. Running that work while
+ * serving $F09D overruns the next cart fetches at $F09E. Defer it until the
+ * first A12-low cycle after OsHead's RTS, when the 6507 has entered the long
+ * RIOT-only blanking kernel.
+ */
+void
+mc_service_blanking_work(void)
+{
+	if (!mc_swap_pending)
+		return;
+
+	mc_swap_pending = 0;
+	if (!mc_playback_pipeline)
+		mc_field_swap_to_display();
 }
 
 static void
@@ -312,6 +335,7 @@ mc_on_visible_bars_rts(void)
 	mc_blanking_window = 1;
 	mc_blanking_window_gen++;
 	mc_visible_bars_vended = 0;
+	mc_swap_pending = 1;
 	mc_audio_skip_blanking();
 
 	/* Last pair does not increment frameLines (jmp to stub instead). */
@@ -325,6 +349,7 @@ mc_on_visible_bars_rts(void)
 	if (expect)
 		r_coreInfo.lines = expect;
 	r_coreInfo.nextLineJump = ADDR_RIGHT_LINE;
+	r_coreInfo.nextLineJumpHi = ADDR_RIGHT_LINE_HI;
 }
 
 
@@ -920,8 +945,10 @@ g0xb0:
 	SET_DATA(0x85);	// sta HMP0 	// 3
 	if (r_coreInfo.lines == 0) {
 		r_coreInfo.nextLineJump = ADDR_END_LINES;
+		r_coreInfo.nextLineJumpHi = ADDR_END_LINES_HI;
 	} else if (LINES_EXHAUSTED(r_coreInfo.lines)) {
 		r_coreInfo.nextLineJump = ADDR_END_LINES;
+		r_coreInfo.nextLineJumpHi = ADDR_END_LINES_HI;
 		DIAG_NOTE(DIAG_WRAP_VISIBLE);
 	} else {
 		r_coreInfo.frameInfo.graphBuf += 10;
@@ -951,7 +978,7 @@ g0xb5:
 	EMULATE_DONE
 
 g0xb6:
-	SET_DATA(0xf0);
+	SET_DATA(r_coreInfo.nextLineJumpHi);
 	EMULATE_DONE
 
 /* leftover $F117–$F135: unused; last pair jmps $F160 */

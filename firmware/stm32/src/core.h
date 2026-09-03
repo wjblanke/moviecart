@@ -31,6 +31,7 @@ struct coreInfo
 
 	volatile uint_fast8_t	lines;
 	uint_fast8_t	nextLineJump;
+	uint_fast8_t	nextLineJumpHi;
 	uint_fast8_t	data;
 	volatile uint_fast8_t	*storeAddress;
 
@@ -76,5 +77,8 @@ extern volatile uint8_t		mc_blanking_window;
 extern volatile uint16_t	mc_blanking_window_gen;
 extern volatile uint8_t		mc_sdio_gate_relaxed;
 extern volatile uint8_t		mc_playback_pipeline;
+extern volatile uint8_t		mc_swap_pending;
+
+void				mc_service_blanking_work(void);
 
 #endif
