@@ -9,7 +9,7 @@
  * looping kernel (firmware/core.c g0x3e–g0xb6). Blanking is RamKernel
  * copied to RIOT $80 at ColdStart (source image at $F200).
  *
- *   $F000–$F04A  ColdStart (copy $F200 → $80, jmp $80)
+ *   $F000–$F053  ColdStart (copy $F200 → $80, WSYNC + pad, jmp $80)
  *   $F09D        nop — VisibleBars entry (once per jsr from RIOT)
  *   $F09E–$F116  right/left pair, jmp $F09E until lines == 0
  *   $F140–$F15F  32-byte packed tail (after the 6 cart overscan samples)
@@ -21,7 +21,9 @@
  * Last picture pair jmps $F160 (same 3-cycle jmp as the loop). Joystick sits
  * on the 6th cart line, then WSYNC, so RTS + first Play stay under 76 cycles.
  * After VBLANK, an in-RIOT pad (ldx #7 / nop / 2×bit $00) matches the working
- * title-kernel arrival at $F09E. A12 stays low until jsr VisibleBars.
+ * title-kernel arrival at $F09E. A12 stays low until jsr VisibleBars. That pad
+ * only runs from frame 2 on, so ColdStart carries its own copy of the same
+ * arrival for frame 1.
  *
  * RIOT after copy: kernel $80–$CD, pack $D0–$EF, FIELD $FB, AUDIDX $FC.
  * $FE/$FF are the 6502 stack (jsr VisibleBars / jsr Play). Do not store
@@ -30,7 +32,7 @@
  * jmp high byte is $F0 (not original $FF): 12-bit decode does not mirror
  * $FFxx onto $F0xx.
  */
-#define MC_OFF_BOOT_END		0x04au
+#define MC_OFF_BOOT_END		0x053u
 #define MC_OFF_VISIBLE_ENTRY	0x09du
 #define ADDR_RIGHT_LINE		0x9eu
 #define ADDR_RIGHT_LINE_HI	0xf0u
@@ -96,8 +98,18 @@ volatile uint8_t	mc_playback_pipeline;
 volatile uint8_t	mc_swap_pending;
 
 /*
- * ColdStart only ($F000–$F04A). Copies 78 bytes from $F200 → $80, jmp $80.
+ * ColdStart only ($F000–$F053). Copies 78 bytes from $F200 → $80, jmp $80.
  * TIA/RESP/HMOVE setup is unchanged; the copy source is the RamKernel image.
+ *
+ * The tail at $F048 (sta WSYNC / ldx #11 / dex / bne / nop / nop) is the only
+ * sync between the WSYNC at $F031 and the first visible line. Without it the
+ * copy loop's length — which follows the RamKernel image size — set frame 1's
+ * HMOVE phase: the left line's HMOVE landed mid-line instead of at cycle 71
+ * and lost the "back 8" that cancels the right line's +8. RESP0/RESP1 never
+ * run again, so those 8 pixels per pair became the picture's column for the
+ * rest of the run — 96 pairs, 768 pixels, 128 after the counter wraps. The 60
+ * cycles of pad are what the RamKernel tail leaves before its own jmp, so
+ * frame 1 arrives at $F09E exactly where every later frame does.
  */
 static const uint8_t mc_boot_rom[MC_OFF_BOOT_END + 1]
 	__attribute__((section(".ccmram"))) = {
@@ -105,7 +117,8 @@ static const uint8_t mc_boot_rom[MC_OFF_BOOT_END + 1]
 	0xa9, 0xcf, 0x85, 0x0d, 0xa9, 0x33, 0x85, 0x0e, 0xa9, 0xcc, 0x85, 0x0f, 0xa2, 0x30, 0x85, 0x10,
 	0xea, 0x85, 0x11, 0xa9, 0x06, 0x85, 0x04, 0xa9, 0x02, 0x85, 0x05, 0x86, 0x20, 0xa9, 0x20, 0x85,
 	0x21, 0x85, 0x02, 0x85, 0x2a, 0xa2, 0x0c, 0xca, 0xd0, 0xfd, 0x85, 0x2b, 0xea, 0xea, 0xa2, 0x4d,
-	0xbd, 0x00, 0xf2, 0x95, 0x80, 0xca, 0x10, 0xf8, 0x4c, 0x80, 0x00
+	0xbd, 0x00, 0xf2, 0x95, 0x80, 0xca, 0x10, 0xf8, 0x85, 0x02, 0xa2, 0x0b, 0xca, 0xd0, 0xfd, 0xea,
+	0xea, 0x4c, 0x80, 0x00
 };
 
 /*
