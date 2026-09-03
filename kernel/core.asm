@@ -27,6 +27,16 @@ GAUDIO		equ #0
 KERNEL_PAIRS	equ 7
 NUM_LINES	equ 8
 PREROLL		equ 50
+
+; FW_ENTRY=1 drops VisibleBars' top preroll so line0 is reached the way the
+; firmware reaches it: jsr from the RamKernel onto a nop, straight into the
+; first pair. The preroll's line budget is spent after the logo instead, so
+; the frame keeps its 264/263 line count. FW_ENTRY=0 (default) is upstream.
+; Build: make fw   (dasm -DFW_ENTRY=1)
+#ifconst FW_ENTRY
+#else
+FW_ENTRY	equ 0
+#endif
 #if 1	; NTSC
 VISIBLE_TOTAL	equ 192
 VISIBLE_LINES	equ (VISIBLE_TOTAL - NUM_LINES*2 - PREROLL + 1)
@@ -192,6 +202,22 @@ ClearMem
 	dex
 	bpl .copy
 
+	; The copy loop is the only thing between the WSYNC above and line0 of the
+	; first frame, and its length follows the RamKernel image size, so frame 1
+	; used to enter the pairs 38 cycles late. The left line's HMOVE then landed
+	; mid-line instead of at 71 and lost the "back 8" that cancels the right
+	; line's +8, leaking 8 pixels per pair. RESP0/RESP1 never run again, so
+	; that leak became the logo's column for the rest of the run. Re-sync and
+	; pad the 60 cycles the RamKernel tail leaves before its own jmp, so frame
+	; 1 arrives exactly where every later frame does.
+	sta WSYNC
+	ldx #11			; 2 + 54
+.boot_pad
+	dex
+	bne .boot_pad
+	nop			; 2
+	nop			; 2 = 60
+
 	jmp RAM_BASE
 
 ;------------------------------------------------------------------------------
@@ -312,6 +338,10 @@ RamKernelEnd
 ; Lives after the $F140/$F160/$F200 map so the pairs do not overlap it.
 	org $F280
 VisibleBars
+#if FW_ENTRY
+	; Matches core.c serving $F09D as nop with line0 at $F09E.
+	nop
+#else
 	; preroll — always 50. The even/odd extra line is overscan
 	; (Play 23/24), not here; +1 here bobs the digits every field.
 	ldx #PREROLL
@@ -335,6 +365,7 @@ busy_wait
 	nop
 
 	jmp line0
+#endif
 
 line0
 	kernel %01111100, %00110000, %01111100, %01111100, %00011100, %11111110, %01111100, %11111110, %01111100, %01111100
@@ -355,6 +386,14 @@ end_lines
 
 	ldx #VISIBLE_LINES
 	jsr wait_lines
+#if FW_ENTRY
+	; Preroll was not spent at the top, so spend it here. The +1 replaces the
+	; partial line that the top preroll's first WSYNC used to absorb; without
+	; it the frame is 263/262 against core.bin's 264/263. wait_lines is
+	; WSYNC'd, so none of this can shift the HMOVE phase.
+	ldx #(PREROLL+1)
+	jsr wait_lines
+#endif
 	jmp OsHead
 
 wait_lines
