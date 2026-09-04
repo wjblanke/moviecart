@@ -439,6 +439,38 @@ make flash                      # st-flash, if installed
 
 Override toolchain: `make TOOLCHAIN=/path/to/arm-none-eabi/bin`
 
+### Standalone on-target SD test harness
+
+The standalone harness runs the real SDIO, DMA, Petit FatFs, field parsing, and
+transport/update paths on the STM32 without reading or driving the Atari bus.
+The Atari synchronization/yield calls become no-ops; required SD initialization
+delays still use the DWT cycle counter.
+
+```bash
+make standalone-test
+# build/standalone_test.elf, .bin, and .hex
+make flash-standalone-test      # st-flash, if installed
+```
+
+Load `build/standalone_test.elf` in the STM32 debugger and set a breakpoint on
+`moviecart_test_checkpoint`. Each stop occurs immediately before the operation
+named by `mc_test_step`. Success and failure end in `moviecart_test_halt` with a
+`BKPT`, so GDB stops instead of spinning. The build uses `-Og -g3 -fno-inline`
+so calls can be stepped into.
+
+Debugger-visible results:
+
+- `mc_test_step` — current `enum moviecart_test_step`
+- `mc_test_error` and `mc_test_detail` — failure reason and associated sector/value
+- `mc_test_sector`, `mc_test_num_frames`, `mc_test_visible_lines`,
+  `mc_test_field_blocks` — values discovered from the card and movie
+- `mc_test_completed` — set to 1 after the full synchronous and asynchronous path
+
+The SD card must contain at least one MovieCart file, as for normal firmware.
+Breakpoints are safest at harness checkpoints or function entry. Halting for a
+long time in the middle of an active SDIO command can allow the peripheral/card
+transaction to finish while the CPU is stopped.
+
 ### Reference and diagnostic builds
 
 | Make flag | Purpose |

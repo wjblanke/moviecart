@@ -46,6 +46,26 @@ SOURCES = \
 	src/update.c \
 	src/title_data.c
 
+STANDALONE_SOURCES = \
+	src/startup_stm32f40xx.s \
+	src/system_stm32f4xx.c \
+	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_rcc.c \
+	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_gpio.c \
+	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_dma.c \
+	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_sdio.c \
+	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_flash.c \
+	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_exti.c \
+	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_syscfg.c \
+	Libraries/STM32F4xx_StdPeriph_Driver/src/misc.c \
+	Libraries/tm_stm32f4_gpio/tm_stm32f4_gpio.c \
+	Libraries/tm_stm32f4_fatfs/fatfs/drivers/fatfs_sd_sdio.c \
+	src/standalone_test.c \
+	src/standalone_bus.c \
+	src/sd_reader.c \
+	src/pff.c \
+	src/frame.c \
+	src/update.c
+
 INCLUDES = \
 	-Isrc \
 	-ILibraries/CMSIS/Include \
@@ -57,11 +77,18 @@ INCLUDES = \
 	-ILibraries/tm_stm32f4_gpio
 
 OBJECTS = $(addprefix $(BUILDDIR)/, $(addsuffix .o, $(basename $(SOURCES))))
+STANDALONE_BUILDDIR = build/standalone
+STANDALONE_DEPDIR = .depend/standalone
+STANDALONE_OBJECTS = $(addprefix $(STANDALONE_BUILDDIR)/, $(addsuffix .o, $(basename $(STANDALONE_SOURCES))))
 
 ELF = $(BUILDDIR)/firmware.elf
 HEX = $(BUILDDIR)/firmware.hex
 BIN = $(BUILDDIR)/firmware.bin
 MAP = $(BUILDDIR)/firmware.map
+STANDALONE_ELF = $(BUILDDIR)/standalone_test.elf
+STANDALONE_HEX = $(BUILDDIR)/standalone_test.hex
+STANDALONE_BIN = $(BUILDDIR)/standalone_test.bin
+STANDALONE_MAP = $(BUILDDIR)/standalone_test.map
 
 # Bus stall budget measurement builds (see README):
 #   make STALL_TEST=1   coarse sweep, 0-64 us
@@ -159,6 +186,24 @@ CFLAGS = \
 	-fdata-sections \
 	$(INCLUDES)
 
+STANDALONE_CFLAGS = \
+	-MT $@ -MMD -MP -MF $(STANDALONE_DEPDIR)/$*.d \
+	$(DEFS) \
+	-DMOVIECART_ENABLE_SD=1 \
+	-DMOVIECART_STANDALONE_TEST=1 \
+	$(FREESTANDING) \
+	-Og -g3 -fno-inline \
+	-mcpu=cortex-m4 -mthumb \
+	-mfpu=fpv4-sp-d16 -mhard-float \
+	-DSTM32F4XX \
+	-DSTM32F40XX \
+	-DUSE_STM32F4_DISCOVERY \
+	-DHSE_VALUE=8000000 \
+	-DUSE_STDPERIPH_DRIVER \
+	-ffunction-sections \
+	-fdata-sections \
+	$(INCLUDES)
+
 LDSCRIPT = stm32f4_flash.ld
 LDFLAGS += \
 	-T$(LDSCRIPT) \
@@ -168,8 +213,10 @@ LDFLAGS += \
 	-Wl,--gc-sections \
 	-Wl,-Map=$(MAP)
 
-.PHONY: all bin elf hex flash clean check-toolchain
+.PHONY: all bin elf hex standalone-test flash flash-standalone-test clean check-toolchain
 all: check-toolchain bin hex
+
+standalone-test: check-toolchain $(STANDALONE_BIN) $(STANDALONE_HEX)
 
 check-toolchain:
 	@test -x $(CC) || { \
@@ -197,6 +244,17 @@ $(HEX): $(ELF)
 $(ELF): $(OBJECTS) $(LDSCRIPT)
 	$(LD) $(LDFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
 
+$(STANDALONE_BIN): $(STANDALONE_ELF)
+	$(OBJCOPY) -O binary $< $@
+
+$(STANDALONE_HEX): $(STANDALONE_ELF)
+	$(OBJCOPY) -O ihex $< $@
+
+$(STANDALONE_ELF): $(STANDALONE_OBJECTS) $(LDSCRIPT)
+	$(LD) -T$(LDSCRIPT) -mthumb -mcpu=cortex-m4 -mhard-float \
+		--specs=nosys.specs -Wl,--gc-sections -Wl,-Map=$(STANDALONE_MAP) \
+		-o $@ $(STANDALONE_OBJECTS) $(LDLIBS)
+
 $(BUILDDIR)/src/core.o: src/core.c
 	mkdir -p $(dir $@)
 	mkdir -p .depend/build/src
@@ -220,10 +278,24 @@ $(BUILDDIR)/%.o: %.s
 	mkdir -p $(dir $@)
 	$(CC) -c $(CFLAGS) $< -o $@
 
+$(STANDALONE_BUILDDIR)/%.o: %.c
+	mkdir -p $(dir $@)
+	mkdir -p $(STANDALONE_DEPDIR)/$(dir $*)
+	$(CC) -c $(STANDALONE_CFLAGS) $< -o $@
+
+$(STANDALONE_BUILDDIR)/%.o: %.s
+	mkdir -p $(dir $@)
+	mkdir -p $(STANDALONE_DEPDIR)/$(dir $*)
+	$(CC) -c $(STANDALONE_CFLAGS) $< -o $@
+
 flash: $(BIN)
 	$(STFLASH) write $(BIN) 0x8000000
+
+flash-standalone-test: $(STANDALONE_BIN)
+	$(STFLASH) write $(STANDALONE_BIN) 0x8000000
 
 clean:
 	rm -rf $(BUILDDIR) .depend
 
 include $(wildcard $(patsubst %,$(DEPDIR)/%.d,$(basename $(SOURCES))))
+include $(wildcard $(patsubst %,$(STANDALONE_DEPDIR)/%.d,$(basename $(STANDALONE_SOURCES))))
