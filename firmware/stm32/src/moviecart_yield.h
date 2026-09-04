@@ -4,16 +4,27 @@
 #include <stdint.h>
 
 /*
- * Serve one Atari cart cycle during visible, or during blanking only when A12
- * is high (cart addressed — includes $F09D that ends blanking). Skip serve on
- * A12-low cycles during blanking so SDIO wait loops run faster.
+ * Give the bus back.
+ *   mc_sd_strict && !relaxed  — mount/open: serve until the next $F1C1
+ *   otherwise                 — one cycle; if visible, drain to this $F1C1
+ * Title copy and LED waits are not strict.
  */
 void moviecart_bus_yield(void);
 
+/* Tight-serve until mc_blanking_window (may be mid-window). Playback only. */
+void moviecart_wait_blanking(void);
+
+/*
+ * Tight-serve until the next $F1C1. Always a brand-new blanking period, never
+ * the leftover of the current one. Use this for mount/open/init; duration
+ * does not matter.
+ */
+void moviecart_wait_blanking_start(void);
+
 /*
  * Block until SDIO may run:
- *   - default: fresh mc_blanking_window_gen edge (mount, probe, select)
- *   - mc_sdio_gate_relaxed: mc_blanking_window set (playback field load only)
+ *   - default: moviecart_wait_blanking_start()
+ *   - mc_sdio_gate_relaxed: already in this blanking (playback field load)
  */
 void moviecart_sdio_gate(void);
 
@@ -29,7 +40,7 @@ void moviecart_sdio_gate(void);
  */
 void moviecart_bus_pump(void (*work)(void));
 
-/* DWT-timed delay that keeps yielding; replaces Delayms under IRQ-off serving. */
+/* DWT-timed delay that keeps yielding. */
 void moviecart_delay_ms(uint32_t ms);
 
 #endif /* MOVIECART_YIELD_H */

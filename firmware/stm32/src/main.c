@@ -1,9 +1,9 @@
 /**
  * MovieCart on DevEBox STM32F407VGT6
  *
- * The Atari is served by UnoCart's polling loop with interrupts off for the
- * entire run. SDIO/DMA completion is polled manually in the driver; every SD
- * wait yields back into bus_serve_cycle() so RamKernel keeps running on the 6502.
+ * The Atari is served by UnoCart's polling loop. No IRQs: SDIO/DMA completion
+ * is polled in the driver; every SD wait yields back into bus_serve_cycle()
+ * so RamKernel keeps running on the 6502.
  */
 /* make NO_SD=1 builds the title-only baseline: the known-good reference. */
 #ifndef MOVIECART_ENABLE_SD
@@ -28,7 +28,6 @@
 #include "update.h"
 #include "title_data.h"
 #include "sd_reader.h"
-#include "tm_stm32f4_delay.h"
 
 extern struct coreInfo r_coreInfo;
 extern struct fileSystemInfo fsInfo;
@@ -58,7 +57,7 @@ static void
 waitEndFrame(void)
 {
 	while (!r_coreInfo.mr_endFrame)
-		bus_serve_cycle();
+		moviecart_bus_yield();
 	r_coreInfo.mr_endFrame = 0;
 }
 
@@ -117,25 +116,14 @@ led_wait_frames(unsigned frames)
  * diagnostic that becomes unreadable in the failure case is no diagnostic.
  *
  * DWT is independent of the kernel, so the code stays countable no matter how
- * badly the display has desynced. The catch that made blinks dangerous before was
- * never the clock source, it was *what runs between serves*: reading a counter
- * after every serve is per-cycle work, and over the ~700k cycles of a blink that
- * is enough to jam the 6507. So the deadline is sampled once per LED_CHECK_EVERY
- * serves, leaving the hot loop byte-identical to the baseline's — the same
- * arrangement wait_title_sync already uses successfully.
+ * badly the display has desynced. The deadline is sampled only on A12-low
+ * (bus_serve_ms), so cart cycles stay identical to emulate_cartridge().
  */
-#define LED_CHECK_EVERY	256u		/* ~214 us between samples */
 
 static void
 led_wait_ms(uint32_t ms)
 {
-	uint32_t start = DWT->CYCCNT;
-	uint32_t limit = (SystemCoreClock / 1000u) * ms;
-
-	do {
-		for (unsigned i = 0; i < LED_CHECK_EVERY; i++)
-			bus_serve_cycle();
-	} while ((DWT->CYCCNT - start) < limit);
+	bus_serve_ms(ms);
 }
 
 /*
@@ -177,6 +165,9 @@ flash_led_slow(uint8_t num)
 static void
 flash_led(uint8_t num)
 {
+#if MOVIECART_NO_LED
+	(void)num;
+#else
 	mc_led_host = 1;	/* keep the kernel heartbeat off this LED */
 	TESTA0_HIGH;
 	for (uint8_t i = 0; i < num; i++) {
@@ -188,6 +179,7 @@ flash_led(uint8_t num)
 	TESTA0_HIGH;
 	led_wait_ms(LED_MS_GAP);
 	mc_led_host = 0;
+#endif
 }
 
 #if MOVIECART_GAP_PROBE
@@ -291,8 +283,6 @@ copy_title(uint8_t *dst, const uint8_t *src, int size)
 	while (size > 0) {
 		*dst++ = *src++;
 		size--;
-		if (!(size & 7))
-			moviecart_bus_yield();
 	}
 }
 
@@ -329,41 +319,10 @@ loadTitlePixels(void)
 		   r_coreInfo.mr_frameInfo2.visibleLines);
 }
 
-/*
- * Main has nothing to do here, so it becomes the (faster) bus server:
- * IRQs masked, tight drain — ~100-150 ns response vs ~300+ ns via EXTI.
- * DWT keeps time (it counts with IRQs masked).
- */
-/*
- * Do not "optimise" the cycle-counter read out of this loop. It looks like the
- * same after-serve gap that had to be removed from the SD waits, and it was
- * changed twice on that reasoning — moving the deadline into the pump's free
- * window, then sampling it once per 4096 cycles. Both builds were worse on
- * hardware than this one: the first jammed every boot (the pump is the bounded
- * serve, and its dead-bus hint latches during sync, when the guard expiring is
- * normal), and the second lost the picture before the first blink. Sync is not
- * the accumulating-gap case the SD waits were — it lasts one frame, not 100k
- * cycles — and this exact shape is what reliably reaches the first blink.
- */
 static int
 wait_title_sync(uint32_t timeout_ms)
 {
-	uint32_t start = DWT->CYCCNT;
-	uint32_t limit = (SystemCoreClock / 1000u) * timeout_ms;
-	int ok = 0;
-
-	r_coreInfo.mr_endFrame = 0;
-
-	__disable_irq();
-	while ((DWT->CYCCNT - start) < limit) {
-		bus_serve_cycle();
-		if (r_coreInfo.mr_endFrame) {
-			r_coreInfo.mr_endFrame = 0;
-			ok = 1;
-			break;
-		}
-	}
-	return ok;
+	return bus_wait_endframe(timeout_ms);
 }
 
 #if MOVIECART_STALL_TEST && MOVIECART_STALL_TEST != 3
@@ -414,8 +373,6 @@ run_stall_sweep(void)
 	};
 #endif
 
-	__disable_irq();
-
 	/* Lock onto a complete frame first, as the title build does. */
 	while (!r_coreInfo.mr_endFrame)
 		bus_serve_cycle();
@@ -445,8 +402,6 @@ run_stall_sweep(void)
 static __attribute__((noreturn)) void
 run_interleave_proof(void)
 {
-	__disable_irq();
-
 	flash_led(3);
 	led_wait_frames(42);
 
@@ -459,7 +414,6 @@ static __attribute__((noreturn)) void fatalBlink(uint8_t code);
 static __attribute__((noreturn)) void
 fatalBlink(uint8_t code)
 {
-	__disable_irq();
 	for (;;)
 		flash_led_slow(code);	/* wall-clock: readable even with a desynced kernel */
 }
@@ -474,7 +428,6 @@ fatalBlink(uint8_t code)
 static __attribute__((noreturn)) void
 fatalStrobe(void)
 {
-	__disable_irq();
 	mc_led_host = 1;
 	for (;;) {
 		TESTA0_LOW;
@@ -561,6 +514,10 @@ setupDisk(void)
 #if MOVIECART_SD_STAGE == 1
 	emulate_cartridge();
 #endif
+	/* Pins are already up. Yields wait for a fresh $F1C1 only in this
+	 * function — not during title copy or the 2 s hold. */
+	mc_sd_strict = 1;
+	moviecart_wait_blanking_start();
 	mount_work();
 	if (!disk_mount_ok)
 		fatalBlink(5);
@@ -575,10 +532,13 @@ setupDisk(void)
 #endif
 	state.io_frameNumber = 1;
 	state.io_bits &= ~STATE_PLAYING;
+	/* flash_led returns mid-visible; do not start the directory walk there. */
+	moviecart_wait_blanking_start();
 	open_work();
 	if (!disk_open_ok)
 		fatalBlink(8);
 	flash_led(3);
+	mc_sd_strict = 0;
 
 #if MOVIECART_SD_STAGE == 3
 	emulate_cartridge();
@@ -799,6 +759,7 @@ checkSelectVideo(int *which)
 		state.io_bits &= ~STATE_END;
 
 		(*which)++;
+		mc_sd_strict = 1;
 		for (;;) {
 			select_which = *which;
 			select_open_work();
@@ -806,6 +767,7 @@ checkSelectVideo(int *which)
 				break;
 			*which = 1;
 		}
+		mc_sd_strict = 0;
 
 		/* Drop cluster checkpoints from the previous file before seeking in
 		 * the newly selected one. */
@@ -899,14 +861,11 @@ main(void)
 	config_gpio_addr();
 	config_status_led();
 	dwt_init();
-
-	/*
-	 * IRQs stay masked for the entire Atari serve run. SDIO/DMA completion is
-	 * polled in the driver; long waits use moviecart_delay_ms (yields each
-	 * iteration). TM_DELAY_Init is kept for library helpers that use TM_Time.
-	 */
-	__disable_irq();
-	TM_DELAY_Init();
+#if MOVIECART_ENABLE_SD
+	/* SDIO on PD2 / PC8-12: do this before the 6507 is served so cart
+	 * GPIOD MODER/ODR is not rewritten in the middle of a frame. */
+	mc_sd_pins_init();
+#endif
 
 	/* Everything the kernel dispatch touches must be valid before serving
 	 * starts, but nothing slow may run before the drain: the console's RC
@@ -922,9 +881,24 @@ main(void)
 	run_stall_sweep();
 #elif MOVIECART_ENABLE_SD
 	MC_PROBE(MC_PHASE_PRE_SD);
+#if MOVIECART_INIT_PHASE == 1
+	/* Same path as NO_SD: tight loop only. No sync wait, hold, LED, or SD. */
+	emulate_cartridge();
+#endif
 	if (!wait_title_sync(3000u))
 		fatalBlink(6);
+	/* Title only — same serve as NO_SD — before mount, blinks, or SDIO. */
+	bus_serve_ms(2000u);
+#if MOVIECART_INIT_PHASE == 2
+	emulate_cartridge();
+#endif
+	moviecart_wait_blanking_start();
+#if MOVIECART_INIT_PHASE == 3
+	emulate_cartridge();
+#endif
+#if !MOVIECART_NO_LED
 	flash_led(1);
+#endif
 
 	setupDisk();
 

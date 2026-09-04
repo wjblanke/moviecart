@@ -27,14 +27,11 @@ FREESTANDING = -ffreestanding
 SOURCES = \
 	src/startup_stm32f40xx.s \
 	src/system_stm32f4xx.c \
-	Libraries/tm_stm32f4_delay/tm_stm32f4_delay.c \
-	Libraries/tm_stm32f4_delay/tm_stm32f4_timer_properties.c \
 	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_rcc.c \
 	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_gpio.c \
 	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_dma.c \
 	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_sdio.c \
 	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_flash.c \
-	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_tim.c \
 	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_exti.c \
 	Libraries/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_syscfg.c \
 	Libraries/STM32F4xx_StdPeriph_Driver/src/misc.c \
@@ -57,7 +54,6 @@ INCLUDES = \
 	-ILibraries/tm_stm32f4_fatfs \
 	-ILibraries/tm_stm32f4_fatfs/fatfs \
 	-ILibraries/tm_stm32f4_fatfs/fatfs/drivers \
-	-ILibraries/tm_stm32f4_delay \
 	-ILibraries/tm_stm32f4_gpio
 
 OBJECTS = $(addprefix $(BUILDDIR)/, $(addsuffix .o, $(basename $(SOURCES))))
@@ -83,6 +79,16 @@ endif
 # Bisect *inside* the mount: make MOUNT_PHASE=1|2 (see defines.h)
 ifneq ($(MOUNT_PHASE),)
 DEFS += -DMOVIECART_MOUNT_PHASE=$(MOUNT_PHASE)
+endif
+
+# Bisect *inside* SD_Init: make INIT_PHASE=1..10 (see defines.h)
+ifneq ($(INIT_PHASE),)
+DEFS += -DMOVIECART_INIT_PHASE=$(INIT_PHASE)
+endif
+
+# Drop milestone LED blinks (keep fatalBlink): make NO_LED=1
+ifneq ($(NO_LED),)
+DEFS += -DMOVIECART_NO_LED=1
 endif
 
 # Title-only baseline, no SD at all: make NO_SD=1. This is the reference build —

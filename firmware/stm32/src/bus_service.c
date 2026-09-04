@@ -44,8 +44,6 @@ bus_interleave_step(void)
 HOTFUNC __attribute__((noreturn)) void
 emulate_cartridge(void)
 {
-	__disable_irq();
-
 	/*
 	 * Do not try to suppress a repeated address here. It looks free and it
 	 * is not: skipping the dispatch on a repeat means skipping a dispatch
@@ -79,6 +77,70 @@ emulate_cartridge(void)
 }
 
 static uint16_t serve_addr_prev;
+
+/*
+ * One serve, identical to emulate_cartridge(). on_free runs only on A12-low.
+ * Do not put a function call in the A12-high path.
+ */
+#define BUS_SERVE_ONCE(on_free)						\
+	do {								\
+		uint16_t _addr;						\
+		while ((_addr = ADDR_IN) != serve_addr_prev)		\
+			serve_addr_prev = _addr;			\
+		if (_addr & 0x1000) {					\
+			bus_dispatch((uint16_t)(_addr & 0xfffu));	\
+			SET_DATA_MODE_OUT;				\
+			while (ADDR_IN == _addr)			\
+				;					\
+			SET_DATA_MODE_IN;				\
+		} else {						\
+			if (mc_swap_pending)				\
+				mc_service_blanking_work();		\
+			on_free;					\
+		}							\
+	} while (0)
+
+int
+bus_wait_endframe(uint32_t timeout_ms)
+{
+	uint32_t start = DWT->CYCCNT;
+	uint32_t limit = (SystemCoreClock / 1000u) * timeout_ms;
+
+	r_coreInfo.mr_endFrame = 0;
+
+	while (1) {
+		int done = 0;
+
+		BUS_SERVE_ONCE({
+			if (r_coreInfo.mr_endFrame) {
+				r_coreInfo.mr_endFrame = 0;
+				done = 1;
+			} else if ((DWT->CYCCNT - start) >= limit) {
+				done = -1;
+			}
+		});
+		if (done)
+			return done > 0;
+	}
+}
+
+void
+bus_serve_ms(uint32_t ms)
+{
+	uint32_t start = DWT->CYCCNT;
+	uint32_t limit = (SystemCoreClock / 1000u) * ms;
+
+	while (1) {
+		int done = 0;
+
+		BUS_SERVE_ONCE({
+			if ((DWT->CYCCNT - start) >= limit)
+				done = 1;
+		});
+		if (done)
+			return;
+	}
+}
 
 #if MOVIECART_GAP_PROBE
 volatile uint8_t mc_probe_phase;
@@ -163,45 +225,101 @@ bus_serve_cycle(void)
  * blinks: a diagnostic that damages the system it measures is worse than none.
  */
 /*
- * During visible, always serve. During RIOT blanking skip A12-low cycles (TIA/
- * RIOT/WSYNC only) so SDIO polls run faster — but still serve A12-high cart
- * fetches. VisibleBars entry ($F09D) is a cart fetch that clears
- * mc_blanking_window; missing it leaves the flag stuck at 1 and visible dead.
+ * Visible is serve-only (same loop as NO_SD). Blanking skips A12-low so SD
+ * can run; $F09D is still served and clears mc_blanking_window.
+ *
+ * These waits used BUS_SERVE_ONCE plus a volatile gen/window check after
+ * every cart fetch, and they returned on the $F1C1 A12-high cycle itself.
+ * INIT_PHASE=2 (hold, then emulate) is clean; INIT_PHASE=3 (one of these
+ * waits, then emulate) is not. Same A12-high path as emulate_cartridge().
+ * Swap runs on the first A12-low after $F1C1; we return on a later one so
+ * the field swap never shares a cycle with the call back into C.
+ * INIT_PHASE=3 never returns — that seam still failed once.
  */
+HOTFUNC void
+moviecart_wait_blanking(void)
+{
+	uint16_t addr, addr_prev = 0;
+
+	while (1)
+	{
+		while ((addr = ADDR_IN) != addr_prev)
+			addr_prev = addr;
+
+		if (addr & 0x1000)
+		{
+			bus_dispatch((uint16_t)(addr & 0xfffu));
+			SET_DATA_MODE_OUT
+			while (ADDR_IN == addr) ;
+			SET_DATA_MODE_IN
+		}
+		else if (mc_swap_pending)
+		{
+			mc_service_blanking_work();
+		}
+		else if (mc_blanking_window)
+		{
+			return;
+		}
+	}
+}
+
+HOTFUNC void
+moviecart_wait_blanking_start(void)
+{
+	uint16_t seen = mc_blanking_window_gen;
+	uint16_t addr, addr_prev = 0;
+
+#if MOVIECART_INIT_PHASE == 3
+	(void)seen;
+#endif
+	while (1)
+	{
+		while ((addr = ADDR_IN) != addr_prev)
+			addr_prev = addr;
+
+		if (addr & 0x1000)
+		{
+			bus_dispatch((uint16_t)(addr & 0xfffu));
+			SET_DATA_MODE_OUT
+			while (ADDR_IN == addr) ;
+			SET_DATA_MODE_IN
+		}
+		else if (mc_swap_pending)
+		{
+			mc_service_blanking_work();
+		}
+#if MOVIECART_INIT_PHASE != 3
+		else if (mc_blanking_window_gen != seen)
+		{
+			/* Next A12-low after the swap. Do not return on the
+			 * swap cycle — that plus emulate_cartridge() garbled. */
+			return;
+		}
+#endif
+	}
+}
+
 void
 moviecart_bus_yield(void)
 {
-	if (!mc_blanking_window || (ADDR_IN & 0x1000))
-		bus_serve_cycle();
+	if (mc_sd_strict && !mc_sdio_gate_relaxed) {
+		moviecart_wait_blanking_start();
+		return;
+	}
+	BUS_SERVE_ONCE({});
+	if (!mc_blanking_window)
+		moviecart_wait_blanking();
 }
 
-/*
- * First call snapshots the current gen so we always wait for the *next* $F1C1
- * edge, even if the kernel has already completed many frames before mount.
- */
 void
 moviecart_sdio_gate(void)
 {
-	static uint16_t seen;
-	static uint8_t primed;
-
 	if (mc_sdio_gate_relaxed) {
-		while (!mc_blanking_window)
-			bus_serve_cycle();
-		/* A later strict operation must wait for an edge newer than the
-		 * relaxed window, not consume this already-active one. */
-		seen = mc_blanking_window_gen;
-		primed = 1;
+		moviecart_wait_blanking();
 		return;
 	}
-
-	if (!primed) {
-		seen = mc_blanking_window_gen;
-		primed = 1;
-	}
-	while (mc_blanking_window_gen == seen)
-		bus_serve_cycle();
-	seen = mc_blanking_window_gen;
+	moviecart_wait_blanking_start();
 }
 
 /*
@@ -268,6 +386,18 @@ moviecart_bus_pump(void (*work)(void))
 	uint16_t addr;
 
 	probe_enter();
+	if (mc_sd_strict && !mc_sdio_gate_relaxed) {
+		moviecart_wait_blanking_start();
+		if (work)
+			work();
+		probe_exit();
+		return;
+	}
+	if (!mc_blanking_window) {
+		moviecart_wait_blanking();
+		probe_exit();
+		return;
+	}
 	while ((addr = ADDR_IN) != serve_addr_prev)
 		serve_addr_prev = addr;
 	if (addr & 0x1000) {
@@ -285,6 +415,8 @@ moviecart_bus_pump(void (*work)(void))
 #else
 		work();
 #endif
+	} else if (mc_swap_pending) {
+		mc_service_blanking_work();
 	}
 	probe_exit();
 }
@@ -322,6 +454,7 @@ moviecart_delay_ms(uint32_t ms)
 	 */
 	uint32_t guard = ms * 4000u + 4000u;
 
+	moviecart_wait_blanking_start();
 	delay_start = DWT->CYCCNT;
 	delay_limit = (SystemCoreClock / 1000u) * ms;
 	delay_expired = 0;

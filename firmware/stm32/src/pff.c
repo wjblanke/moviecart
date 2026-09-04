@@ -137,6 +137,7 @@ uint32_t get_fat (
 )
 {
 	uint8_t*	buf = disk_read_block1(fsInfo.fatbase + (clst >> 7));
+	moviecart_bus_yield();
 	uint16_t	offset =  (((uint16_t)clst & 127) << 2);
 
 	return ld_dword(&buf[offset]) & 0x0FFFFFFF;
@@ -185,6 +186,7 @@ bool pf_mount()
 	while(1)
 	{
 		buf = disk_read_block1(bsect);	// Read the boot record 
+		moviecart_bus_yield();
 
 #if MOVIECART_MOUNT_PHASE == 2
 		emulate_cartridge();	/* one 512-byte sector DMA has now run */
@@ -221,6 +223,7 @@ bool pf_mount()
 		fsize = ld_dword(buf+BPB_FATSz32);
 
 	fsize *= buf[BPB_NumFATs];						// Number of sectors in FAT area 
+	moviecart_bus_yield();
 	fsInfo.fatbase = bsect + ld_word(buf+BPB_RsvdSecCnt); // FAT start sector (lba) 
 	fsInfo.n_rootdir = ld_word(buf+BPB_RootEntCnt);		// Nmuber of root directory entries 
 
@@ -250,6 +253,7 @@ bool pf_mount()
 
 	// Last cluster# + 1 
 	fsInfo.n_fatent = ((tsect - ld_word(buf+BPB_RsvdSecCnt) - fsize - (fsInfo.n_rootdir >> 4)) >> fsInfo.csize_bits) + 2;
+	moviecart_bus_yield();
 
 	fsInfo.dirbase = ld_dword(buf+(BPB_RootClus));	// Root directory start cluster 
 	fsInfo.database = fsInfo.fatbase + fsize + (fsInfo.n_rootdir >> 4);	// Data start sector (lba) 
@@ -453,9 +457,12 @@ pf_open_file( uint32_t *numFrames, int num)
 
 	*numFrames = 0;
 
+	moviecart_wait_blanking_start();
 	do 
 	{
+		moviecart_wait_blanking_start();
 		buf = disk_read_block1(dir_sect);
+		moviecart_bus_yield();
 		dir = &buf[(dir_index & 15) << 5];
 
 		c = dir[DIR_Name];	// First character 

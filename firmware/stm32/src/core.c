@@ -55,7 +55,7 @@
 #define MC_OFF_STORE		0x0e00u
 #define MC_OFF_VECTORS		0x0ffau
 
-#define SET_DATA(X)     do { DATA_OUT = ((uint16_t)(uint8_t)(X)) << 8; \
+#define SET_DATA(X)     do { DATA_OUT_SET(((uint16_t)(uint8_t)(X)) << 8); \
 			     SET_DATA_MODE_OUT } while (0)
 
 #define EMULATE_DONE    do { return; } while (0);
@@ -94,6 +94,7 @@ volatile uint8_t	mc_visible_bars_vended;
 volatile uint8_t	mc_blanking_window;
 volatile uint16_t	mc_blanking_window_gen;
 volatile uint8_t	mc_sdio_gate_relaxed;
+volatile uint8_t	mc_sd_strict;
 volatile uint8_t	mc_playback_pipeline;
 volatile uint8_t	mc_swap_pending;
 
@@ -161,24 +162,9 @@ static void mc_pack_blanking_audio(void);
 static inline void
 diagFrameTick(void)
 {
-	uint16_t flashing = (uint16_t)diagShowing * DIAG_SLOT_FRAMES;
-
-	if (mc_led_host) {
-		diagTick = 0;
-		return;
-	}
-
-	if (diagTick < flashing && (diagTick & (DIAG_SLOT_FRAMES - 1)) <
-				   (DIAG_SLOT_FRAMES / 2))
-		TESTA0_LOW
-	else
-		TESTA0_HIGH
-
-	if (++diagTick >= flashing + DIAG_GAP_FRAMES) {
-		diagTick = 0;
-		diagShowing = diagWorst ? diagWorst : DIAG_NOMINAL;
-		diagWorst = 0;
-	}
+	/* TEMP: kernel 1 Hz heartbeat off so boot flash_led codes are readable. */
+	if (!mc_led_host)
+		TESTA0_HIGH;
 }
 
 void
@@ -190,6 +176,7 @@ coreInit(void)
 	mc_blanking_window = 0;
 	mc_blanking_window_gen = 0;
 	mc_sdio_gate_relaxed = 0;
+	mc_sd_strict = 0;
 	mc_playback_pipeline = 0;
 	mc_swap_pending = 0;
 

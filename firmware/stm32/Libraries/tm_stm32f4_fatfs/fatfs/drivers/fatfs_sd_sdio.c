@@ -234,6 +234,18 @@
 #define logf(x)
 
 #include "moviecart_yield.h"
+#include "defines.h"
+#include "bus_service.h"
+
+#if MOVIECART_INIT_PHASE
+#define MC_INIT_STOP(n)							\
+	do {								\
+		if ((n) == MOVIECART_INIT_PHASE)			\
+			emulate_cartridge();				\
+	} while (0)
+#else
+#define MC_INIT_STOP(n)	do { } while (0)
+#endif
 
 static void
 SDIO_DataConfigGated(SDIO_DataInitTypeDef *cfg)
@@ -258,10 +270,10 @@ SDIO_SendCommandGated(SDIO_CmdInitTypeDef *cmd)
 static void
 SD_PollDmaAndYield(void)
 {
-	moviecart_sdio_gate();
-	SD_ProcessIRQSrc();
-	SD_ProcessDMAIRQ();
 	moviecart_bus_yield();
+	SD_ProcessIRQSrc();
+	moviecart_bus_yield();
+	SD_ProcessDMAIRQ();
 }
 
 static void
@@ -352,32 +364,14 @@ uint8_t TM_FATFS_SDIO_WriteEnabled(void) {
 }
 
 DSTATUS TM_FATFS_SD_SDIO_disk_initialize(void) {
-	NVIC_InitTypeDef NVIC_InitStructure;
-	
-	/* Detect pin */
-#if FATFS_USE_DETECT_PIN > 0
-	TM_GPIO_Init(FATFS_USE_DETECT_PIN_PORT, FATFS_USE_DETECT_PIN_PIN, TM_GPIO_Mode_IN, TM_GPIO_OType_PP, TM_GPIO_PuPd_UP, TM_GPIO_Speed_Low);
-#endif
+	/* Pins/clocks are brought up in mc_sd_pins_init() before serving.
+	 * Do not RMW GPIOD (cart data) or touch NVIC here. IRQs stay masked;
+	 * completion is polled. */
 
-	/* Write protect pin */
-#if FATFS_USE_WRITEPROTECT_PIN > 0
-	TM_GPIO_Init(FATFS_USE_WRITEPROTECT_PIN_PORT, FATFS_USE_WRITEPROTECT_PIN_PIN, TM_GPIO_Mode_IN, TM_GPIO_OType_PP, TM_GPIO_PuPd_UP, TM_GPIO_Speed_Low);
-#endif
-	
-	// Configure the NVIC Preemption Priority Bits 
-	NVIC_PriorityGroupConfig (NVIC_PriorityGroup_1);
-	NVIC_InitStructure.NVIC_IRQChannel = SDIO_IRQn;
-	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
-	NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
-	NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
-	NVIC_Init (&NVIC_InitStructure);
-	NVIC_InitStructure.NVIC_IRQChannel = SD_SDIO_DMA_IRQn;
-	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
-	NVIC_Init (&NVIC_InitStructure);
-	
-	SD_LowLevel_DeInit();
-	SD_LowLevel_Init();
+	moviecart_wait_blanking_start();
 	sd_blocklen512_done = 0;
+	moviecart_bus_yield();
+	MC_INIT_STOP(4);
 
 	/* Card power / CMD0 can fail intermittently on DevEBox — retry a few times. */
 	{
@@ -389,8 +383,6 @@ DSTATUS TM_FATFS_SD_SDIO_disk_initialize(void) {
 			err = SD_Init();
 			if (err == SD_OK)
 				break;
-			SD_LowLevel_DeInit();
-			SD_LowLevel_Init();
 		}
 		if (err == SD_OK) {
 			TM_FATFS_SD_SDIO_Stat &= ~STA_NOINIT;	/* Clear STA_NOINIT flag */
@@ -432,6 +424,7 @@ TM_FATFS_SD_SDIO_disk_read_begin(BYTE *buff, DWORD sector, UINT count)
 	if (!count || ((DWORD)buff & 3))
 		return RES_PARERR;
 
+	moviecart_bus_yield();
 	if (count == 1) {
 		Status = SD_ReadBlock(buff, sector << 9, BLOCK_SIZE);
 	} else {
@@ -448,9 +441,9 @@ TM_FATFS_SD_SDIO_disk_read_finish(void)
 	SDTransferState State;
 
 	Status = SD_WaitReadOperation();
+	moviecart_bus_yield();
 
 	for (;;) {
-		moviecart_sdio_gate();
 		State = SD_GetStatus();
 		if (State != SD_TRANSFER_BUSY)
 			break;
@@ -480,6 +473,7 @@ DRESULT TM_FATFS_SD_SDIO_disk_read(BYTE *buff, DWORD sector, UINT count) {
 
 	if (TM_FATFS_SD_SDIO_disk_read_begin(buff, sector, count) != RES_OK)
 		return RES_ERROR;
+	moviecart_bus_yield();
 	return TM_FATFS_SD_SDIO_disk_read_finish();
 }
 
@@ -518,9 +512,9 @@ DRESULT TM_FATFS_SD_SDIO_disk_write(const BYTE *buff, DWORD sector, UINT count) 
 		SDTransferState State;
 
 		Status = SD_WaitWriteOperation(); // Check if the Transfer is finished
+		moviecart_bus_yield();
 
 		for (;;) {
-			moviecart_sdio_gate();
 			State = SD_GetStatus();
 			if (State != SD_TRANSFER_BUSY)
 				break;
@@ -598,9 +592,9 @@ SD_Error SD_Init (void)
 {
 	__IO SD_Error errorstatus = SD_OK;
 
-	/* SDIO Peripheral Low Level Init */
-	//SD_LowLevel_Init();
+	moviecart_wait_blanking_start();
 	SDIO_DeInit ();
+	MC_INIT_STOP(5);
 	errorstatus = SD_PowerON ();
 
 	if (errorstatus != SD_OK) {
@@ -610,7 +604,9 @@ SD_Error SD_Init (void)
 	}
 
 	logf ("SD_PowerON OK\r\n");
+	MC_INIT_STOP(7);
 
+	moviecart_wait_blanking_start();
 	errorstatus = SD_InitializeCards ();
 
 	if (errorstatus != SD_OK) {
@@ -620,10 +616,20 @@ SD_Error SD_Init (void)
 	}
 
 	logf ("SD_InitializeCards OK\r\n");
+	MC_INIT_STOP(8);
 
-	/*!< Configure the SDIO peripheral */
-	/*!< SDIO_CK = SDIOCLK / (SDIO_TRANSFER_CLK_DIV + 2) */
-	/*!< on STM32F4xx devices, SDIOCLK is fixed to 48MHz */
+#if MOVIECART_INIT_PHASE != 94
+	/* One register write per fresh $F1C1. A single SDIO_Init while CLKEN is
+	 * still set jumps 400 kHz → 8 MHz in one CLKCR store and can AHB-stall
+	 * the serve loop for a field. */
+	moviecart_wait_blanking_start();
+	MC_INIT_STOP(911);
+
+	moviecart_wait_blanking_start();
+	SDIO_ClockCmd(DISABLE);
+	MC_INIT_STOP(912);
+
+	moviecart_wait_blanking_start();
 	SDIO_InitStructure.SDIO_ClockDiv = SDIO_TRANSFER_CLK_DIV;
 	SDIO_InitStructure.SDIO_ClockEdge = SDIO_ClockEdge_Rising;
 	SDIO_InitStructure.SDIO_ClockBypass = SDIO_ClockBypass_Disable;
@@ -631,13 +637,22 @@ SD_Error SD_Init (void)
 	SDIO_InitStructure.SDIO_BusWide = SDIO_BusWide_1b;
 	SDIO_InitStructure.SDIO_HardwareFlowControl = SDIO_HardwareFlowControl_Disable;
 	SDIO_Init (&SDIO_InitStructure);
+	MC_INIT_STOP(913);
 
+	moviecart_wait_blanking_start();
+	SDIO_ClockCmd(ENABLE);
+	MC_INIT_STOP(91);
+#endif
+
+	moviecart_wait_blanking_start();
 	/*----------------- Read CSD/CID MSD registers ------------------*/
 	errorstatus = SD_GetCardInfo (&SDCardInfo);
 
 	if (errorstatus == SD_OK) {
-		/*----------------- Select Card --------------------------------*/
 		logf ("SD_GetCardInfo OK\r\n");
+		MC_INIT_STOP(92);
+		/*----------------- Select Card --------------------------------*/
+		moviecart_wait_blanking_start();
 		errorstatus = SD_SelectDeselect ((uint32_t) (SDCardInfo.RCA << 16));
 	}
 	else {
@@ -646,11 +661,16 @@ SD_Error SD_Init (void)
 
 	if (errorstatus == SD_OK) {
 		logf ("SD_SelectDeselect OK\r\n");
-#if FATFS_SDIO_4BIT == 1
+		MC_INIT_STOP(94);
+		MC_INIT_STOP(9);
+		moviecart_wait_blanking_start();
+		#if FATFS_SDIO_4BIT == 1
 		/* Prefer 4-bit; fall back to 1-bit if wide-bus fails (noisy DAT1-3). */
 		errorstatus = SD_EnableWideBusOperation (SDIO_BusWide_4b);
-		if (errorstatus != SD_OK)
+		if (errorstatus != SD_OK) {
+			moviecart_bus_yield();
 			errorstatus = SD_EnableWideBusOperation (SDIO_BusWide_1b);
+		}
 #else
 		errorstatus = SD_EnableWideBusOperation (SDIO_BusWide_1b);
 #endif
@@ -661,6 +681,7 @@ SD_Error SD_Init (void)
 
 	if (errorstatus == SD_OK) {
 		logf ("SD_EnableWideBusOperation OK\r\n");
+		MC_INIT_STOP(10);
 	}
 
 	return (errorstatus);
@@ -749,15 +770,18 @@ SD_Error SD_PowerON (void)
 	SDIO_InitStructure.SDIO_BusWide = SDIO_BusWide_1b;
 	SDIO_InitStructure.SDIO_HardwareFlowControl = SDIO_HardwareFlowControl_Disable;
 	SDIO_Init (&SDIO_InitStructure);
+	moviecart_bus_yield();
 
 	/*!< Set Power State to ON */
 	SDIO_SetPowerState (SDIO_PowerState_ON);
+	moviecart_bus_yield();
 
 	/*!< Enable SDIO Clock */
 	SDIO_ClockCmd (ENABLE);
 
 	/* >=74 SD clocks + card power settle before first CMD0 */
 	moviecart_delay_ms(2);
+	MC_INIT_STOP(6);
 
 	/*!< CMD0: GO_IDLE_STATE ---------------------------------------------------*/
 	/*!< No CMD response required */
@@ -911,8 +935,11 @@ SD_Error SD_InitializeCards (void)
 		}
 
 		CID_Tab[0] = SDIO_GetResponse (SDIO_RESP1);
+		moviecart_bus_yield();
 		CID_Tab[1] = SDIO_GetResponse (SDIO_RESP2);
+		moviecart_bus_yield();
 		CID_Tab[2] = SDIO_GetResponse (SDIO_RESP3);
+		moviecart_bus_yield();
 		CID_Tab[3] = SDIO_GetResponse (SDIO_RESP4);
 	}
 	
@@ -956,8 +983,11 @@ SD_Error SD_InitializeCards (void)
 		}
 
 		CSD_Tab[0] = SDIO_GetResponse (SDIO_RESP1);
+		moviecart_bus_yield();
 		CSD_Tab[1] = SDIO_GetResponse (SDIO_RESP2);
+		moviecart_bus_yield();
 		CSD_Tab[2] = SDIO_GetResponse (SDIO_RESP3);
+		moviecart_bus_yield();
 		CSD_Tab[3] = SDIO_GetResponse (SDIO_RESP4);
 	}
 
@@ -977,6 +1007,7 @@ SD_Error SD_GetCardInfo (SD_CardInfo *cardinfo)
 
 	cardinfo->CardType = (uint8_t) CardType;
 	cardinfo->RCA = (uint16_t) RCA;
+	moviecart_bus_yield();
 
 	/*!< Byte 0 */
 	tmp = (uint8_t) ((CSD_Tab[0] & 0xFF000000) >> 24);
@@ -1275,6 +1306,7 @@ SD_Error SD_EnableWideBusOperation (uint32_t WideMode)
 			return (errorstatus);
 		} else if (SDIO_BusWide_4b == WideMode) {
 			errorstatus = SDEnWideBus (ENABLE);
+			moviecart_bus_yield();
 
 			if (SD_OK == errorstatus) {
 				/*!< Configure the SDIO peripheral */
@@ -1288,6 +1320,7 @@ SD_Error SD_EnableWideBusOperation (uint32_t WideMode)
 			}
 		} else {
 			errorstatus = SDEnWideBus (DISABLE);
+			moviecart_bus_yield();
 
 			if (SD_OK == errorstatus) {
 				/*!< Configure the SDIO peripheral */
@@ -1354,10 +1387,13 @@ SD_Error SD_ReadBlock (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize)
 	StopCondition = 0;
 
 	SDIO ->DCTRL = 0x0;
+	moviecart_bus_yield();
 
 #if defined (SD_DMA_MODE)
 	SDIO->MASK |= (SDIO_IT_DCRCFAIL | SDIO_IT_DTIMEOUT | SDIO_IT_DATAEND | SDIO_IT_RXOVERR | SDIO_IT_STBITERR);
+	moviecart_bus_yield();
 	SDIO_DMACmd (ENABLE);
+	moviecart_bus_yield();
 	SD_LowLevel_DMA_RxConfig ((uint32_t *) readbuff, BlockSize);
 #endif
 
@@ -1463,10 +1499,13 @@ SD_Error SD_ReadMultiBlocks (uint8_t *readbuff, uint64_t ReadAddr, uint16_t Bloc
 	StopCondition = 1;
 
 	SDIO ->DCTRL = 0x0;
+	moviecart_bus_yield();
 
 #if defined (SD_DMA_MODE)
 	SDIO->MASK |= (SDIO_IT_DCRCFAIL | SDIO_IT_DTIMEOUT | SDIO_IT_DATAEND | SDIO_IT_RXOVERR | SDIO_IT_STBITERR);
+	moviecart_bus_yield();
 	SD_LowLevel_DMA_RxConfig ((uint32_t *) readbuff, (NumberOfBlocks * BlockSize));
+	moviecart_bus_yield();
 	SDIO_DMACmd (ENABLE);
 #endif
 
@@ -1515,6 +1554,7 @@ SD_Error SD_ReadMultiBlocksFIXED(uint8_t *readbuff, uint64_t ReadAddr, uint16_t 
 	StopCondition = 1;
 
 	SDIO->DCTRL = 0x0;
+	moviecart_bus_yield();
 
 	if (CardType == SDIO_HIGH_CAPACITY_SD_CARD) {	
 		BlockSize = 512;
@@ -1559,7 +1599,9 @@ SD_Error SD_ReadMultiBlocksFIXED(uint8_t *readbuff, uint64_t ReadAddr, uint16_t 
 	}
 
 	SDIO->MASK |= (SDIO_IT_DCRCFAIL | SDIO_IT_DTIMEOUT | SDIO_IT_DATAEND | SDIO_IT_RXOVERR | SDIO_IT_STBITERR);
+	moviecart_bus_yield();
 	SDIO_DMACmd(ENABLE);
+	moviecart_bus_yield();
 	SD_LowLevel_DMA_RxConfig((uint32_t *)readbuff, (NumberOfBlocks * BlockSize));
 
 	return(errorstatus);
@@ -1590,14 +1632,14 @@ SD_Error SD_WaitReadOperation (void)
 	timeout = SD_DATATIMEOUT;
 
 	while (timeout > 0) {
-		moviecart_sdio_gate();
+		moviecart_bus_yield();
 		if (!(SDIO ->STA & SDIO_FLAG_RXACT))
 			break;
 		timeout--;
-		moviecart_bus_yield();
 	}
 
 	if (StopCondition == 1) {
+		moviecart_bus_yield();
 		errorstatus = SD_StopTransfer ();
 		StopCondition = 0;
 	}
@@ -1606,6 +1648,7 @@ SD_Error SD_WaitReadOperation (void)
 		errorstatus = SD_DATA_TIMEOUT;
 	}
 
+	moviecart_bus_yield();
 	/*!< Clear all the static flags */
 	SDIO->ICR = (SDIO_STATIC_FLAGS);
 
@@ -1644,10 +1687,13 @@ SD_Error SD_WriteBlock (uint8_t *writebuff, uint64_t WriteAddr, uint16_t BlockSi
 	StopCondition = 0;
 
 	SDIO->DCTRL = 0x0;
+	moviecart_bus_yield();
 
 #if defined (SD_DMA_MODE)
 	SDIO->MASK |= (SDIO_IT_DCRCFAIL | SDIO_IT_DTIMEOUT | SDIO_IT_DATAEND | SDIO_IT_RXOVERR | SDIO_IT_STBITERR);
+	moviecart_bus_yield();
 	SD_LowLevel_DMA_TxConfig ((uint32_t *) writebuff, BlockSize);
+	moviecart_bus_yield();
 	SDIO_DMACmd (ENABLE);
 #endif
 
@@ -1756,10 +1802,13 @@ SD_Error SD_WriteMultiBlocks (uint8_t *writebuff, uint64_t WriteAddr, uint16_t B
 	TransferEnd = 0;
 	StopCondition = 1;
 	SDIO ->DCTRL = 0x0;
+	moviecart_bus_yield();
 
 #if defined (SD_DMA_MODE)
 	SDIO->MASK |= (SDIO_IT_DCRCFAIL | SDIO_IT_DTIMEOUT | SDIO_IT_DATAEND | SDIO_IT_TXUNDERR | SDIO_IT_STBITERR);
+	moviecart_bus_yield();
 	SD_LowLevel_DMA_TxConfig ((uint32_t *) writebuff, (NumberOfBlocks * BlockSize));
+	moviecart_bus_yield();
 	SDIO_DMACmd (ENABLE);
 #endif
 
@@ -1859,6 +1908,7 @@ SD_Error SD_WriteMultiBlocksFIXED (uint8_t *writebuff, uint64_t WriteAddr, uint1
 	StopCondition = 1;
 
 	SDIO->DCTRL = 0x0;
+	moviecart_bus_yield();
 
 	if (CardType == SDIO_HIGH_CAPACITY_SD_CARD)
 		BlockSize = 512;
@@ -1931,7 +1981,9 @@ SD_Error SD_WriteMultiBlocksFIXED (uint8_t *writebuff, uint64_t WriteAddr, uint1
 	SDIO_DataConfigGated(&SDIO_DataInitStructure);
 
 	SDIO->MASK |= (SDIO_IT_DCRCFAIL | SDIO_IT_DTIMEOUT | SDIO_IT_DATAEND | SDIO_IT_RXOVERR | SDIO_IT_STBITERR);
+	moviecart_bus_yield();
 	SDIO_DMACmd(ENABLE);
+	moviecart_bus_yield();
 	SD_LowLevel_DMA_TxConfig((uint32_t *)writebuff, (NumberOfBlocks * BlockSize));
 
 	return (errorstatus);
@@ -1962,14 +2014,14 @@ SD_Error SD_WaitWriteOperation (void)
 	timeout = SD_DATATIMEOUT;
 
 	while (timeout > 0) {
-		moviecart_sdio_gate();
+		moviecart_bus_yield();
 		if (!(SDIO ->STA & SDIO_FLAG_TXACT))
 			break;
 		timeout--;
-		moviecart_bus_yield();
 	}
 
 	if (StopCondition == 1) {
+		moviecart_bus_yield();
 		errorstatus = SD_StopTransfer ();
 		StopCondition = 0;
 	}
@@ -1978,6 +2030,7 @@ SD_Error SD_WaitWriteOperation (void)
 		errorstatus = SD_DATA_TIMEOUT;
 	}
 
+	moviecart_bus_yield();
 	/*!< Clear all the static flags */
 	SDIO->ICR =  (SDIO_STATIC_FLAGS );
 
@@ -2318,11 +2371,10 @@ static SD_Error CmdError (void)
 	timeout = SDIO_CMD0TIMEOUT; /*!< 10000 */
 
 	while (timeout > 0) {
-		moviecart_sdio_gate();
+		moviecart_bus_yield();
 		if (SDIO_GetFlagStatus (SDIO_FLAG_CMDSENT) != RESET)
 			break;
 		timeout--;
-		moviecart_bus_yield();
 	}
 
 	if (timeout == 0) {
@@ -2348,12 +2400,11 @@ static SD_Error CmdResp7Error (void)
 	uint32_t timeout = SDIO_CMD0TIMEOUT;
 
 	while (timeout > 0) {
-		moviecart_sdio_gate();
+		moviecart_bus_yield();
 		status = SDIO ->STA;
 		if (status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))
 			break;
 		timeout--;
-		moviecart_bus_yield();
 	}
 
 	if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
@@ -2386,12 +2437,11 @@ static SD_Error CmdResp1Error (uint8_t cmd)
 
 	timeout = SDIO_CMD0TIMEOUT;
 	while (timeout > 0) {
-		moviecart_sdio_gate();
+		moviecart_bus_yield();
 		status = SDIO ->STA;
 		if (status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))
 			break;
 		timeout--;
-		moviecart_bus_yield();
 	}
 
 	if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
@@ -2511,12 +2561,11 @@ static SD_Error CmdResp3Error (void)
 
         timeout = SDIO_CMD0TIMEOUT;
         while (timeout > 0) {
-                moviecart_sdio_gate();
+                moviecart_bus_yield();
                 status = SDIO ->STA;
                 if (status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))
                         break;
                 timeout--;
-                moviecart_bus_yield();
         }
 
         if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
@@ -2542,12 +2591,11 @@ static SD_Error CmdResp2Error (void)
 
 	timeout = SDIO_CMD0TIMEOUT;
 	while (timeout > 0) {
-		moviecart_sdio_gate();
+		moviecart_bus_yield();
 		status = SDIO ->STA;
 		if (status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND))
 			break;
 		timeout--;
-		moviecart_bus_yield();
 	}
 
 	if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
@@ -2582,12 +2630,11 @@ static SD_Error CmdResp6Error (uint8_t cmd, uint16_t *prca)
 
 	timeout = SDIO_CMD0TIMEOUT;
 	while (timeout > 0) {
-		moviecart_sdio_gate();
+		moviecart_bus_yield();
 		status = SDIO ->STA;
 		if (status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CTIMEOUT | SDIO_FLAG_CMDREND))
 			break;
 		timeout--;
-		moviecart_bus_yield();
 	}
 
 	if ((timeout == 0) || (status & SDIO_FLAG_CTIMEOUT)) {
@@ -2651,6 +2698,7 @@ static SD_Error SDEnWideBus (FunctionalState NewState)
 
 	/*!< Get SCR Register */
 	errorstatus = FindSCR (RCA, scr);
+	moviecart_bus_yield();
 
 	if (errorstatus != SD_OK) {
 		return (errorstatus);
@@ -2752,12 +2800,11 @@ static SD_Error IsCardProgramming (uint8_t *pstatus)
 		uint32_t timeout = SDIO_CMD0TIMEOUT;
 
 		while (timeout > 0) {
-			moviecart_sdio_gate();
+			moviecart_bus_yield();
 			status = SDIO ->STA;
 			if (status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))
 				break;
 			timeout--;
-			moviecart_bus_yield();
 		}
 		if (timeout == 0 && !(status & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT))) {
 			errorstatus = SD_CMD_RSP_TIMEOUT;
@@ -2939,6 +2986,7 @@ static SD_Error FindSCR (uint16_t rca, uint32_t *pscr)
 	}
 
 	while (!(SDIO ->STA & (SDIO_FLAG_RXOVERR | SDIO_FLAG_DCRCFAIL | SDIO_FLAG_DTIMEOUT | SDIO_FLAG_DBCKEND | SDIO_FLAG_STBITERR))) {
+		moviecart_bus_yield();
 		if (SDIO_GetFlagStatus (SDIO_FLAG_RXDAVL) != RESET) {
 			*(tempscr + index) = SDIO_ReadData ();
 			index++;
@@ -3012,6 +3060,7 @@ SD_Error SD_HighSpeed (void)
 
 	/*!< Get SCR Register */
 	errorstatus = FindSCR (RCA, scr);
+	moviecart_bus_yield();
 
 	if (errorstatus != SD_OK) {
 		return (errorstatus);

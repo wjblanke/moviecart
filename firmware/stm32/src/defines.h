@@ -45,7 +45,7 @@
  * next cart fetch. See moviecart_bus_pump in bus_service.c.
  */
 #ifndef MOVIECART_PUMP_ALIGN
-#define MOVIECART_PUMP_ALIGN		0
+#define MOVIECART_PUMP_ALIGN		1
 #endif
 
 /*
@@ -187,6 +187,36 @@
  */
 #ifndef MOVIECART_MOUNT_PHASE
 #define MOVIECART_MOUNT_PHASE 0
+#endif
+
+/*
+ * Finer bisection *inside* SD_Init (make INIT_PHASE=N). Each stop hands the
+ * bus back to emulate_cartridge() — title only, no further SD.
+ *   1  NO_SD-equivalent: emulate_cartridge() immediately
+ *   2  + title sync and 2 s hold, then emulate
+ *   3  + wait_blanking_start that never returns (same loop as emulate)
+ *   4  + setupDisk / disk_initialize waits; no SDIO registers
+ *   5  + SDIO_DeInit
+ *   6  + PowerON clocks and delay_ms(2); no CMD0
+ *   7  + SD_PowerON (CMD0 / CMD8 / ACMD41)
+ *   8  + SD_InitializeCards (CMD2 / CMD3 / CMD9)
+ *   9  + transfer clock, GetCardInfo, Select; no FindSCR / wide-bus
+ *  911 + one blanking wait only (no CLKCR write)
+ *  912 + SDIO_ClockCmd(DISABLE)
+ *  913 + CLKCR rewrite to 8 MHz, clock still off
+ *   91 + ClockCmd(ENABLE) at 8 MHz
+ *   92 + GetCardInfo unpack (no CMD7)
+ *   94 GetCardInfo + Select at init clock (no 8 MHz bump)
+ *  10  + EnableWideBus / FindSCR
+ * 0 runs the whole init.
+ */
+#ifndef MOVIECART_INIT_PHASE
+#define MOVIECART_INIT_PHASE 0
+#endif
+
+/* Skip milestone flash_led() codes (make NO_LED=1). fatalBlink still reports. */
+#ifndef MOVIECART_NO_LED
+#define MOVIECART_NO_LED 0
 #endif
 
 /*

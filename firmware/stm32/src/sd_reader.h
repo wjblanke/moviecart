@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* SDIO pins + clocks. Call before the 6507 is served so GPIOD RMW is idle. */
+void		mc_sd_pins_init(void);
 bool		mc_disk_initialize(void);
 bool		mc_sd_prepare_playback_read(void);
 void		disk_read_invalidate(void);

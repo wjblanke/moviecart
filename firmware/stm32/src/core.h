@@ -76,8 +76,13 @@ extern volatile uint8_t		mc_visible_bars_vended;
 extern volatile uint8_t		mc_blanking_window;
 extern volatile uint16_t	mc_blanking_window_gen;
 extern volatile uint8_t		mc_sdio_gate_relaxed;
+/* Non-zero only during mount/open. Yield then waits for the next $F1C1.
+ * Title copy, LED waits, and playback updates must leave this clear. */
+extern volatile uint8_t		mc_sd_strict;
 extern volatile uint8_t		mc_playback_pipeline;
 extern volatile uint8_t		mc_swap_pending;
+
+extern struct coreInfo		r_coreInfo;
 
 void				mc_service_blanking_work(void);
 

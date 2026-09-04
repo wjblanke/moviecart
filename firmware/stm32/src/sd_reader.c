@@ -1,5 +1,6 @@
 #include "sd_reader.h"
 #include "defines.h"
+#include "moviecart_yield.h"
 
 #include "fatfs_sd_sdio.h"
 #include "diskio.h"
@@ -33,6 +34,8 @@ static uint8_t diskBuffer[512] __attribute__((aligned(16), section(".sram1")));
 static bool
 disk_read_blocks_raw(uint32_t sector, uint8_t *buf, uint8_t count)
 {
+	moviecart_wait_blanking_start();
+	moviecart_bus_yield();
 	return TM_FATFS_SD_SDIO_disk_read(buf, sector, count) == RES_OK;
 }
 
@@ -51,6 +54,8 @@ disk_read_blocks_begin(uint32_t sector, uint8_t *dst, uint8_t count)
 	if (read_pending || !count)
 		return false;
 
+	moviecart_wait_blanking_start();
+	moviecart_bus_yield();
 	if (TM_FATFS_SD_SDIO_disk_read_begin(dst, sector, count) != RES_OK)
 		return false;
 
@@ -67,6 +72,8 @@ disk_read_blocks_finish(void)
 	if (!read_pending)
 		return false;
 
+	moviecart_wait_blanking_start();
+	moviecart_bus_yield();
 	bool ok = TM_FATFS_SD_SDIO_disk_read_finish() == RES_OK;
 	if (ok) {
 		dinfo.sector2 = pending.sector2;
@@ -126,6 +133,13 @@ bool
 mc_sd_prepare_playback_read(void)
 {
 	return SD_PreparePlaybackRead() == SD_OK;
+}
+
+void
+mc_sd_pins_init(void)
+{
+	SD_LowLevel_DeInit();
+	SD_LowLevel_Init();
 }
 
 bool

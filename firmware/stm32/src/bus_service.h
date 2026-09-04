@@ -3,11 +3,21 @@
 
 #include <stdint.h>
 
-/* Infinite, IRQ-disabled UnoCart bus loop; used for boot/title lock. */
+/* Infinite UnoCart polling loop; used for boot/title lock. */
 void emulate_cartridge(void) __attribute__((noreturn));
 
 /* Serve one cart cycle synchronously from the main polling path. */
 void bus_serve_cycle(void);
+
+/*
+ * Same tight loop as emulate_cartridge() until $F1C1 (mr_endFrame) or timeout.
+ * Cart cycles have no extra work; end-frame and the deadline are sampled only
+ * on A12-low. Returns 1 on the first complete frame.
+ */
+int bus_wait_endframe(uint32_t timeout_ms);
+
+/* Same loop for a wall-clock hold. Title stays up; no SD or other work. */
+void bus_serve_ms(uint32_t ms);
 
 /*
  * There is no bounded variant. Guarding the tristate wait costs every cycle and
