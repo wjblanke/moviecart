@@ -76,6 +76,34 @@ emulate_cartridge(void)
 	}
 }
 
+#define LED_REST_BLANKINGS	60u
+#define LED_ON_BLANKINGS	20u
+#define LED_OFF_BLANKINGS	20u
+
+void
+moviecart_stage_blink(uint8_t n)
+{
+	uint8_t i;
+
+	mc_led_host = 1;
+
+	for (i = 0; i < LED_REST_BLANKINGS; i++)
+		moviecart_wait_blanking_start();
+
+	while (n--) {
+		moviecart_wait_blanking_start();
+		TESTA0_LOW
+		for (i = 0; i < LED_ON_BLANKINGS; i++)
+			moviecart_wait_blanking_start();
+		TESTA0_HIGH
+		for (i = 0; i < LED_OFF_BLANKINGS; i++)
+			moviecart_wait_blanking_start();
+	}
+
+	for (i = 0; i < LED_REST_BLANKINGS; i++)
+		moviecart_wait_blanking_start();
+}
+
 static uint16_t serve_addr_prev;
 
 /*

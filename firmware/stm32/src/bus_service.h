@@ -19,6 +19,9 @@ int bus_wait_endframe(uint32_t timeout_ms);
 /* Same loop for a wall-clock hold. Title stays up; no SD or other work. */
 void bus_serve_ms(uint32_t ms);
 
+/* Counted blanking-edge LED code via moviecart_wait_blanking_start(). */
+void moviecart_stage_blink(uint8_t n);
+
 /*
  * There is no bounded variant. Guarding the tristate wait costs every cycle and
  * the shortened-guard version latched itself on and cut live cycles short; the

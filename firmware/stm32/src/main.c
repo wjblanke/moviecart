@@ -492,6 +492,8 @@ field_reads_ok_in_scratch(uint32_t offset)
 #define BLINK_FIELD_GEOMETRY	9u
 #define BLINK_SECTOR_READ	10u
 
+static void stage_pulse(uint8_t n);
+
 static bool disk_mount_ok;
 static bool disk_open_ok;
 static uint8_t playback_field_blocks;
@@ -524,7 +526,7 @@ setupDisk(void)
 #if MOVIECART_INIT_PHASE == 13
 	emulate_cartridge();
 #endif
-	flash_led(2);
+	stage_pulse(2);
 
 #if MOVIECART_SD_STAGE == 2
 #if MOVIECART_GAP_PROBE
@@ -547,7 +549,7 @@ setupDisk(void)
 #if MOVIECART_INIT_PHASE == 151
 	emulate_cartridge();
 #endif
-	flash_led(3);
+	stage_pulse(3);
 	mc_sd_strict = 0;
 	moviecart_wait_blanking_start();
 #if MOVIECART_INIT_PHASE == 152
@@ -557,6 +559,12 @@ setupDisk(void)
 #if MOVIECART_SD_STAGE == 3
 	emulate_cartridge();
 #endif
+}
+
+static void
+stage_pulse(uint8_t n)
+{
+	moviecart_stage_blink(n);
 }
 
 #define FIELD_LOAD_ATTEMPTS	4
@@ -710,7 +718,7 @@ runTitle(void)
 	playback_field_blocks = fInfo.numBlocks;
 	uint8_t fileVis = fInfo.visibleLines;
 
-	flash_led(4);
+	stage_pulse(4);
 
 	copy_title(r_coreInfo.mr_frameInfo1.colorBuf, TitleColor1, 512);
 #if MOVIECART_INIT_PHASE == 16
@@ -832,6 +840,7 @@ runFrameLoop(void)
 	state.io_bits = STATE_PLAYING;
 	field_dma_pending = 0;
 	mc_playback_pipeline = 1;
+	stage_pulse(5);
 
 	while (1) {
 		waitEndFrame();
@@ -913,9 +922,8 @@ main(void)
 #if MOVIECART_INIT_PHASE == 3
 	emulate_cartridge();
 #endif
-#if !MOVIECART_NO_LED
-	flash_led(1);
-#endif
+	mc_led_host = 1;
+	stage_pulse(1);
 
 	setupDisk();
 
