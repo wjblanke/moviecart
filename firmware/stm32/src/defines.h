@@ -208,6 +208,25 @@
  *   92 + GetCardInfo unpack (no CMD7)
  *   94 GetCardInfo + Select at init clock (no 8 MHz bump)
  *  10  + EnableWideBus / FindSCR
+ *  11  SD_Init returned (no sector DMA)
+ *  12  first 512-byte boot-sector DMA
+ * 131  first sector parsed (AA55 / FAT vs MBR); no second DMA
+ * 132  FAT32 boot sector in hand (second DMA if MBR)
+ * 133  BPB FAT size / fatbase / n_rootdir
+ * 1341 load BPB_SecPerClus
+ * 1342 csize_bits
+ * 1343 restore csize = 2^bits
+ * 134  csize_mask
+ *  13  pf_mount finished (dirbase / database)
+ *  14  pf_open_file finished
+ * 151  wait after open, still mc_sd_strict
+ * 152  mc_sd_strict cleared
+ * 153  updateInit mode/volume
+ * 154  updateInit bright/joystick
+ * 155  updateInit speed/step
+ *  15  updateInit finished (lswcha/inpt)
+ *  16  first field header probe
+ *  17  runTitle done (playback read prepared)
  * 0 runs the whole init.
  */
 #ifndef MOVIECART_INIT_PHASE

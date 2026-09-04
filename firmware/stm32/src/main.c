@@ -521,6 +521,9 @@ setupDisk(void)
 	mount_work();
 	if (!disk_mount_ok)
 		fatalBlink(5);
+#if MOVIECART_INIT_PHASE == 13
+	emulate_cartridge();
+#endif
 	flash_led(2);
 
 #if MOVIECART_SD_STAGE == 2
@@ -537,8 +540,19 @@ setupDisk(void)
 	open_work();
 	if (!disk_open_ok)
 		fatalBlink(8);
+#if MOVIECART_INIT_PHASE == 14
+	emulate_cartridge();
+#endif
+	moviecart_wait_blanking_start();
+#if MOVIECART_INIT_PHASE == 151
+	emulate_cartridge();
+#endif
 	flash_led(3);
 	mc_sd_strict = 0;
+	moviecart_wait_blanking_start();
+#if MOVIECART_INIT_PHASE == 152
+	emulate_cartridge();
+#endif
 
 #if MOVIECART_SD_STAGE == 3
 	emulate_cartridge();
@@ -699,6 +713,9 @@ runTitle(void)
 	flash_led(4);
 
 	copy_title(r_coreInfo.mr_frameInfo1.colorBuf, TitleColor1, 512);
+#if MOVIECART_INIT_PHASE == 16
+	emulate_cartridge();
+#endif
 
 	int diff = (int)fileVis - (int)r_coreInfo.mr_frameInfo1.visibleLines;
 
@@ -903,7 +920,13 @@ main(void)
 	setupDisk();
 
 	updateInit();
+#if MOVIECART_INIT_PHASE == 15
+	emulate_cartridge();
+#endif
 	runTitle();
+#if MOVIECART_INIT_PHASE == 17
+	emulate_cartridge();
+#endif
 	runFrameLoop();
 #else
 	emulate_cartridge();

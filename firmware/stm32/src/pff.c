@@ -162,6 +162,10 @@ bool pf_mount()
 	if (!mc_disk_initialize())
 		return false;
 
+#if MOVIECART_INIT_PHASE == 11
+	emulate_cartridge();
+#endif
+
 #if MOVIECART_MOUNT_PHASE == 1
 #if MOVIECART_GAP_PROBE
 	mc_probe_report();	/* blink out the worst gap and where it was */
@@ -179,86 +183,104 @@ bool pf_mount()
 			moviecart_bus_yield();
 	}
 
-	// Search FAT partition on the drive 
-
+	/* Search FAT partition. One fresh $F1C1 between each parse/DMA step. */
 	bsect = 0;
+	buf = disk_read_block1(bsect);
+	moviecart_wait_blanking_start();
 
-	while(1)
-	{
-		buf = disk_read_block1(bsect);	// Read the boot record 
-		moviecart_bus_yield();
-
-#if MOVIECART_MOUNT_PHASE == 2
-		emulate_cartridge();	/* one 512-byte sector DMA has now run */
+#if MOVIECART_INIT_PHASE == 12
+	emulate_cartridge();
 #endif
 
-		// Check record signature 
+#if MOVIECART_MOUNT_PHASE == 2
+	emulate_cartridge();
+#endif
+
+	if (ld_word(&buf[510]) != 0xAA55)
+		return false;
+
+	if (ld_word(&buf[BS_FilSysType32]) != 0x4146) {
+		uint8_t *part = buf + MBR_Table;
+
+		if (!part[4])
+			return false;
+		bsect = ld_dword(&part[8]);
+		moviecart_wait_blanking_start();
+#if MOVIECART_INIT_PHASE == 131
+		emulate_cartridge();
+#endif
+		buf = disk_read_block1(bsect);
+		moviecart_wait_blanking_start();
 		if (ld_word(&buf[510]) != 0xAA55)
-			return false;	// not a boot record, error
-
-		// Check FAT32 
-		if (ld_word(&buf[BS_FilSysType32]) == 0x4146)
-			break;	// valid
-
-		// Not an FAT boot record, it may be FDISK format 
-		// Check a partition listed in top of the partition table 
-
-		buf += MBR_Table;
-
-		// Is the partition existing? 
-		if (buf[4])
-		{
-			bsect = ld_dword(&buf[8]);	// Partition offset in LBA 
-			continue;
-		}
-
-		return false;	// not a boot record, error
+			return false;
+		if (ld_word(&buf[BS_FilSysType32]) != 0x4146)
+			return false;
 	}
 
+	moviecart_wait_blanking_start();
+#if MOVIECART_INIT_PHASE == 131
+	emulate_cartridge();
+#endif
+#if MOVIECART_INIT_PHASE == 132
+	emulate_cartridge();
+#endif
 
-	// Initialize the file system object 
-
-	fsize = ld_word(buf+BPB_FATSz16);				// Number of sectors per FAT 
+	moviecart_wait_blanking_start();
+	fsize = ld_word(buf + BPB_FATSz16);
 	if (!fsize)
-		fsize = ld_dword(buf+BPB_FATSz32);
+		fsize = ld_dword(buf + BPB_FATSz32);
+	fsize *= buf[BPB_NumFATs];
+	fsInfo.fatbase = bsect + ld_word(buf + BPB_RsvdSecCnt);
+	fsInfo.n_rootdir = ld_word(buf + BPB_RootEntCnt);
+#if MOVIECART_INIT_PHASE == 133
+	emulate_cartridge();
+#endif
 
-	fsize *= buf[BPB_NumFATs];						// Number of sectors in FAT area 
-	moviecart_bus_yield();
-	fsInfo.fatbase = bsect + ld_word(buf+BPB_RsvdSecCnt); // FAT start sector (lba) 
-	fsInfo.n_rootdir = ld_word(buf+BPB_RootEntCnt);		// Nmuber of root directory entries 
-
-
-	// Number of sectors per cluster 
-	
+	moviecart_wait_blanking_start();
 	fsInfo.csize = buf[BPB_SecPerClus];
-	fsInfo.csize_bits = -1;
+#if MOVIECART_INIT_PHASE == 1341
+	emulate_cartridge();
+#endif
 
-	moviecart_bus_yield();
-
-	while(fsInfo.csize)
+	moviecart_wait_blanking_start();
 	{
-		fsInfo.csize_bits++;
-		fsInfo.csize >>= 1;
+		uint8_t cs = fsInfo.csize;
+		uint8_t bits = 0;
+
+		if (cs) {
+			cs >>= 1;
+			while (cs) {
+				bits++;
+				cs >>= 1;
+			}
+		}
+		fsInfo.csize_bits = bits;
 	}
+#if MOVIECART_INIT_PHASE == 1342
+	emulate_cartridge();
+#endif
 
-	moviecart_bus_yield();
+	moviecart_wait_blanking_start();
+	fsInfo.csize = (uint8_t)(1u << fsInfo.csize_bits);
+#if MOVIECART_INIT_PHASE == 1343
+	emulate_cartridge();
+#endif
 
-	fsInfo.csize = 1 << fsInfo.csize_bits;
+	moviecart_wait_blanking_start();
 	fsInfo.csize_mask = fsInfo.csize - 1;
+#if MOVIECART_INIT_PHASE == 134
+	emulate_cartridge();
+#endif
 
-
-	tsect = ld_word(buf+BPB_TotSec16);				// Number of sectors on the file system 
+	moviecart_wait_blanking_start();
+	tsect = ld_word(buf + BPB_TotSec16);
 	if (!tsect)
-		tsect = ld_dword(buf+BPB_TotSec32);
+		tsect = ld_dword(buf + BPB_TotSec32);
+	fsInfo.n_fatent = ((tsect - ld_word(buf + BPB_RsvdSecCnt) - fsize -
+			    (fsInfo.n_rootdir >> 4)) >> fsInfo.csize_bits) + 2;
+	fsInfo.dirbase = ld_dword(buf + BPB_RootClus);
+	fsInfo.database = fsInfo.fatbase + fsize + (fsInfo.n_rootdir >> 4);
 
-	// Last cluster# + 1 
-	fsInfo.n_fatent = ((tsect - ld_word(buf+BPB_RsvdSecCnt) - fsize - (fsInfo.n_rootdir >> 4)) >> fsInfo.csize_bits) + 2;
-	moviecart_bus_yield();
-
-	fsInfo.dirbase = ld_dword(buf+(BPB_RootClus));	// Root directory start cluster 
-	fsInfo.database = fsInfo.fatbase + fsize + (fsInfo.n_rootdir >> 4);	// Data start sector (lba) 
-
-	// FS_FAT32;
 	if (fsInfo.n_fatent >= 0xFFF7)
 		return true;
 

@@ -4,6 +4,7 @@
 #include "osd.h"
 #include "update.h"
 #include "moviecart_yield.h"
+#include "bus_service.h"
 
 // transport controls
 
@@ -65,17 +66,33 @@ __attribute__((section(".updateInfo"))) struct updateInfo           uInfo;
 void
 updateInit()
 {
+	moviecart_wait_blanking_start();
 	uInfo.mode = MODE_TIME;
-	uInfo.drawLevelBars = 0; // expressed in frames
-	uInfo.drawTimeCode = 0; // expressed in frames
+	uInfo.drawLevelBars = 0;
+	uInfo.drawTimeCode = 0;
 	uInfo.volume = DEFAULT_LEVEL;
+#if MOVIECART_INIT_PHASE == 153
+	emulate_cartridge();
+#endif
+
+	moviecart_wait_blanking_start();
 	uInfo.bright = DEFAULT_LEVEL;
 	uInfo.joyRepeat = 0x01;
 	uInfo.right = false;
 	uInfo.left = false;
+#if MOVIECART_INIT_PHASE == 154
+	emulate_cartridge();
+#endif
+
+	moviecart_wait_blanking_start();
 	uInfo.lastMainMode = 0xff;
-	uInfo.speed = 1;    // signed
-	uInfo.step = 1; // signed
+	uInfo.speed = 1;
+	uInfo.step = 1;
+#if MOVIECART_INIT_PHASE == 155
+	emulate_cartridge();
+#endif
+
+	moviecart_wait_blanking_start();
 	uInfo.lswcha_off = true;
 	uInfo.linpt4 = 0xff;
 	uInfo.lswchb = 0xff;

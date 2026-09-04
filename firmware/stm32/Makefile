@@ -81,7 +81,7 @@ ifneq ($(MOUNT_PHASE),)
 DEFS += -DMOVIECART_MOUNT_PHASE=$(MOUNT_PHASE)
 endif
 
-# Bisect *inside* SD_Init: make INIT_PHASE=1..10 (see defines.h)
+# Bisect SD bring-up: make INIT_PHASE=1..17 (see defines.h)
 ifneq ($(INIT_PHASE),)
 DEFS += -DMOVIECART_INIT_PHASE=$(INIT_PHASE)
 endif
