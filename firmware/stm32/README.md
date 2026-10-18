@@ -4,6 +4,17 @@ Firmware for the **MCUDEV DevEBox STM32F407VGT6** that emulates a MovieCart cart
 
 The original dsPIC33CK firmware lives in `firmware/` (parent of this directory).
 
+## Status
+
+Working on real hardware (2600 + DevEBox):
+
+- Title screen, SD mount, file select and playback of `.MVC` field files.
+- Transport controls (see [Controls](#controls)): play/pause, fast-forward and rewind while playing, frame stepping while paused, volume, brightness, Reset (back 10 s), Select (next file).
+
+Known issues:
+
+- In-field **FIRMWARE.FRM** flash update is not ported from the dsPIC.
+
 ## Hardware
 
 | Atari | MCU |
@@ -220,6 +231,22 @@ After the embedded title screen and SD mount:
 Field files: FAT32 root, first playable file by default (8.3 extension `.MVC`, at least one field long, name not starting with `.` or `_`, so macOS `.DS_Store` and `._*` files are skipped); `MVC\0` header, 1–6 sectors (≤ 3 KiB field buffer). Controls match stock MovieCart (Select advances files, etc.). A file change (Select or end of file) first silences the shown field and the blanking pack (`mc_mute_display()`), so the directory walk and the 30-frame hold are quiet instead of a 60 Hz buzz.
 
 The directory walk and other CPU-bound loops call `moviecart_bus_yield()` between steps. Playback reads no FAT: when a movie is opened, `pf_map_file()` reads the FAT six sectors per frame (one async CMD18, like a field) and records the file's clusters as runs (up to 8,192), so `pf_seek_block()` is a binary search plus arithmetic. During playback field loads (relaxed) those calls do nothing; elsewhere each one waits for the next RamKernel entry.
+
+### Controls
+
+Joystick input is read once per frame in OsHead and handled by `updateTransport()` (`src/update.c`). Up/down cycles three modes: **time → volume → brightness → time**. (The PIC firmware had a fourth, dead mode that showed the volume label but ignored left/right; `MODE_LAST` is now `MODE_BRIGHT`.)
+
+| Input | Effect |
+|-------|--------|
+| Fire | Toggle play / pause |
+| Up / down | Previous / next mode; shows that mode's display for ~3 s |
+| Left / right, time mode, playing | Rewind / fast-forward while held. Normal speed for the first ~¼ s, then the step grows by 4 fields every 16 frames, up to 125 |
+| Left / right, time mode, paused | Step one field pair per push; holding repeats after 24 frames, then every 8 (no acceleration) |
+| Left / right, volume / brightness | One level per push; holding repeats after 24 frames, then every 8 |
+| Reset switch | Jump back 10 s |
+| Select switch | Next file |
+
+The PIC firmware only changed volume/brightness when a 16-frame counter wrapped, so quick taps were ignored. Volume/brightness and paused stepping now use their own counter (`levelRepeat`); fast-forward/rewind keeps the original `joyRepeat` ramp.
 
 ### Double buffering
 
@@ -478,5 +505,15 @@ transaction to finish while the CPU is stopped.
 | `POLL_READ=1` | DMA-free FIFO drain path (experimental) |
 | `FASTPATH=0` | Full DMA re-init per sector instead of M0AR-only retarget |
 | `DMA_CLKDIV=N` | SDIO clock divider for DMA path (default `0x04` ≈ 8 MHz) |
+| `NO_LED=0` | Bring back the milestone blinks (off by default; fatal codes always blink) |
+| `NO_LOG=1` | Drop the RAM event log (`src/mclog.c`) |
+
+The Makefile does not track these flags: object files built with one setting are reused under another. Run `make clean` whenever you change a flag.
+
+### Event log
+
+With the log built in (the default unless `NO_LOG=1`), `scripts/read_log.py` reads the 512-entry ring from SRAM2 over the ST-Link. Read it with the same `build/firmware.bin` that is on the board, and before power-cycling the 2600. The log survives a reset but not a power-off.
+
+The SD driver's "SD cmd response still waiting" message in `CmdResp1Error_raw()` fires on practically every command during playback (three entries per frame), so the ring fills in seconds. Throttle or remove that message before using the log to diagnose anything else.
 
 Not ported from dsPIC: in-field **FIRMWARE.FRM** flash update.
