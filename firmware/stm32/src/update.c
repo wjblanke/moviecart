@@ -41,13 +41,6 @@
 #define LEVEL_REPEAT_DELAY	24
 #define LEVEL_REPEAT_RATE	8
 
-/*
- * A held left/right counts as released only after this many frames reading
- * released. A single frame that misses the stick would otherwise reset the
- * fast-forward/rewind speed ramp back to 1.
- */
-#define JOY_RELEASE_FRAMES	3
-
 
 // scale adjustments, automatically generated
 const uint8_t scale0[16] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 /*0.0000 */ };
@@ -73,7 +66,6 @@ struct updateInfo
 	uint_fast8_t    bright;
 	uint_fast8_t    joyRepeat;
 	uint_fast8_t    levelRepeat;
-	uint_fast8_t    joyRelease;
 	bool            right;
 	bool            left;
 	uint_fast8_t    lastMainMode;
@@ -102,7 +94,6 @@ updateInit()
 	uInfo.bright = DEFAULT_LEVEL;
 	uInfo.joyRepeat = 0x01;
 	uInfo.levelRepeat = 0;
-	uInfo.joyRelease = JOY_RELEASE_FRAMES;
 	uInfo.right = false;
 	uInfo.left = false;
 #if MOVIECART_INIT_PHASE == 154
@@ -127,22 +118,8 @@ void
 updateTransport(struct stateVars *state)
 {
 	uInfo.lastMainMode = uInfo.mode;
-	bool right = !(state->i_swcha & 0x80);
-	bool left = !(state->i_swcha & 0x40);
-
-	if (right || left)
-	{
-		uInfo.right = right;
-		uInfo.left = left;
-		uInfo.joyRelease = 0;
-	}
-	else if (uInfo.joyRelease < JOY_RELEASE_FRAMES)
-		uInfo.joyRelease++;	// keep the last direction through a dropout
-	else
-	{
-		uInfo.right = false;
-		uInfo.left = false;
-	}
+	uInfo.right = !(state->i_swcha & 0x80);
+	uInfo.left = !(state->i_swcha & 0x40);
 
 
 	// reset

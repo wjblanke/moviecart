@@ -485,7 +485,7 @@ setupDisk(void)
 #endif
 }
 
-/* Milestone blink, about 2-5 s each; make NO_LED=1 drops them (and ~20 s of boot). */
+/* Milestone blink, about 2-5 s each; off by default, make NO_LED=0 enables them. */
 static void
 stage_pulse(uint8_t n)
 {

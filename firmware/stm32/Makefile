@@ -119,8 +119,10 @@ ifneq ($(NO_LOG),)
 DEFS += -DMOVIECART_NO_LOG=1
 endif
 
-# Drop milestone LED blinks (keep fatalBlink): make NO_LED=1
-ifneq ($(NO_LED),)
+# Milestone LED blinks are off by default (fatalBlink still reports);
+# make NO_LED=0 brings them back (about 20 s of boot).
+NO_LED ?= 1
+ifneq ($(NO_LED),0)
 DEFS += -DMOVIECART_NO_LED=1
 endif
 

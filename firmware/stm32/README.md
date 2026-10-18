@@ -405,7 +405,7 @@ CCM holds all CPU data so it does not share an AHB port with DMA. The two field 
 | 4 | Title geometry OK |
 | 5 | Playback starting |
 
-Each milestone is 120 + 41×n frames, about 20 s of boot in all. `make NO_LED=1` drops them (fatal codes still blink). The title keeps alternating fields through all five.
+Each milestone is 120 + 41×n frames, about 20 s of boot in all. They are off by default; `make NO_LED=0` turns them on (fatal codes always blink). The title keeps alternating fields through all five.
 
 ### Fatal codes (`fatalBlink`, slow wall-clock repeat)
 
