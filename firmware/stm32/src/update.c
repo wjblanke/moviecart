@@ -22,7 +22,7 @@
 #define MODE_TIME       0
 #define MODE_VOLUME     1
 #define MODE_BRIGHT     2
-#define MODE_LAST       3
+#define MODE_LAST       MODE_BRIGHT	// last selectable mode; 3 was a dead mode (volume label, no controls)
 
 #define MAX_LEVEL       11
 /*
@@ -32,6 +32,21 @@
  */
 #define MAX_SPEED       125
 #define DEFAULT_LEVEL   6
+
+/*
+ * Volume/brightness left-right: step on the first frame the stick is pushed,
+ * then auto-repeat after LEVEL_REPEAT_DELAY frames every LEVEL_REPEAT_RATE.
+ * (Waiting for the 16-frame joyRepeat wrap made quick taps never register.)
+ */
+#define LEVEL_REPEAT_DELAY	24
+#define LEVEL_REPEAT_RATE	8
+
+/*
+ * A held left/right counts as released only after this many frames reading
+ * released. A single frame that misses the stick would otherwise reset the
+ * fast-forward/rewind speed ramp back to 1.
+ */
+#define JOY_RELEASE_FRAMES	3
 
 
 // scale adjustments, automatically generated
@@ -57,6 +72,8 @@ struct updateInfo
 	uint_fast8_t    volume;
 	uint_fast8_t    bright;
 	uint_fast8_t    joyRepeat;
+	uint_fast8_t    levelRepeat;
+	uint_fast8_t    joyRelease;
 	bool            right;
 	bool            left;
 	uint_fast8_t    lastMainMode;
@@ -84,6 +101,8 @@ updateInit()
 	moviecart_wait_ram_kernel_entry();
 	uInfo.bright = DEFAULT_LEVEL;
 	uInfo.joyRepeat = 0x01;
+	uInfo.levelRepeat = 0;
+	uInfo.joyRelease = JOY_RELEASE_FRAMES;
 	uInfo.right = false;
 	uInfo.left = false;
 #if MOVIECART_INIT_PHASE == 154
@@ -108,8 +127,22 @@ void
 updateTransport(struct stateVars *state)
 {
 	uInfo.lastMainMode = uInfo.mode;
-	uInfo.right = !(state->i_swcha & 0x80);
-	uInfo.left = !(state->i_swcha & 0x40);
+	bool right = !(state->i_swcha & 0x80);
+	bool left = !(state->i_swcha & 0x40);
+
+	if (right || left)
+	{
+		uInfo.right = right;
+		uInfo.left = left;
+		uInfo.joyRelease = 0;
+	}
+	else if (uInfo.joyRelease < JOY_RELEASE_FRAMES)
+		uInfo.joyRelease++;	// keep the last direction through a dropout
+	else
+	{
+		uInfo.right = false;
+		uInfo.left = false;
+	}
 
 
 	// reset
@@ -152,12 +185,18 @@ updateTransport(struct stateVars *state)
 	{
 		uInfo.joyRepeat++;
 		uInfo.joyRepeat &= 0x0f;
+		if (++uInfo.levelRepeat > LEVEL_REPEAT_DELAY)
+			uInfo.levelRepeat = LEVEL_REPEAT_DELAY - LEVEL_REPEAT_RATE + 1;
 	}
 	else
 	{
 		uInfo.joyRepeat = 0x01;
+		uInfo.levelRepeat = 0;
 		uInfo.speed = 1;
 	}
+
+	bool levelStep = (uInfo.levelRepeat == 1 ||
+	    uInfo.levelRepeat == LEVEL_REPEAT_DELAY);
 
 	if (!uInfo.joyRepeat)
 	{
@@ -169,7 +208,7 @@ updateTransport(struct stateVars *state)
 		}
 	}
 
-	if (!uInfo.joyRepeat)
+	if (levelStep)
 	{
 		if (uInfo.mode == MODE_VOLUME)
 		{
@@ -188,7 +227,7 @@ updateTransport(struct stateVars *state)
 		}
 	}
 
-	if (!uInfo.joyRepeat)
+	if (levelStep)
 	{
 		if (uInfo.mode == MODE_BRIGHT)
 		{
@@ -231,11 +270,11 @@ updateTransport(struct stateVars *state)
 	// update frame
 	uInfo.step = (state->io_frameNumber & 1) ? -1 : 1; // signed
 
-	if (!(state->io_bits & STATE_PLAYING))	// step while paused
+	if (!(state->io_bits & STATE_PLAYING))	// step while paused, repeating while held
 	{
 		if (uInfo.mode == MODE_TIME)
 		{
-			if (uInfo.lswcha_off)
+			if (levelStep)
 			{
 				if (uInfo.right)
 					uInfo.step = 2;
