@@ -44,6 +44,7 @@ SOURCES = \
 	src/pff.c \
 	src/frame.c \
 	src/update.c \
+	src/mclog.c \
 	src/title_data.c
 
 STANDALONE_SOURCES = \
@@ -113,6 +114,11 @@ ifneq ($(INIT_PHASE),)
 DEFS += -DMOVIECART_INIT_PHASE=$(INIT_PHASE)
 endif
 
+# Drop the RAM event log (src/mclog.c, read by scripts/read_log.py): make NO_LOG=1
+ifneq ($(NO_LOG),)
+DEFS += -DMOVIECART_NO_LOG=1
+endif
+
 # Drop milestone LED blinks (keep fatalBlink): make NO_LED=1
 ifneq ($(NO_LED),)
 DEFS += -DMOVIECART_NO_LED=1
@@ -123,11 +129,6 @@ endif
 # change touches the serving code, so "did I break the base?" is never a guess.
 ifneq ($(NO_SD),)
 DEFS += -DMOVIECART_ENABLE_SD=0
-endif
-
-# Worst serve-to-serve gap probe, reported on the LED: make GAP_PROBE=1
-ifneq ($(GAP_PROBE),)
-DEFS += -DMOVIECART_GAP_PROBE=$(GAP_PROBE)
 endif
 
 # DMA-free read path: make POLL_READ=1 (see defines.h). Drains the SDIO FIFO one
@@ -147,13 +148,8 @@ ifneq ($(DMA_CLKDIV),)
 DEFS += -DMOVIECART_SD_DMA_CLKDIV=$(DMA_CLKDIV)
 endif
 
-# One pumped work step per Atari cycle, aligned to the cycle boundary: make PUMP_ALIGN=1
-ifneq ($(PUMP_ALIGN),)
-DEFS += -DMOVIECART_PUMP_ALIGN=$(PUMP_ALIGN)
-endif
-
-# Ablations for locating the per-sector cost (see defines.h). Timing probes are
-# unusable here — GAP_PROBE's own per-cycle cost kills the picture — so we add and
+# Ablations for locating the per-sector cost (see defines.h). Per-cycle timing
+# probes cost more than the cycle budget and kill the picture, so we add and
 # remove work instead of measuring it.
 #   make NO_CARD_READY=1   drop the post-read CMD13 poll
 #   make DOUBLE_READ=1     positive control: read every sector twice

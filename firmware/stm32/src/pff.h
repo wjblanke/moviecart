@@ -21,9 +21,19 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define QUEUE_SIZE  128
-#define QUEUE_SIZE  128
-#define QUEUE_MASK (QUEUE_SIZE-1)
+/*
+ * The open file's cluster chain as runs of consecutive clusters, built once by
+ * pf_map_file() so a seek during playback is arithmetic with no FAT access.
+ * EXTENT_MAX runs take 64 KB of SRAM1; a file copied to a freshly formatted
+ * card is usually a single run.
+ */
+#define EXTENT_MAX		8192
+
+/* pf_map_file() results */
+#define PF_MAP_OK		0
+#define PF_MAP_READ		1	/* a FAT read failed after retries */
+#define PF_MAP_CHAIN		2	/* chain ends early or leaves the FAT */
+#define PF_MAP_FRAGMENTED	3	/* more than EXTENT_MAX runs */
 
 #define	DIR_Name			0
 #define	DIR_Attr			11
@@ -47,16 +57,18 @@
 #define AM_ARC	0x20	// Archive 
 #define AM_MASK	0x3F	// Mask of defined bits 
 						//
-struct queueInfo
+struct extentMap
 {
-    uint32_t    block[QUEUE_SIZE];
-    uint32_t    clust[QUEUE_SIZE];
-    uint8_t     head;
+    uint32_t    file[EXTENT_MAX];	// first file cluster index of each run
+    uint32_t    card[EXTENT_MAX];	// card cluster where that run starts
+    uint32_t    runs;			// runs in use
+    uint32_t    total;			// clusters in the file
 };
 
 bool		pf_mount();							/* Mount/Unmount a logical drive */
 bool		pf_open_file(uint32_t *numFrames, int num);	/* Open first 'num' archived non-deleted file */
-bool		pf_seek_block(uint32_t block);		/* Move file pointer of the open file */
+uint8_t		pf_map_file(void);			/* Map the open file's clusters; PF_MAP_* */
+bool		pf_seek_block(uint32_t block);		/* Move file pointer; needs pf_map_file() */
 bool        pf_read_block(uint8_t *dst);		/* Read full block, false on read failure */
 bool        pf_read_blocks(uint8_t *dst, uint8_t count); /* One contiguous multi-block read */
 bool        pf_read_blocks_begin(uint8_t *dst, uint8_t count);

@@ -1,0 +1,83 @@
+image /Users/bill/moviecart/firmware/stm32/hosttest/out/c32k.img, 11 reference movies
+  pf     2: playing STREET  MVC (942 fields, 1 cluster run)
+    pf     2: fields 2..43 (step +1)
+    pf    44: fields 42..43 (step +1)
+    pf    46: fields 42..43 (step +1)
+  [inject] field read 50: CMD18 start fails
+    pf    48: fields 42..43 (step +1)
+    pf    50: fields 42..43 (step +1)
+    pf    53: fields 42..43 (step +1)
+    pf    55: fields 42..43 (step +1)
+    pf    57: fields 42..43 (step +1)
+    pf    59: fields 42..43 (step +1)
+    pf    61: fields 42..43 (step +1)
+    pf    63: fields 42..43 (step +1)
+    pf    65: fields 42..43 (step +1)
+    pf    67: fields 42..43 (step +1)
+    pf    69: fields 42..43 (step +1)
+    pf    71: fields 42..43 (step +1)
+    pf    73: fields 42..43 (step +1)
+    pf    75: fields 42..43 (step +1)
+    pf    77: fields 42..43 (step +1)
+    pf    79: fields 42..43 (step +1)
+    pf    81: fields 42..43 (step +1)
+    pf    83: fields 42..43 (step +1)
+    pf    85: fields 42..43 (step +1)
+    pf    87: fields 42..43 (step +1)
+    pf    89: fields 42..43 (step +1)
+    pf    91: fields 42..43 (step +1)
+    pf    93: fields 42..43 (step +1)
+    pf    95: fields 42..43 (step +1)
+    pf    97: fields 42..43 (step +1)
+    pf    99: fields 42..43 (step +1)
+  [inject] field read 120: finish reports an error
+  [inject] field read 200: header corrupted
+    pf   101: fields 42..156 (step +1)
+    pf   218: fields 161..236 (step +5)
+    pf   234: fields 245..380 (step +9)
+    pf   250: fields 393..588 (step +13)
+    pf   266: fields 605..860 (step +17)
+    pf   282: fields 881..923 (step +21)
+    pf   285: field 940
+  pf   388: playing CRONKI~2MVC (451 fields, 1 cluster run)
+    pf   388: fields 22..253 (step +21)
+  [inject] field read 300: takes 3 frames
+    pf   400: fields 278..328 (step +25)
+    pf   405: fields 329..426 (step +1)
+  [inject] field read 400: never ends
+    pf   503: fields 425..412 (step -1)
+    pf   537: fields 407..332 (step -5)
+    pf   553: fields 323..188 (step -9)
+    pf   569: fields 175..6 (step -13)
+    pf   583: fields 1..0 (step -1)
+    pf   585: fields 1..0 (step -1)
+    pf   587: fields 1..0 (step -1)
+    pf   589: fields 1..0 (step -1)
+    pf   591: fields 1..0 (step -1)
+    pf   593: fields 1..0 (step -1)
+    pf   595: fields 1..0 (step -1)
+    pf   597: fields 1..0 (step -1)
+    pf   599: fields 1..0 (step -1)
+    pf   601: fields 1..0 (step -1)
+    pf   603: fields 1..100 (step +1)
+    pf   703: fields 1..200 (step +1)
+  pf  1014: playing TESTPA~3MVC (719 fields, 1 cluster run)
+    pf  1014: fields 2..718 (step +1)
+  pf  1852: playing 20CENT~4MVC (1320 fields, 1 cluster run)
+    pf  1852: fields 2..1319 (step +1)
+    pf  3170: field 1318
+  pf  3300: playing OUTPUT~5MVC (602 fields, 1 cluster run)
+    pf  3300: fields 2..601 (step +1)
+    pf  3900: field 600
+
+result: firmware stopped with failure blink 7 at pf 4389 (OUTPUT~5MVC)
+  frames 6055 (playback 4389), files played 5
+  checks passed: 3412 field contents, 6055 visible frames, 6055 audio frames, 3411 audio packs
+  SD: 3416 field reads, 3420 async reads, 10 sync reads, 3 aborts, 5 injected
+  frames a read finish waited past its window: 21
+  field read calls in relaxed mode: 6830, outside: 0
+  lines per frame: 263 x2714 264 x2714 313 x313 314 x313
+  frames repeating the previous field's parity: 977
+  HMOVE cycle in line: @2 x597014 @72 x597014
+  errors: 0
+PASS

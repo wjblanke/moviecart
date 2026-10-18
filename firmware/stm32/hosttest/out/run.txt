@@ -1,0 +1,42 @@
+built /Users/bill/moviecart/firmware/stm32/hosttest/out/moviecart_host
+== 4 KB clusters: transport (pause, fast-forward, rewind, Reset, Select, auto-advance)
+image /Users/bill/moviecart/firmware/stm32/hosttest/out/c4k.img, 11 reference movies
+  pf   327: playing TITLE   MVC (120 fields, 1 cluster run)
+  pf   605: playing LION    MVC (544 fields, 1 cluster run)
+  pf   782: playing NUMBERS MVC (1000 fields, 1 cluster run)
+  pf  1341: playing FRAGA   MVC (865 fields, 55 cluster runs)
+  pf  2321: playing FRAGB   MVC (942 fields, 55 cluster runs)
+  pf  3380: playing FOX_PAL MVC (1101 fields, 1 cluster run)
+  pf  4601: playing TATE    MVC (938 fields, 1 cluster run)
+  pf  5675: playing TITLE   MVC (120 fields, 1 cluster run)
+  pf  5892: playing LION    MVC (544 fields, 1 cluster run)
+
+result: ran 6000 playback frames
+  frames 7347 (playback 6000), files played 9
+  checks passed: 4762 field contents, 7347 visible frames, 7347 audio frames, 4761 audio packs
+  SD: 4763 field reads, 4779 async reads, 9 sync reads, 0 aborts, 0 injected
+  field read calls in relaxed mode: 9525, outside: 0
+  lines per frame: 262 x3063 263 x3062 312 x610 313 x611
+  HMOVE cycle in line: @2 x735837 @72 x735837
+  errors: 0
+PASS
+== 32 KB clusters, MBR: injected read faults, then TINY.MVC (expects blink 7)
+image /Users/bill/moviecart/firmware/stm32/hosttest/out/c32k.img, 11 reference movies
+  pf   327: playing STREET  MVC (942 fields, 1 cluster run)
+  [inject] field read 50: CMD18 start fails
+  [inject] field read 120: finish reports an error
+  [inject] field read 200: header corrupted
+  pf   713: playing CRONKI~2MVC (451 fields, 1 cluster run)
+  pf  1339: playing TESTPA~3MVC (719 fields, 1 cluster run)
+  pf  2177: playing 20CENT~4MVC (1320 fields, 1 cluster run)
+  pf  3625: playing OUTPUT~5MVC (602 fields, 1 cluster run)
+
+result: firmware stopped with failure blink 7 at pf 4716 (OUTPUT~5MVC)
+  frames 6057 (playback 4716), files played 5
+  checks passed: 3434 field contents, 6057 visible frames, 6057 audio frames, 3434 audio packs
+  SD: 3437 field reads, 3441 async reads, 10 sync reads, 1 aborts, 3 injected
+  field read calls in relaxed mode: 6873, outside: 0
+  lines per frame: 262 x2715 263 x2715 312 x313 313 x313
+  HMOVE cycle in line: @2 x597161 @72 x597160
+  errors: 0
+PASS

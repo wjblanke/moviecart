@@ -454,6 +454,13 @@ typedef struct {
 #define SD_CARD_LOCKED                  ((uint32_t)0x02000000)
 
 #define SD_DATATIMEOUT					((uint32_t)0xFFFFFFFF)
+/*
+ * Card-side data timeout for reads, in SDIO_CK periods: 250 ms at the
+ * transfer clock (SDIO_CK = 48 MHz / (div + 2)). The SD spec caps the read
+ * access time of SDHC/SDXC cards at 100 ms, so a card past this is stuck.
+ * SD_DATATIMEOUT (~9 minutes at 8 MHz) stays the software poll count.
+ */
+#define SD_READ_DATATIMEOUT	((uint32_t)(48000000u / (SDIO_TRANSFER_CLK_DIV + 2u) / 4u))
 #define SD_0TO7BITS                     ((uint32_t)0x000000FF)
 #define SD_8TO15BITS                    ((uint32_t)0x0000FF00)
 #define SD_16TO23BITS                   ((uint32_t)0x00FF0000)
@@ -499,6 +506,8 @@ extern SD_Error SD_EnableWideBusOperation (uint32_t WideMode);
 extern SD_Error SD_SelectDeselect (uint64_t addr);
 extern DRESULT TM_FATFS_SD_SDIO_disk_read_begin(BYTE *buff, DWORD sector, UINT count);
 extern DRESULT TM_FATFS_SD_SDIO_disk_read_finish(void);
+extern void TM_FATFS_SD_SDIO_disk_read_abort(void);
+extern int TM_FATFS_SD_SDIO_disk_read_done(void);
 extern SD_Error SD_PreparePlaybackRead (void);
 extern SD_Error SD_ReadBlock (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize);
 extern SD_Error SD_ReadMultiBlocks (uint8_t *readbuff, uint64_t ReadAddr, uint16_t BlockSize, uint32_t NumberOfBlocks);

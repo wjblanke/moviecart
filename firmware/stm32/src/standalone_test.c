@@ -112,12 +112,19 @@ main(void)
 	if (!mc_test_num_frames)
 		test_fail(MC_TEST_ERROR_OPEN_FILE, 0);
 
+	{
+		uint8_t map_res = pf_map_file();
+
+		if (map_res != PF_MAP_OK)
+			test_fail(MC_TEST_ERROR_MAP, map_res);
+	}
+
 	if (!pf_seek_block(field_block))
 		test_fail(MC_TEST_ERROR_SEEK, field_block);
 	mc_test_sector = pf_current_sector();
 
 	moviecart_test_checkpoint(MC_TEST_READ_SCRATCH);
-	disk_read_invalidate();
+	disk_sector_cache_clear();
 	if (memcmp(disk_read_block1(mc_test_sector), "MVC\0", 4) != 0)
 		test_fail(MC_TEST_ERROR_HEADER, mc_test_sector);
 

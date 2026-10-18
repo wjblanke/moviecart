@@ -37,6 +37,7 @@
 
 // Reduced greatly for moviecart application -> Rob Bairos 2021-2023
 
+#include "mclog.h"
 #include <string.h> // memcpy
 #include "pff.h"		// Petit FatFs configurations and declarations 
 #include "sd_reader.h"	// Declarations of low level disk I/O functions 
@@ -148,9 +149,18 @@ uint32_t get_fat (
 //-----------------------------------------------------------------------
 
 
-// ring buffer..
+/* 64 KB: in SRAM1 rather than CCM, which also holds the stack. */
+__attribute__((section(".sram1"))) static struct extentMap extentMap;
 
-__attribute__((section(".queueInfo"))) struct queueInfo qinfo;
+/*
+ * FAT sectors read per CMD18 while mapping: 6 x 128 = 768 chain entries per
+ * frame. Own buffer, because at boot both display buffers hold the title.
+ */
+#define FAT_BATCH		6
+#define FAT_READ_ATTEMPTS	4
+
+static uint8_t fatBatch[FAT_BATCH * 512]
+	__attribute__((aligned(16), section(".sram1")));
 
 
 bool pf_mount()
@@ -167,26 +177,14 @@ bool pf_mount()
 #endif
 
 #if MOVIECART_MOUNT_PHASE == 1
-#if MOVIECART_GAP_PROBE
-	mc_probe_report();	/* blink out the worst gap and where it was */
-#else
 	emulate_cartridge();	/* card init only — no sector DMA yet */
 #endif
-#endif
-
-	qinfo.head = 0;
-	for (int i=0; i<QUEUE_SIZE; i++)
-	{
-		qinfo.block[i] = -1;
-		qinfo.clust[i] = -1;
-		if (!(i & 7))
-			moviecart_bus_yield();
-	}
 
 	/* Search FAT partition. One fresh $F1C1 between each parse/DMA step. */
 	bsect = 0;
 	buf = disk_read_block1(bsect);
-	moviecart_wait_blanking_start();
+	mc_log("mount: sector 0 signature (want aa55)", ld_word(&buf[510]));
+	moviecart_wait_ram_kernel_entry();
 
 #if MOVIECART_INIT_PHASE == 12
 	emulate_cartridge();
@@ -205,19 +203,20 @@ bool pf_mount()
 		if (!part[4])
 			return false;
 		bsect = ld_dword(&part[8]);
-		moviecart_wait_blanking_start();
+		mc_log("mount: partition 1 boot sector", bsect);
+		moviecart_wait_ram_kernel_entry();
 #if MOVIECART_INIT_PHASE == 131
 		emulate_cartridge();
 #endif
 		buf = disk_read_block1(bsect);
-		moviecart_wait_blanking_start();
+		moviecart_wait_ram_kernel_entry();
 		if (ld_word(&buf[510]) != 0xAA55)
 			return false;
 		if (ld_word(&buf[BS_FilSysType32]) != 0x4146)
 			return false;
 	}
 
-	moviecart_wait_blanking_start();
+	moviecart_wait_ram_kernel_entry();
 #if MOVIECART_INIT_PHASE == 131
 	emulate_cartridge();
 #endif
@@ -225,7 +224,7 @@ bool pf_mount()
 	emulate_cartridge();
 #endif
 
-	moviecart_wait_blanking_start();
+	moviecart_wait_ram_kernel_entry();
 	fsize = ld_word(buf + BPB_FATSz16);
 	if (!fsize)
 		fsize = ld_dword(buf + BPB_FATSz32);
@@ -236,13 +235,13 @@ bool pf_mount()
 	emulate_cartridge();
 #endif
 
-	moviecart_wait_blanking_start();
+	moviecart_wait_ram_kernel_entry();
 	fsInfo.csize = buf[BPB_SecPerClus];
 #if MOVIECART_INIT_PHASE == 1341
 	emulate_cartridge();
 #endif
 
-	moviecart_wait_blanking_start();
+	moviecart_wait_ram_kernel_entry();
 	{
 		uint8_t cs = fsInfo.csize;
 		uint8_t bits = 0;
@@ -260,19 +259,19 @@ bool pf_mount()
 	emulate_cartridge();
 #endif
 
-	moviecart_wait_blanking_start();
+	moviecart_wait_ram_kernel_entry();
 	fsInfo.csize = (uint8_t)(1u << fsInfo.csize_bits);
 #if MOVIECART_INIT_PHASE == 1343
 	emulate_cartridge();
 #endif
 
-	moviecart_wait_blanking_start();
+	moviecart_wait_ram_kernel_entry();
 	fsInfo.csize_mask = fsInfo.csize - 1;
 #if MOVIECART_INIT_PHASE == 134
 	emulate_cartridge();
 #endif
 
-	moviecart_wait_blanking_start();
+	moviecart_wait_ram_kernel_entry();
 	tsect = ld_word(buf + BPB_TotSec16);
 	if (!tsect)
 		tsect = ld_dword(buf + BPB_TotSec32);
@@ -281,6 +280,8 @@ bool pf_mount()
 	fsInfo.dirbase = ld_dword(buf + BPB_RootClus);
 	fsInfo.database = fsInfo.fatbase + fsize + (fsInfo.n_rootdir >> 4);
 
+	mc_log("mount: FAT32 clusters (need >= 0xfff7)", fsInfo.n_fatent);
+	mc_log("mount: sectors per cluster", fsInfo.csize);
 	if (fsInfo.n_fatent >= 0xFFF7)
 		return true;
 
@@ -292,100 +293,122 @@ bool pf_mount()
 //-----------------------------------------------------------------------
 
 
+/*
+ * Map the open file's whole cluster chain into extentMap, once, at open time.
+ *
+ * Reads FAT_BATCH consecutive FAT sectors at a time with one async CMD18: it
+ * is started in one RamKernel window and drained in the next, exactly like a
+ * field read, so the transfer runs while the visible kernel is served. Each
+ * window then walks the chain as far as the loaded sectors reach and starts
+ * the next read, so a contiguous file costs about one frame per 768 clusters.
+ */
+uint8_t pf_map_file(void)
+{
+	uint32_t	cluster_bytes_bits = 9u + fsInfo.csize_bits;
+	uint32_t	total = (fsInfo.fsize + (1u << cluster_bytes_bits) - 1u)
+				>> cluster_bytes_bits;
+	uint32_t	clust = fsInfo.org_clust;
+	uint32_t	idx = 0;		// file cluster index of clust
+	uint32_t	lo = 0, cnt = 0;	// FAT sectors held in fatBatch
+	int		attempts = 0;
+
+	extentMap.runs = 0;
+	extentMap.total = 0;
+	if (!total || clust < 2 || clust >= fsInfo.n_fatent)
+		return PF_MAP_CHAIN;
+
+	extentMap.file[0] = 0;
+	extentMap.card[0] = clust;
+	extentMap.runs = 1;
+
+	moviecart_wait_ram_kernel_entry();
+	for (;;)
+	{
+		uint32_t sect = 0;
+
+		// Follow the chain as far as the loaded FAT sectors reach.
+		while (idx + 1u < total)
+		{
+			sect = fsInfo.fatbase + (clust >> 7);
+			if (sect < lo || sect >= lo + cnt)
+				break;
+
+			uint32_t next = ld_dword(&fatBatch[((sect - lo) << 9) +
+					((clust & 127u) << 2)]) & 0x0FFFFFFF;
+
+			if (next < 2 || next >= fsInfo.n_fatent)
+				return PF_MAP_CHAIN;
+			idx++;
+			if (next != clust + 1u)
+			{
+				if (extentMap.runs == EXTENT_MAX)
+					return PF_MAP_FRAGMENTED;
+				extentMap.file[extentMap.runs] = idx;
+				extentMap.card[extentMap.runs] = next;
+				extentMap.runs++;
+			}
+			clust = next;
+		}
+		if (idx + 1u >= total)
+			break;
+
+		// Load the FAT sectors from sect on; the DMA crosses one visible kernel.
+		mc_sdio_gate_relaxed = 1;
+		bool ok = disk_read_blocks_begin(sect, fatBatch, FAT_BATCH);
+		mc_sdio_gate_relaxed = 0;
+		moviecart_wait_ram_kernel_entry();
+		if (ok)
+		{
+			mc_sdio_gate_relaxed = 1;
+			ok = disk_read_blocks_finish();
+			mc_sdio_gate_relaxed = 0;
+		}
+		if (!ok)
+		{
+			cnt = 0;
+			if (++attempts >= FAT_READ_ATTEMPTS)
+				return PF_MAP_READ;
+			continue;
+		}
+		attempts = 0;
+		lo = sect;
+		cnt = FAT_BATCH;
+	}
+
+	extentMap.total = total;
+	return PF_MAP_OK;
+}
+
+/*
+ * Point the file at a block: find the run holding its cluster (binary search
+ * of extentMap) and compute the sector. No FAT access.
+ */
 bool pf_seek_block (
 	uint32_t block		// File pointer from top of file 
 )
 {
-	uint32_t	sect;
-	uint8_t		cs;
-	uint8_t		skip = 0;
+	uint32_t	target = block >> fsInfo.csize_bits;	// file cluster index
+	uint32_t	lo = 0, hi = extentMap.runs;
 
-	// When seek to same or following cluster, start from the current cluster 
-	// When seek to back cluster,  start from the first cluster 
+	if (!hi || target >= extentMap.total)
+		return false;
 
-	// check previous entries as well
-
-
-	uint8_t		check;
-	uint8_t		i;
-
-	check = qinfo.head - 1;
-	check &= QUEUE_MASK;
-
-	for (i=0; i<QUEUE_SIZE; i++)
+	// Last run whose first file cluster is <= target.
+	while (hi - lo > 1u)
 	{
-		if (block >= qinfo.block[check])
-		{
-			fsInfo.block = qinfo.block[check];
-			fsInfo.curr_clust = qinfo.clust[check];
-			break;
-		}
+		uint32_t mid = (lo + hi) >> 1;
 
-		check--;
-		check &= QUEUE_MASK;
-		if (!(i & 15u))
-			moviecart_bus_yield();
+		if (extentMap.file[mid] <= target)
+			lo = mid;
+		else
+			hi = mid;
 	}
 
-	if (fsInfo.block > block)
-	{
-		fsInfo.block = 0;
-		fsInfo.curr_clust = fsInfo.org_clust;
-	}
+	uint32_t clust = extentMap.card[lo] + (target - extentMap.file[lo]);
 
-	// Cluster following loop 
-	// Follow cluster chain 
-
-
-	while (block >= (fsInfo.block + fsInfo.csize))
-	{
-		skip++;
-
-		// DEFRAG
-//		skip &= 127; //  94
-//		skip &=  63; // 109
-//		skip &=  31; // 136
-//		skip &=  15; // 192
-//		skip &=   7; // 296 
-				
-		// shotgun frag:
-//		skip &= 127; // 116892
-//		skip &= 63;  // 61146
-//		skip &= 31;  // 35670
-//		skip &= 15;  // 27583
-//		skip &=  7;  // 33273
-
-		// Full cache Defrag:   fwd: 18    bck:  18
-		// Full cache Shotgun:  fwd: 1830  bck:  1830
-		
-		// compromise
-		// 9136 block reads for just data, so about 5x more reads to reverse if shot-gunned
-		// may get slower for larger files
-
-//		skip &=  15;
-//		skip &=  31;	// stutter every 9 minutes of rewinding
-		skip &=  63;	// stutter every 19 minutes of rewinding on formatted card
-
-		if (!skip)
-		{
-			qinfo.clust[qinfo.head] =  fsInfo.curr_clust;
-			qinfo.block[qinfo.head] =  fsInfo.block;
-			qinfo.head++;
-			qinfo.head &= QUEUE_MASK;
-		}
-
-		fsInfo.curr_clust = get_fat(fsInfo.curr_clust);
-		fsInfo.block += fsInfo.csize;
-		moviecart_bus_yield();
-	}
-
-
-	// Update start block for this cluster 
-
-	sect = clust2sect(fsInfo.curr_clust);		// Get current sector 
-	cs = (uint8_t)(block & fsInfo.csize_mask);	// Sector offset in the cluster 
-
-	fsInfo.file_block = sect + cs;
+	fsInfo.block = target << fsInfo.csize_bits;
+	fsInfo.curr_clust = clust;
+	fsInfo.file_block = clust2sect(clust) + (block & fsInfo.csize_mask);
 
 	return true;
 }
@@ -463,6 +486,23 @@ pf_current_sector(void)
 	return fsInfo.file_block;
 }
 
+/*
+ * A movie file: 8.3 extension MVC and at least one field long. Skips names
+ * starting with '.' or '_': macOS writes .DS_Store and an AppleDouble
+ * "._name" file (short name "_NAME~1.MVC", one field long) next to every file
+ * it copies, and either would end playback with a header fault.
+ */
+static bool
+is_movie_entry(const uint8_t *dir)
+{
+	if (dir[DIR_Name] == '.' || dir[DIR_Name] == '_')
+		return false;
+	if (dir[DIR_Name + 8] != 'M' || dir[DIR_Name + 9] != 'V' ||
+	    dir[DIR_Name + 10] != 'C')
+		return false;
+	return ld_dword(dir + DIR_FileSize) >= FIELD_NUM_BLOCKS * 512u;
+}
+
 bool
 pf_open_file( uint32_t *numFrames, int num)
 {
@@ -479,10 +519,10 @@ pf_open_file( uint32_t *numFrames, int num)
 
 	*numFrames = 0;
 
-	moviecart_wait_blanking_start();
+	moviecart_wait_ram_kernel_entry();
 	do 
 	{
-		moviecart_wait_blanking_start();
+		moviecart_wait_ram_kernel_entry();
 		buf = disk_read_block1(dir_sect);
 		moviecart_bus_yield();
 		dir = &buf[(dir_index & 15) << 5];
@@ -499,7 +539,8 @@ pf_open_file( uint32_t *numFrames, int num)
 		{
 			/* Regular file: allow ARC plus optional RDO/HID (Windows often sets those). */
 			if (!(dir[DIR_Attr] & (AM_DIR | AM_VOL | AM_LFN)) &&
-			    ((dir[DIR_Attr] & AM_ARC) || (dir[DIR_Attr] == 0x00)))
+			    ((dir[DIR_Attr] & AM_ARC) || (dir[DIR_Attr] == 0x00)) &&
+			    is_movie_entry(dir))
 			{
 				// File start cluster 
 				uint8_t	*b = (uint8_t*)&fsInfo.org_clust;
@@ -559,5 +600,8 @@ pf_open_file( uint32_t *numFrames, int num)
 
 	} while (res == true);
 
+	// The caller maps the chosen file with pf_map_file() before seeking.
+	extentMap.runs = 0;
+	extentMap.total = 0;
 	return (found == num);
 }

@@ -40,9 +40,15 @@ bus_interleave_step(void)
  * experiment that inserted a ~60 ns settle window here to reject transient
  * addresses killed the display outright, so the path is already close to the
  * 6502's data-valid deadline.
+ *
+ * Serves until inramkernel goes false → true: the 6507 has just fetched
+ * RamKernel's first opcode and has the long RIOT-only blanking ahead. Called
+ * while already in RamKernel, it waits for the next frame's entry. limit is a
+ * DWT cycle budget from start, checked on A12-low only; 0 means no timeout and
+ * folds away. Returns 1 on entry, 0 on timeout.
  */
-HOTFUNC __attribute__((noreturn)) void
-emulate_cartridge(void)
+static inline __attribute__((always_inline)) int
+serve_until_ram_kernel(uint32_t start, uint32_t limit)
 {
 	/*
 	 * Do not try to suppress a repeated address here. It looks free and it
@@ -52,6 +58,8 @@ emulate_cartridge(void)
 	 * an occasional glitch into a permanent one.
 	 */
 	uint16_t addr, addr_prev = 0;
+	bool was_out = !inramkernel;
+
 	while (1)
 	{
 		while ((addr = ADDR_IN) != addr_prev)
@@ -69,10 +77,35 @@ emulate_cartridge(void)
 			while (ADDR_IN == addr) ;
 			SET_DATA_MODE_IN
 		}
-		else if (mc_swap_pending)
-		{ /* First A12-low cycle after OsHead enters long RIOT blanking. */
-			mc_service_blanking_work();
+		else
+		{
+			mc_track_ram_kernel(addr);
+			if (!inramkernel)
+				was_out = true;
+			else if (was_out)
+				return 1;
+			if (limit && (DWT->CYCCNT - start) >= limit)
+				return 0;
 		}
+	}
+}
+
+/* Serve until the next RamKernel entry; no swap. Public callers use
+ * moviecart_wait_ram_kernel_entry(). */
+static HOTFUNC void
+wait_ram_kernel(void)
+{
+	serve_until_ram_kernel(0, 0);
+}
+
+/* One frame per pass: wait for RamKernel, then swap the title field. */
+HOTFUNC __attribute__((noreturn)) void
+emulate_cartridge(void)
+{
+	while (1)
+	{
+		wait_ram_kernel();
+		mc_blanking_swap();
 	}
 }
 
@@ -85,23 +118,21 @@ moviecart_stage_blink(uint8_t n)
 {
 	uint8_t i;
 
-	mc_led_host = 1;
-
 	for (i = 0; i < LED_REST_BLANKINGS; i++)
-		moviecart_wait_blanking_start();
+		moviecart_wait_ram_kernel_entry();
 
 	while (n--) {
-		moviecart_wait_blanking_start();
+		moviecart_wait_ram_kernel_entry();
 		TESTA0_LOW
 		for (i = 0; i < LED_ON_BLANKINGS; i++)
-			moviecart_wait_blanking_start();
+			moviecart_wait_ram_kernel_entry();
 		TESTA0_HIGH
 		for (i = 0; i < LED_OFF_BLANKINGS; i++)
-			moviecart_wait_blanking_start();
+			moviecart_wait_ram_kernel_entry();
 	}
 
 	for (i = 0; i < LED_REST_BLANKINGS; i++)
-		moviecart_wait_blanking_start();
+		moviecart_wait_ram_kernel_entry();
 }
 
 static uint16_t serve_addr_prev;
@@ -122,8 +153,7 @@ static uint16_t serve_addr_prev;
 				;					\
 			SET_DATA_MODE_IN;				\
 		} else {						\
-			if (mc_swap_pending)				\
-				mc_service_blanking_work();		\
+			mc_track_ram_kernel(_addr);			\
 			on_free;					\
 		}							\
 	} while (0)
@@ -134,22 +164,20 @@ bus_wait_endframe(uint32_t timeout_ms)
 	uint32_t start = DWT->CYCCNT;
 	uint32_t limit = (SystemCoreClock / 1000u) * timeout_ms;
 
-	r_coreInfo.mr_endFrame = 0;
+	if (!limit)
+		limit = 1;	/* 0 means "no timeout" to serve_until_ram_kernel */
 
-	while (1) {
-		int done = 0;
+	/*
+	 * Only an entry that follows $F1C1 (OsHead's RTS back to $0083) proves a
+	 * whole frame ran. ColdStart's jmp $0080 is also an entry, so skip it.
+	 */
+	do {
+		if (!serve_until_ram_kernel(start, limit))
+			return 0;
+	} while (mc_coldstart_entry);
 
-		BUS_SERVE_ONCE({
-			if (r_coreInfo.mr_endFrame) {
-				r_coreInfo.mr_endFrame = 0;
-				done = 1;
-			} else if ((DWT->CYCCNT - start) >= limit) {
-				done = -1;
-			}
-		});
-		if (done)
-			return done > 0;
-	}
+	mc_blanking_swap();
+	return 1;
 }
 
 void
@@ -170,71 +198,6 @@ bus_serve_ms(uint32_t ms)
 	}
 }
 
-#if MOVIECART_GAP_PROBE
-volatile uint8_t mc_probe_phase;
-uint32_t mc_gap_max_cycles;
-uint8_t mc_gap_worst_phase;
-
-static uint32_t probe_last_exit;
-static uint8_t probe_primed;
-
-static inline __attribute__((always_inline)) void
-probe_enter(void)
-{
-	uint32_t gap;
-
-	/*
-	 * Skip the first sample. probe_last_exit starts at zero, so the first
-	 * measurement would be "time since reset" — millions of cycles — and would
-	 * pin the maximum forever against a phase that never ran. That artifact
-	 * cost a measurement round trip; a probe that lies is worse than none.
-	 */
-	if (!probe_primed)
-		return;
-
-	gap = DWT->CYCCNT - probe_last_exit;
-
-	if (gap > mc_gap_max_cycles) {
-		mc_gap_max_cycles = gap;
-		mc_gap_worst_phase = mc_probe_phase;
-	}
-}
-
-static inline __attribute__((always_inline)) void
-probe_exit(void)
-{
-	probe_last_exit = DWT->CYCCNT;
-	probe_primed = 1;
-}
-#else
-#define probe_enter()	do { } while (0)
-#define probe_exit()	do { } while (0)
-#endif
-
-HOTFUNC void
-bus_serve_cycle(void)
-{
-	uint16_t addr;
-
-	probe_enter();
-	while ((addr = ADDR_IN) != serve_addr_prev)
-		serve_addr_prev = addr;
-	if (addr & 0x1000) {
-		bus_dispatch((uint16_t)(addr & 0xfffu));
-		SET_DATA_MODE_OUT
-#if MOVIECART_STALL_TEST == 3
-		bus_interleave_step();
-#endif
-		while (ADDR_IN == addr) ;
-		SET_DATA_MODE_IN
-	}
-	else if (mc_swap_pending)
-	{
-		mc_service_blanking_work();
-	}
-	probe_exit();
-}
-
 /*
  * There is no bounded variant any more, and no dead-bus guard.
  *
@@ -253,242 +216,51 @@ bus_serve_cycle(void)
  * blinks: a diagnostic that damages the system it measures is worse than none.
  */
 /*
- * Visible is serve-only (same loop as NO_SD). Blanking skips A12-low so SD
- * can run; $F09D is still served and clears mc_blanking_window.
+ * Frame waits. Each one ends at a RamKernel entry and then runs the title field
+ * swap there, so the title keeps alternating through SD init. bus_serve_ms()
+ * (wall-clock LED codes) only tracks inramkernel; a frame spent entirely in it
+ * shows the last field again.
  *
- * These waits used BUS_SERVE_ONCE plus a volatile gen/window check after
- * every cart fetch, and they returned on the $F1C1 A12-high cycle itself.
- * INIT_PHASE=2 (hold, then emulate) is clean; INIT_PHASE=3 (one of these
- * waits, then emulate) is not. Same A12-high path as emulate_cartridge().
- * Swap runs on the first A12-low after $F1C1; we return on a later one so
- * the field swap never shares a cycle with the call back into C.
- * INIT_PHASE=3 never returns — that seam still failed once.
+ * INIT_PHASE=2 (hold, then emulate) is clean; INIT_PHASE=3 (wait for a fresh
+ * blanking, then emulate) failed once, so INIT_PHASE=3 never returns.
  */
-HOTFUNC void
-moviecart_wait_blanking(void)
+void
+moviecart_wait_ram_kernel_entry(void)
 {
-	uint16_t addr, addr_prev = 0;
-
-	while (1)
-	{
-		while ((addr = ADDR_IN) != addr_prev)
-			addr_prev = addr;
-
-		if (addr & 0x1000)
-		{
-			bus_dispatch((uint16_t)(addr & 0xfffu));
-			SET_DATA_MODE_OUT
-			while (ADDR_IN == addr) ;
-			SET_DATA_MODE_IN
-		}
-		else if (mc_swap_pending)
-		{
-			mc_service_blanking_work();
-		}
-		else if (mc_blanking_window)
-		{
-			return;
-		}
-	}
-}
-
-HOTFUNC void
-moviecart_wait_blanking_start(void)
-{
-	uint16_t seen = mc_blanking_window_gen;
-	uint16_t addr, addr_prev = 0;
-
 #if MOVIECART_INIT_PHASE == 3
-	(void)seen;
+	emulate_cartridge();
 #endif
-	while (1)
-	{
-		while ((addr = ADDR_IN) != addr_prev)
-			addr_prev = addr;
-
-		if (addr & 0x1000)
-		{
-			bus_dispatch((uint16_t)(addr & 0xfffu));
-			SET_DATA_MODE_OUT
-			while (ADDR_IN == addr) ;
-			SET_DATA_MODE_IN
-		}
-		else if (mc_swap_pending)
-		{
-			mc_service_blanking_work();
-		}
-#if MOVIECART_INIT_PHASE != 3
-		else if (mc_blanking_window_gen != seen)
-		{
-			/* Next A12-low after the swap. Do not return on the
-			 * swap cycle — that plus emulate_cartridge() garbled. */
-			return;
-		}
-#endif
-	}
+	wait_ram_kernel();
+	mc_blanking_swap();
 }
 
+/*
+ * Relaxed: the caller is part way through a list of steps that all run inside
+ * the current RamKernel window, so leave the bus alone. Otherwise start the
+ * next step at the beginning of a fresh RamKernel window.
+ */
 void
 moviecart_bus_yield(void)
 {
-	if (mc_sd_strict && !mc_sdio_gate_relaxed) {
-		moviecart_wait_blanking_start();
+	if (mc_sdio_gate_relaxed)
 		return;
-	}
-	BUS_SERVE_ONCE({});
-	if (!mc_blanking_window)
-		moviecart_wait_blanking();
-}
-
-void
-moviecart_sdio_gate(void)
-{
-	if (mc_sdio_gate_relaxed) {
-		moviecart_wait_blanking();
-		return;
-	}
-	moviecart_wait_blanking_start();
+	moviecart_wait_ram_kernel_entry();
 }
 
 /*
- * Serve one cycle; do SD/DMA housekeeping only in cycles that can never miss a
- * cart fetch. A cart-read cycle (A12 high) is served exactly like the bounded
- * serve, with nothing added before the dispatch. A non-cart cycle (A12 low)
- * drives no data at all, so its entire ~838 ns is free for one `work` step —
- * this is the interleave-proof result taken to its safe limit. See the header.
+ * Frame-granular delay: the deadline is checked once per RamKernel entry, inside
+ * the window. Waits for a fresh entry every pass, relaxed or not, so it always
+ * serves the bus. At least one frame.
  */
-/*
- * A cart-read cycle (A12 high) is served *byte-identically* to bus_serve_cycle:
- * nothing is added anywhere in it. Work happens only in cycles where the cart is
- * not addressed and drives nothing, so its whole ~838 ns is ours.
- *
- * The previous version also ran work every 16th cart cycle, inside the drive
- * window, to guarantee progress if free cycles never came. That cost the drive
- * window a `pump_tick` load/increment/store on *every* cart cycle plus an
- * indirect call on every 16th — comfortably over the ~100 ns per-cycle budget the
- * fine sweep measured. It went unnoticed because per cycle it is tiny; over the
- * ~700k cycles of a single LED blink it reliably jammed the 6507. SD_STAGE=1,
- * which executes no SD code at all, went black right after its one blink while
- * the NO_SD baseline was pixel-perfect. That is the whole proof.
- *
- * Free cycles are not rare on a running console — the kernel's TIA and RAM
- * accesses are all A12-low — so polling still makes brisk progress. If the 6507
- * is jammed there are no free cycles and no progress, which is the accepted
- * trade: not damaging a healthy console outranks reporting on a dead one.
- *
- * work() must stay short. It runs in a cycle the cart is not driving, but the
- * next cycle's address still has to be caught, so keep steps to a fraction of
- * 838 ns (a status-register read, a counter compare) — never a loop.
- */
-#if MOVIECART_PUMP_ALIGN
-/*
- * Which A12-low address a work step has already been spent on.
- *
- * Bounding a work step's *duration* is not enough; its *position* in the cycle
- * matters just as much, and nothing above controlled it. The caller re-enters the
- * pump the moment work() returns, so a single 838 ns free cycle absorbed several
- * steps in a row — and the last one straddled the boundary into the next cycle. If
- * that next cycle was a cart fetch, the dispatch started late by a whole work step
- * (~150-250 ns for an indirect call plus an APB2 read). The identical step is
- * harmless at the start of a free cycle and fatal at the end of one, so every step
- * was a coin flip, which is exactly the shape of the observed failures: never
- * reproducible, always scaling with the number of sectors read.
- *
- * Spending at most one step per address means a step only ever begins just after
- * an address change was detected, i.e. at a cycle boundary with the full ~838 ns
- * ahead of it. The drain rate barely changes (the 6507 changes address nearly
- * every cycle, so free cycles still yield about one step each) but the straddle
- * disappears.
- *
- * If the console is halted on a static A12-low address no step ever runs, so
- * callers make no progress and fall back on their iteration ceilings. That is the
- * same trade already made everywhere else here: never damage a healthy console to
- * report on a dead one.
- */
-static uint16_t pump_work_addr = 0xffffu;
-#endif
-
-HOTFUNC void
-moviecart_bus_pump(void (*work)(void))
-{
-	uint16_t addr;
-
-	probe_enter();
-	if (mc_sd_strict && !mc_sdio_gate_relaxed) {
-		moviecart_wait_blanking_start();
-		if (work)
-			work();
-		probe_exit();
-		return;
-	}
-	if (!mc_blanking_window) {
-		moviecart_wait_blanking();
-		probe_exit();
-		return;
-	}
-	while ((addr = ADDR_IN) != serve_addr_prev)
-		serve_addr_prev = addr;
-	if (addr & 0x1000) {
-		bus_dispatch((uint16_t)(addr & 0xfffu));
-		SET_DATA_MODE_OUT
-		while (ADDR_IN == addr)
-			;
-		SET_DATA_MODE_IN
-	} else if (work) {
-#if MOVIECART_PUMP_ALIGN
-		if (addr != pump_work_addr) {
-			pump_work_addr = addr;
-			work();
-		}
-#else
-		work();
-#endif
-	} else if (mc_swap_pending) {
-		mc_service_blanking_work();
-	}
-	probe_exit();
-}
-
-/*
- * Timed serving with no per-cycle gap.
- *
- * The obvious form — `while (DWT->CYCCNT - start < limit) yield();` — reads the
- * cycle counter immediately after the yield returns, and the yield returns the
- * instant the bus steps to the next cycle. That read therefore lands inside the
- * new cycle and eats into the 6507's data-valid deadline. One such gap is
- * survivable; a 150 ms blink or a card-init wait is >100k cycles of them, and
- * the misses accumulate into a jam. So the deadline test runs in the free
- * (A12-low) window via the pump, and the loop body is a single SRAM load.
- */
-static volatile uint32_t delay_expired;
-static uint32_t delay_start, delay_limit;
-
-static void
-delay_check(void)
-{
-	if ((DWT->CYCCNT - delay_start) >= delay_limit)
-		delay_expired = 1;
-}
-
 void
 moviecart_delay_ms(uint32_t ms)
 {
-	/*
-	 * Loose escape hatch for the case where free cycles are scarce enough that
-	 * the deadline check is starved. It cannot rescue a fully jammed console —
-	 * the pump's tristate wait is unbounded again, by design — so this is only
-	 * a backstop against a pathologically A12-high-heavy stretch. It is a
-	 * register decrement, so it costs the serve loop nothing.
-	 */
-	uint32_t guard = ms * 4000u + 4000u;
+	uint32_t start = DWT->CYCCNT;
+	uint32_t limit = (SystemCoreClock / 1000u) * ms;
 
-	moviecart_wait_blanking_start();
-	delay_start = DWT->CYCCNT;
-	delay_limit = (SystemCoreClock / 1000u) * ms;
-	delay_expired = 0;
-
-	while (!delay_expired && --guard)
-		moviecart_bus_pump(delay_check);
+	do
+		moviecart_wait_ram_kernel_entry();
+	while ((DWT->CYCCNT - start) < limit);
 }
 
 /*

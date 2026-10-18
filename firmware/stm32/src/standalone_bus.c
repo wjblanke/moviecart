@@ -14,25 +14,8 @@ moviecart_bus_yield(void)
 }
 
 void
-moviecart_wait_blanking(void)
+moviecart_wait_ram_kernel_entry(void)
 {
-}
-
-void
-moviecart_wait_blanking_start(void)
-{
-}
-
-void
-moviecart_sdio_gate(void)
-{
-}
-
-void
-moviecart_bus_pump(void (*work)(void))
-{
-	if (work)
-		work();
 }
 
 void
@@ -43,11 +26,6 @@ moviecart_delay_ms(uint32_t ms)
 
 	while ((DWT->CYCCNT - start) < limit)
 		;
-}
-
-void
-bus_serve_cycle(void)
-{
 }
 
 int

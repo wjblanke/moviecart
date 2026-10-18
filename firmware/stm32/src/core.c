@@ -3,6 +3,7 @@
 #include "defines.h"
 #include "cartridge_io.h"
 #include "bus_service.h"
+#include "mclog.h"
 
 /*
  * Cart layout (12-bit, addr & 0xfff). Visible is the original MovieCart
@@ -64,13 +65,7 @@
 
 struct coreInfo r_coreInfo;
 
-#define DIAG_NOMINAL		1
 #define DIAG_WRAP_VISIBLE	2
-#define DIAG_WRAP_ENDLINES	3
-#define DIAG_FRAME_LENGTH	4
-
-#define DIAG_SLOT_FRAMES	8
-#define DIAG_GAP_FRAMES		30
 
 #define DIAG_NOTE(code)	do { \
 		if ((code) > diagWorst) \
@@ -78,11 +73,6 @@ struct coreInfo r_coreInfo;
 	} while (0)
 
 static uint8_t  diagWorst;
-static uint8_t  diagShowing;
-static uint16_t diagTick;
-static uint16_t frameLines;
-
-volatile uint8_t mc_led_host;
 
 void
 mc_diag_note(uint8_t code)
@@ -90,13 +80,11 @@ mc_diag_note(uint8_t code)
 	DIAG_NOTE(code);
 }
 
-volatile uint8_t	mc_visible_bars_vended;
-volatile uint8_t	mc_blanking_window;
-volatile uint16_t	mc_blanking_window_gen;
 volatile uint8_t	mc_sdio_gate_relaxed;
-volatile uint8_t	mc_sd_strict;
 volatile uint8_t	mc_playback_pipeline;
-volatile uint8_t	mc_swap_pending;
+volatile bool		inramkernel;
+volatile uint8_t	mc_ram_kernel_armed;
+volatile bool		mc_coldstart_entry;
 
 /*
  * ColdStart only ($F000–$F053). Copies 78 bytes from $F200 → $80, jmp $80.
@@ -158,27 +146,17 @@ static const uint8_t mc_ram_kernel[] __attribute__((section(".ccmram"))) = {
 static uint8_t mc_aud_pack[MC_AUD_PACK_LEN];
 
 static void mc_pack_blanking_audio(void);
-
-static inline void
-diagFrameTick(void)
-{
-	/* TEMP: kernel 1 Hz heartbeat off so boot flash_led codes are readable. */
-	if (!mc_led_host)
-		TESTA0_HIGH;
-}
+static void mc_arm_visible_lines(void);
 
 void
 coreInit(void)
 {
-	r_coreInfo.mr_endFrame = 1;
 	r_coreInfo.mr_bufferIndex = false;
-	mc_visible_bars_vended = 0;
-	mc_blanking_window = 0;
-	mc_blanking_window_gen = 0;
+	inramkernel = false;
+	mc_ram_kernel_armed = 0;
+	mc_coldstart_entry = false;
 	mc_sdio_gate_relaxed = 0;
-	mc_sd_strict = 0;
 	mc_playback_pipeline = 0;
-	mc_swap_pending = 0;
 
 	r_coreInfo.mr_swcha = 0xff;
 	r_coreInfo.mr_swchb = 0xff;
@@ -229,6 +207,7 @@ mc_field_swap_to_display(void)
 	}
 	r_coreInfo.mr_bufferIndex = !r_coreInfo.mr_bufferIndex;
 	mc_pack_blanking_audio();
+	mc_arm_visible_lines();
 }
 
 static void
@@ -265,91 +244,91 @@ mc_pack_blanking_audio(void)
 	}
 }
 
-static uint8_t *
-mc_display_audio_base(void)
-{
-	if (r_coreInfo.mr_bufferIndex)
-		return r_coreInfo.mr_frameInfo2.audioBuf;
-	return r_coreInfo.mr_frameInfo1.audioBuf;
-}
-
+/* Line count and loop target for the next visible kernel. */
 static void
-mc_audio_begin_visible(void)
+mc_arm_visible_lines(void)
 {
-	r_coreInfo.frameInfo.audioBuf = mc_display_audio_base();
-}
-
-static void
-mc_audio_skip_blanking(void)
-{
-	/*
-	 * Visible + 6 overscan-head samples were consumed from the cursor.
-	 * Snap to the end of the field. The remaining tail is packed at swap
-	 * into mc_aud_pack (not read from this cursor).
-	 */
-	if (!r_coreInfo.frameInfo.numBlocks)
-		return;
-
-	if (r_coreInfo.frameInfo.totalLines <= r_coreInfo.frameInfo.visibleLines)
-		return;
-
-	r_coreInfo.frameInfo.audioBuf = mc_display_audio_base()
-		+ r_coreInfo.frameInfo.totalLines;
-}
-
-static void
-mc_on_visible_bars_entry(void)
-{
-	mc_audio_begin_visible();
 	if (r_coreInfo.frameInfo.visibleLines)
 		r_coreInfo.lines = r_coreInfo.frameInfo.visibleLines;
 	r_coreInfo.nextLineJump = ADDR_RIGHT_LINE;
 	r_coreInfo.nextLineJumpHi = ADDR_RIGHT_LINE_HI;
-	mc_blanking_window = 0;
-	mc_visible_bars_vended = 1;
+}
+
+/*
+ * RamKernel entry ($0080 after ColdStart, $0083 after OsHead's RTS), called by
+ * mc_track_ram_kernel() on a free cycle with the whole RIOT-only window ahead,
+ * so nothing here costs a cart deadline. Sets up the next visible kernel from
+ * the displayed buffer: picture and audio pointers back to its start, line
+ * count and loop target. The visible kernel advances the pointers every line
+ * pair and nothing else resets them, so a frame with no field swap would
+ * otherwise start where the last one ended and walk off the end of SRAM. A swap
+ * later in the same window overrides all of it.
+ */
+void
+mc_on_ram_kernel_entry(void)
+{
+	const struct frameInfo *shown = r_coreInfo.mr_bufferIndex
+		? &r_coreInfo.mr_frameInfo2 : &r_coreInfo.mr_frameInfo1;
+
+	mc_log_frame_tick();
+
+	/* The visible kernel just run stopped on a wrapped line count. */
+	if (r_coreInfo.nextLineJump == ADDR_END_LINES && r_coreInfo.lines)
+		DIAG_NOTE(DIAG_WRAP_VISIBLE);
+
+	r_coreInfo.frameInfo.graphBuf = shown->graphBuf;
+	r_coreInfo.frameInfo.colorBuf = shown->colorBuf;
+	r_coreInfo.frameInfo.colorBKBuf = shown->colorBKBuf;
+	r_coreInfo.frameInfo.audioBuf = shown->audioBuf;
+	mc_arm_visible_lines();
+}
+
+/*
+ * Zero the shown field's audio and the blanking pack, so a frame plays one
+ * level throughout. Without the pack, a file change would play 198 silent
+ * lines and then the old field's 64-sample tail, a 60 Hz buzz, until the next
+ * swap. Runs in the RamKernel window: about 300 byte stores.
+ */
+void
+mc_mute_display(void)
+{
+	const struct frameInfo *shown = r_coreInfo.mr_bufferIndex
+		? &r_coreInfo.mr_frameInfo2 : &r_coreInfo.mr_frameInfo1;
+	unsigned i;
+
+	for (i = 0; i < MC_AUD_PACK_LEN; i++)
+		mc_aud_pack[i] = 0;
+	if (shown->audioBuf)
+		for (i = 0; i < shown->totalLines; i++)
+			shown->audioBuf[i] = 0;
 }
 
 /*
  * The title and NO_SD paths need a field swap once per frame, but the swap
- * copies pointer state and repacks blanking audio. Running that work while
- * serving $F09D overruns the next cart fetches at $F09E. Defer it until the
- * first A12-low cycle after OsHead's RTS, when the 6507 has entered the long
- * RIOT-only blanking kernel.
+ * copies pointer state and repacks blanking audio, far too much for a cart
+ * cycle. The frame waits call
+ * this right after moviecart_wait_ram_kernel_entry() returns, when the 6507 has
+ * entered the long RIOT-only blanking kernel. Playback swaps in main.c after
+ * each field load instead.
  */
 void
-mc_service_blanking_work(void)
+mc_blanking_swap(void)
 {
-	if (!mc_swap_pending)
+	/* ColdStart's entry is ~5 bus cycles before $F09D: no room for a swap. */
+	if (mc_coldstart_entry)
 		return;
-
-	mc_swap_pending = 0;
 	if (!mc_playback_pipeline)
 		mc_field_swap_to_display();
 }
 
-static void
+/*
+ * OsHead's RTS: arm the tracker so the next RIOT fetch counts as the RamKernel
+ * entry. Everything else is done at that entry (mc_on_ram_kernel_entry).
+ */
+static inline __attribute__((always_inline)) void
 mc_on_visible_bars_rts(void)
 {
-	uint8_t expect = r_coreInfo.frameInfo.visibleLines;
-
-	mc_blanking_window = 1;
-	mc_blanking_window_gen++;
-	mc_visible_bars_vended = 0;
-	mc_swap_pending = 1;
-	mc_audio_skip_blanking();
-
-	/* Last pair does not increment frameLines (jmp to stub instead). */
-	if (expect && (frameLines + 2 < expect - 4 || frameLines + 2 > expect + 4))
-		DIAG_NOTE(DIAG_FRAME_LENGTH);
-	frameLines = 0;
-#if MOVIECART_STALL_TEST != 1 && MOVIECART_STALL_TEST != 2
-	diagFrameTick();
-#endif
-	r_coreInfo.mr_endFrame = true;
-	if (expect)
-		r_coreInfo.lines = expect;
-	r_coreInfo.nextLineJump = ADDR_RIGHT_LINE;
-	r_coreInfo.nextLineJumpHi = ADDR_RIGHT_LINE_HI;
+	mc_ram_kernel_armed = MC_ARMED_FRAME;	/* RTS returns to RamKernel at $0083 */
 }
 
 
@@ -381,12 +360,14 @@ bus_dispatch(uint16_t cart_off)
 
 	if (cart_off <= MC_OFF_BOOT_END) {
 		SET_DATA(mc_boot_rom[cart_off]);
+		/* jmp $0080 high byte: next RIOT fetch enters RamKernel. */
+		if (cart_off == MC_OFF_BOOT_END)
+			mc_ram_kernel_armed = MC_ARMED_COLDSTART;
 		EMULATE_DONE
 	}
 
 	if (cart_off == MC_OFF_VISIBLE_ENTRY) {
 		SET_DATA(0xea);
-		mc_on_visible_bars_entry();
 		EMULATE_DONE
 	}
 
@@ -401,15 +382,21 @@ bus_dispatch(uint16_t cart_off)
 
 	if (cart_off >= MC_OFF_OSHEAD &&
 	    cart_off < MC_OFF_OSHEAD + sizeof(mc_oshead)) {
+		/*
+		 * The sample is fetched on the opcode cycle but the pointer only
+		 * advances on the operand cycle: the loop's taken bne at $F197
+		 * makes a dummy read of $F199 (AUD5), which must not consume one.
+		 */
 		if (cart_off == MC_OFF_OSHEAD_AUD6 ||
 		    cart_off == MC_OFF_OSHEAD_AUD5) {
 			SET_DATA(0xa9);
-			r_coreInfo.data = *r_coreInfo.frameInfo.audioBuf++;
+			r_coreInfo.data = *r_coreInfo.frameInfo.audioBuf;
 			EMULATE_DONE
 		}
 		if (cart_off == MC_OFF_OSHEAD_AUD6 + 1u ||
 		    cart_off == MC_OFF_OSHEAD_AUD5 + 1u) {
 			SET_DATA(r_coreInfo.data);
+			r_coreInfo.frameInfo.audioBuf++;
 			EMULATE_DONE
 		}
 		if (cart_off == MC_OFF_OSHEAD_FE0) {
@@ -947,13 +934,12 @@ g0xb0:
 		r_coreInfo.nextLineJump = ADDR_END_LINES;
 		r_coreInfo.nextLineJumpHi = ADDR_END_LINES_HI;
 	} else if (LINES_EXHAUSTED(r_coreInfo.lines)) {
+		/* Noted at the next RamKernel entry. */
 		r_coreInfo.nextLineJump = ADDR_END_LINES;
 		r_coreInfo.nextLineJumpHi = ADDR_END_LINES_HI;
-		DIAG_NOTE(DIAG_WRAP_VISIBLE);
 	} else {
 		r_coreInfo.frameInfo.graphBuf += 10;
 		r_coreInfo.frameInfo.colorBuf += 10;
-		frameLines += 2;
 	}
 	EMULATE_DONE
 

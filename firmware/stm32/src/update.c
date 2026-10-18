@@ -25,6 +25,12 @@
 #define MODE_LAST       3
 
 #define MAX_LEVEL       11
+/*
+ * Fast-forward/rewind ceiling in fields per frame (speed climbs 1, 5, 9 ... 125
+ * while the joystick is held). Each frame's forward seek runs inside the
+ * RamKernel window; at 125 it costs at most about one FAT sector read.
+ */
+#define MAX_SPEED       125
 #define DEFAULT_LEVEL   6
 
 
@@ -66,7 +72,7 @@ __attribute__((section(".updateInfo"))) struct updateInfo           uInfo;
 void
 updateInit()
 {
-	moviecart_wait_blanking_start();
+	moviecart_wait_ram_kernel_entry();
 	uInfo.mode = MODE_TIME;
 	uInfo.drawLevelBars = 0;
 	uInfo.drawTimeCode = 0;
@@ -75,7 +81,7 @@ updateInit()
 	emulate_cartridge();
 #endif
 
-	moviecart_wait_blanking_start();
+	moviecart_wait_ram_kernel_entry();
 	uInfo.bright = DEFAULT_LEVEL;
 	uInfo.joyRepeat = 0x01;
 	uInfo.right = false;
@@ -84,7 +90,7 @@ updateInit()
 	emulate_cartridge();
 #endif
 
-	moviecart_wait_blanking_start();
+	moviecart_wait_ram_kernel_entry();
 	uInfo.lastMainMode = 0xff;
 	uInfo.speed = 1;
 	uInfo.step = 1;
@@ -92,7 +98,7 @@ updateInit()
 	emulate_cartridge();
 #endif
 
-	moviecart_wait_blanking_start();
+	moviecart_wait_ram_kernel_entry();
 	uInfo.lswcha_off = true;
 	uInfo.linpt4 = 0xff;
 	uInfo.lswchb = 0xff;
@@ -158,9 +164,8 @@ updateTransport(struct stateVars *state)
 		if (uInfo.mode == MODE_TIME)
 		{
 			uInfo.drawTimeCode = OSD_FRAMES;
-			uInfo.speed += 4;
-			if (uInfo.speed < 0)
-				uInfo.speed -= 4;
+			if (uInfo.speed <= MAX_SPEED - 4)
+				uInfo.speed += 4;
 		}
 	}
 

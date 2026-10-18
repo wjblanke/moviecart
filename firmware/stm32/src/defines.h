@@ -39,22 +39,13 @@
 #define MOVIECART_SD_POLL_READ		0
 #endif
 
-/*
- * Spend at most one pumped work step per Atari cycle (make PUMP_ALIGN=1), so a
- * step always begins at a cycle boundary instead of possibly straddling into the
- * next cart fetch. See moviecart_bus_pump in bus_service.c.
- */
-#ifndef MOVIECART_PUMP_ALIGN
-#define MOVIECART_PUMP_ALIGN		1
-#endif
 
 /*
  * Ablation knobs for locating the fixed per-sector cost.
  *
- * Timing instrumentation is not available to us: GAP_PROBE puts two DWT reads on
- * every served cycle, which alone exceeds the ~100 ns per-cycle budget the fine
- * sweep measured, so a probe build cannot keep the picture up long enough to
- * report. Removing or duplicating work costs nothing per cycle, so ablation is the
+ * Timing instrumentation is not available to us: two DWT reads on every served
+ * cycle alone exceed the ~100 ns per-cycle budget the fine sweep measured, so a
+ * probe build cannot keep the picture up long enough to report. Removing or duplicating work costs nothing per cycle, so ablation is the
  * only non-destructive measurement left — the same bisection that SD_STAGE and
  * MOUNT_PHASE already did successfully.
  *
@@ -219,8 +210,8 @@
  * 134  csize_mask
  *  13  pf_mount finished (dirbase / database)
  *  14  pf_open_file finished
- * 151  wait after open, still mc_sd_strict
- * 152  mc_sd_strict cleared
+ * 151  wait after open
+ * 152  after stage_pulse(3)
  * 153  updateInit mode/volume
  * 154  updateInit bright/joystick
  * 155  updateInit speed/step
@@ -236,15 +227,6 @@
 /* Skip milestone flash_led() codes (make NO_LED=1). fatalBlink still reports. */
 #ifndef MOVIECART_NO_LED
 #define MOVIECART_NO_LED 0
-#endif
-
-/*
- * Measure the worst gap between served cycles and report which part of the SD
- * path caused it (make GAP_PROBE=1). See bus_service.h. Costs two cycle-counter
- * reads per served cycle, so it is a diagnostic build, not a shipping one.
- */
-#ifndef MOVIECART_GAP_PROBE
-#define MOVIECART_GAP_PROBE 0
 #endif
 
 /* Optional status LED on PA1 (DevEBox has LEDs on PA1/PA2/PA3 on many boards). */
