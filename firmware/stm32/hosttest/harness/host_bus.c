@@ -25,6 +25,12 @@ uint16_t host_cpu_pc;
 uint8_t host_swcha = 0xff, host_swchb = 0xff, host_inpt4 = 0xff, host_inpt5 = 0xff;
 
 static uint8_t riot_ram[128];
+
+uint8_t
+host_riot_read(uint8_t addr)
+{
+	return riot_ram[addr & 0x7f];
+}
 static bool cpu_started;
 static struct { uint8_t a, x, y, sp; bool n, z, c, v, i, d; uint16_t pc; } cpu;
 

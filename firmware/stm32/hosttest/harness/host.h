@@ -7,6 +7,7 @@
 #include <stdbool.h>
 
 /* 6507 + bus (host_bus.c) */
+uint8_t host_riot_read(uint8_t addr);	/* RIOT RAM $80-$FF */
 extern uint64_t host_cycles;		/* 6507 bus cycles since reset */
 extern uint16_t host_cpu_pc;		/* current 6507 PC */
 extern uint8_t host_swcha, host_swchb, host_inpt4, host_inpt5;

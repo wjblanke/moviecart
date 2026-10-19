@@ -27,5 +27,6 @@ struct stateVars
 
 extern void updateTransport(struct stateVars* state);
 extern void updateBuffer(struct stateVars* state, struct frameInfo* fInfo);
+extern void updateFieldParity(struct stateVars* state, int32_t prevFrame, uint8_t low);
 
 #endif

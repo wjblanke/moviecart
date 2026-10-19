@@ -85,6 +85,7 @@ volatile uint8_t	mc_playback_pipeline;
 volatile bool		inramkernel;
 volatile uint8_t	mc_ram_kernel_armed;
 volatile bool		mc_coldstart_entry;
+volatile uint8_t	mc_field_parity;
 
 /*
  * ColdStart only ($F000–$F053). Copies 78 bytes from $F200 → $80, jmp $80.
@@ -164,6 +165,7 @@ coreInit(void)
 	inramkernel = false;
 	mc_ram_kernel_armed = 0;
 	mc_coldstart_entry = false;
+	mc_field_parity = 0;
 	mc_sdio_gate_relaxed = 0;
 	mc_playback_pipeline = 0;
 
@@ -281,6 +283,12 @@ mc_on_ram_kernel_entry(void)
 
 	mc_log_frame_tick();
 
+	/* Mirror FIELD: ColdStart clears it, each later entry increments it. */
+	if (mc_coldstart_entry)
+		mc_field_parity = 0;
+	else
+		mc_field_parity ^= 1;
+
 	/* The visible kernel just run stopped on a wrapped line count. */
 	if (r_coreInfo.nextLineJump == ADDR_END_LINES && r_coreInfo.lines)
 		DIAG_NOTE(DIAG_WRAP_VISIBLE);
@@ -319,15 +327,26 @@ mc_mute_display(void)
  * this right after moviecart_wait_ram_kernel_entry() returns, when the 6507 has
  * entered the long RIOT-only blanking kernel. Playback swaps in main.c after
  * each field load instead.
+ *
+ * Swap only when the shown field is the wrong one for the coming visible pass
+ * (odd must be the opposite of mc_field_parity), so the title's two fields
+ * stay interleaved even after a wait that missed a frame. If both buffers
+ * have the same parity this still swaps every other frame.
  */
 void
 mc_blanking_swap(void)
 {
+	const struct frameInfo *shown = r_coreInfo.mr_bufferIndex
+		? &r_coreInfo.mr_frameInfo2 : &r_coreInfo.mr_frameInfo1;
+
 	/* ColdStart's entry is ~5 bus cycles before $F09D: no room for a swap. */
 	if (mc_coldstart_entry)
 		return;
-	if (!mc_playback_pipeline)
-		mc_field_swap_to_display();
+	if (mc_playback_pipeline)
+		return;
+	if ((uint8_t)shown->odd != mc_field_parity)
+		return;
+	mc_field_swap_to_display();
 }
 
 /*

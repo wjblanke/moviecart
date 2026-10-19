@@ -502,6 +502,8 @@ stage_pulse(uint8_t n)
 
 static struct frameInfo *pending_frame;
 static uint32_t pending_offset;
+/* odd ^ (frame number & 1) for the open file, -1 until a field has loaded. */
+static int8_t file_parity = -1;
 static uint8_t pending_attempt;
 static uint8_t field_dma_pending;
 static uint8_t field_restart_pending;	/* a start failed; retry it next window */
@@ -585,6 +587,8 @@ finishFieldRead(void)
 		mc_log("field read fault (blink code), attempt", (uint32_t)fault << 8 | pending_attempt);
 	if (!fault) {
 		/* Same RamKernel window as the finish: update.c's yields are no-ops. */
+		file_parity = (int8_t)(pending_frame->odd ^
+			((pending_offset / FIELD_NUM_BLOCKS) & 1u));
 		mc_sdio_gate_relaxed = 1;
 		updateBuffer(&state, pending_frame);
 		mc_field_swap_to_display();
@@ -767,6 +771,7 @@ checkSelectVideo(int *which)
 		    probe_info.numBlocks > FIELD_MAX_BLOCKS)
 			fatalBlink(BLINK_FIELD_GEOMETRY);
 		playback_field_blocks = probe_info.numBlocks;
+		file_parity = (int8_t)(probe_info.odd ^ 1);	/* probe is field 1 */
 
 		state.io_frameNumber = 1;
 		state.io_bits |= STATE_PLAYING;
@@ -814,7 +819,14 @@ runFrameLoop(void)
 		}
 
 		checkSelectVideo(&which);
+		int32_t prev_frame = state.io_frameNumber;
 		updateTransport(&state);
+		/* The field read below shows after the next entry, whose FIELD
+		 * parity is the opposite of this one's, and it needs odd to be the
+		 * opposite of that: odd == mc_field_parity now. */
+		if (file_parity >= 0)
+			updateFieldParity(&state, prev_frame,
+				(uint8_t)(mc_field_parity ^ (uint8_t)file_parity));
 
 		/*
 		 * After $F1C1 the 6502 is in RIOT blanking. Finish the previous

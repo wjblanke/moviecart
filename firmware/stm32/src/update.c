@@ -293,6 +293,28 @@ updateTransport(struct stateVars *state)
 	};
 }
 
+/*
+ * Make bit 0 of the next frame number equal low, moving one more field the way
+ * the transport moved (or back, at either end). Once a file's field parity is
+ * in step with the RamKernel's, playing and paused stepping both alternate it,
+ * so this only fires after a start, a seek, or a missed frame.
+ */
+void
+updateFieldParity(struct stateVars* state, int32_t prevFrame, uint8_t low)
+{
+	int32_t	dir;
+	int32_t	n;
+
+	if ((uint8_t)(state->io_frameNumber & 1) == low || state->i_numFrames < 2)
+		return;
+
+	dir = (state->io_frameNumber < prevFrame) ? -1 : 1;
+	n = state->io_frameNumber + dir;
+	if (n < 0 || (uint32_t)n >= state->i_numFrames)
+		n = state->io_frameNumber - dir;
+	state->io_frameNumber = n;
+}
+
 void
 updateVolume(struct stateVars* state, struct frameInfo* fInfo)
 {

@@ -249,6 +249,8 @@ static long frames, served_checks, audio_checks, buzz_runs;
 static uint64_t vsync_line;
 static int prev_odd = -1;		/* parity of the field shown before this one */
 static long same_parity;		/* frames whose parity repeated the previous one */
+static long field_mismatch;		/* playback frames whose field parity is not the RAM kernel's */
+static long title_mismatch;		/* the same, title frames */
 static long line_hist[400];
 static long hmove_hist[76];
 
@@ -471,6 +473,15 @@ host_on_cart_read(uint16_t off)
 		have_snap = true;
 		in_visible = true;
 
+		/* The RAM kernel set this frame's VBLANK from FIELD ($FB) bit 0;
+		 * odd fields belong after VBLANK 37 (FIELD even). */
+		if ((host_riot_read(0xfb) & 1) == snap.odd) {
+			if (mc_playback_pipeline)
+				field_mismatch++;
+			else
+				title_mismatch++;
+		}
+
 		if (mc_playback_pipeline) {
 			int b = buf_index(snap.graphBuf);
 
@@ -569,6 +580,8 @@ main(int argc, char **argv)
 		if (line_hist[i])
 			printf(" %d x%ld", i, line_hist[i]);
 	printf("\n  frames repeating the previous field's parity: %ld\n", same_parity);
+	printf("  playback frames whose field parity is not the RAM kernel's: %ld\n", field_mismatch);
+	printf("  title frames whose field parity is not the RAM kernel's: %ld\n", title_mismatch);
 	printf("  HMOVE cycle in line:");
 	for (int i = 0; i < 76; i++)
 		if (hmove_hist[i])

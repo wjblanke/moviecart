@@ -70,6 +70,13 @@ extern void			mc_field_swap_to_display(void);
  *                          jmp $0080. That "window" is only the RamKernel's
  *                          jsr VisibleBars, about 5 bus cycles, so nothing that
  *                          follows an entry may assume the long blanking window.
+ *
+ *   mc_field_parity        bit 0 of the RamKernel's FIELD ($FB) for the visible
+ *                          pass after the latest entry. The 6507 picks VBLANK
+ *                          37 (0) or 38 (1) from FIELD, not from the file, so a
+ *                          field shows interleaved correctly only when its odd
+ *                          flag is the opposite of this (odd fields go after
+ *                          VBLANK 37; the other way round garbles the OSD).
  */
 #define MC_ARMED_FRAME		1u
 #define MC_ARMED_COLDSTART	2u
@@ -79,6 +86,7 @@ extern volatile uint8_t		mc_playback_pipeline;
 extern volatile bool		inramkernel;
 extern volatile uint8_t		mc_ram_kernel_armed;
 extern volatile bool		mc_coldstart_entry;
+extern volatile uint8_t		mc_field_parity;
 
 extern struct coreInfo		r_coreInfo;
 
