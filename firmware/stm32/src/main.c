@@ -691,24 +691,31 @@ runTitle(void)
 }
 
 /*
- * Zeroing both field buffers is several kilobytes of stores. Done in one memset
- * it silences the cart for tens of microseconds mid-playback, so clear it in
- * small chunks and serve a cycle between each.
+ * Show the title while the next file is opened and mapped, instead of a black
+ * screen. Both field buffers are rebuilt with the title, each step at the start
+ * of its own RamKernel window, and the frame waits then alternate its fields
+ * as at boot. The title keeps the playing file's visible line count, so the
+ * TV sees no geometry change. The next field read replaces it.
  */
 static void
-clearFieldBuffers(void)
+showTitleScreen(void)
 {
-	const uint32_t chunk = 64;
+	int diff = (int)r_coreInfo.frameInfo.visibleLines - 192;
 
-	for (uint32_t off = 0; off < sizeof(mr_buffer1); off += chunk) {
-		uint32_t n = sizeof(mr_buffer1) - off;
+	waitEndFrame();
+	memset(mr_buffer1, 0, sizeof(mr_buffer1));
+	memset(mr_buffer2, 0, sizeof(mr_buffer2));
 
-		if (n > chunk)
-			n = chunk;
-		memset(&mr_buffer1[off], 0, n);
-		memset(&mr_buffer2[off], 0, n);
-		moviecart_bus_yield();
-	}
+	waitEndFrame();
+	frameInitTitle(&r_coreInfo.mr_frameInfo1, 0);
+	frameInitTitle(&r_coreInfo.mr_frameInfo2, 1);
+	loadTitlePixels();
+	r_coreInfo.mr_frameInfo1.visibleLines += diff;
+	r_coreInfo.mr_frameInfo2.visibleLines += diff;
+	r_coreInfo.mr_frameInfo1.totalLines += diff;
+	r_coreInfo.mr_frameInfo2.totalLines += diff;
+	mc_playback_pipeline = 0;	/* frame waits swap the title fields */
+	mc_field_swap_to_display();
 }
 
 static int select_which;
@@ -729,9 +736,10 @@ checkSelectVideo(int *which)
 		selected = true;
 		mc_log("select: next file (end bit in io_bits)", state.io_bits);
 		state.io_bits &= ~STATE_END;
-		/* Silence now: the directory walk and the clear below take over a
-		 * second, and the shown field's audio would loop as a buzz. */
+		/* Silence now: the directory walk takes over a second, and the
+		 * shown field's audio would loop as a buzz. */
 		mc_mute_display();
+		showTitleScreen();
 
 		(*which)++;
 		for (;;) {
@@ -763,10 +771,9 @@ checkSelectVideo(int *which)
 		state.io_frameNumber = 1;
 		state.io_bits |= STATE_PLAYING;
 
-		clearFieldBuffers();
-
 		for (int i = 0; i < 30; i++)
 			waitEndFrame();
+		mc_playback_pipeline = 1;
 	}
 
 	coreInfoToState();
