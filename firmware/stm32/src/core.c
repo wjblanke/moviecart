@@ -127,18 +127,19 @@ static const uint8_t mc_oshead[] __attribute__((section(".ccmram"))) = {
 };
 
 /*
- * RamKernel at RIOT $80. Remaining OS 23/24 + VS 3 + VB 37 from pack at $D0
- * (A12 low). Play is a plain nibble unpack (no BIT-skip). The phase pad after
- * VBLANK off makes the first visible HMOVE land three cycles later, at the
- * phase expected by the visible kernel. Even: 63 nibbles (drop 64th). Odd: 64.
- */
-/*
- * INTERLACE TEST: the parity line is in VBLANK (37/38), not overscan (now a
- * fixed 23), so alternate fields' pictures sit one scanline apart after VSYNC,
- * as on the PIC. Same length; Play stays at $B5.
+ * RamKernel at RIOT $80. Remaining OS 23 + VS 3 + VB 37/38 from pack at $D0
+ * (A12 low). The parity line is in VBLANK, so alternate fields' pictures sit
+ * one scanline apart after VSYNC and their right/left line pairs interleave
+ * into the checkerboard, as on the PIC. (With the extra line in overscan both
+ * fields land on the same scanlines and the columns show gaps.) Confirmed on
+ * the 2600 on 2026-10-19.
  *
  *   $80 jsr VisibleBars / $83 ldx #23 / jsr Play / VSYNC 3 / lda #2 sta VBLANK
  *   $97 inc FIELD / lda FIELD / lsr / ldx #37 / bcc +1 / inx / jsr Play / stx VBLANK
+ *
+ * Play is a plain nibble unpack (no BIT-skip). The phase pad after VBLANK off
+ * makes the first visible HMOVE land three cycles later, at the phase expected
+ * by the visible kernel. Parity 0: 63 nibbles (drop 64th). Parity 1: 64.
  */
 static const uint8_t mc_ram_kernel[] __attribute__((section(".ccmram"))) = {
 	0x20, 0x9d, 0xf0, 0xa2, 0x17, 0x20, 0xb5, 0x00, 0xa9, 0x02, 0x85, 0x00,

@@ -119,33 +119,31 @@ Pack is taken from the display buffer **base** at swap (`+ visible + 6`), not fr
 
 | RIOT | Size | Role |
 |------|-----:|------|
-| `$80`–`$AB` | 44 | Frame: `jsr $F09D`, overscan 24/23, VS 3, VB 37/36 (by parity), `stx VBLANK` / `AUDIDX` |
-| `$AC`–`$B8` | 13 | HMOVE pad (`ldx #7` / `nop` / `bit $00` ×2 / `jmp $80`) |
-| `$B9`–`$D1` | 25 | `Play` (`lda $D8,y`, nibble unpack, `sta AUDV0` / `WSYNC`) |
-| `$D2`–`$D7` | 6 | unused |
-| `$D8`–`$F7` | 32 | Packed tail after the 6 cart OS samples |
-| `$F8`–`$FA` | 3 | unused |
-| `$FB` | 1 | Field parity of the field just shown (written by OsHead) |
+| `$80`–`$A7` | 40 | Frame: `jsr $F09D`, overscan 23, VS 3, VB 37/38 (by `$FB` parity), `stx VBLANK` / `AUDIDX` |
+| `$A8`–`$B4` | 13 | HMOVE pad (`ldx #7` / `nop` / `bit $00` ×2 / `jmp $80`) |
+| `$B5`–`$CD` | 25 | `Play` (`lda $D0,y`, nibble unpack, `sta AUDV0` / `WSYNC`) |
+| `$CE`–`$CF` | 2 | unused |
+| `$D0`–`$EF` | 32 | Packed tail after the 6 cart OS samples (copied by OsHead) |
+| `$F0`–`$FA` | 11 | unused |
+| `$FB` | 1 | `FIELD`: field parity, toggled by the RamKernel each frame |
 | `$FC` | 1 | `AUDIDX` |
 | `$FD` | 1 | unused |
 | `$FE`–`$FF` | 2 | 6502 stack for `jsr VisibleBars` / `jsr Play` |
 
-`$80`–`$D1` is 82 bytes (copied from `$F200`). `$80`–`$FF` is 128.
+`$80`–`$CD` is 78 bytes (copied from `$F200`). `$80`–`$FF` is 128.
 
 #### RamKernel listing
 
 Firmware image `mc_ram_kernel[]` at `$F200`, copied to `$80`. Not assembled from `core.asm`.
 
+The parity line is in VBLANK, so alternate fields' pictures start one scanline apart after VSYNC. That one-line offset is what interleaves the right/left line pairs of the two fields into the checkerboard, as on the PIC (which uses VB +1 and OS −1 by parity). Putting the extra line in overscan instead keeps both fields on the same scanlines and leaves gaps between the columns. Frames are 263/264 lines.
+
 ```asm
 ; rorg $80
 RamKernel
-        jsr     $F09D           ; VisibleBars + OsHead (cart); OsHead sets $FB
-        lda     $FB             ; parity of the field just shown (1 = odd)
-        lsr
-        ldx     #24             ; even: 24 more overscan lines
-        bcc     .os
-        dex                     ; odd: 23
-.os     jsr     Play            ; $B9
+        jsr     $F09D           ; VisibleBars + OsHead (cart)
+        ldx     #23             ; overscan: 23 more lines
+        jsr     Play            ; $B5
         lda     #2
         sta     $00             ; VSYNC
         ldx     #3
@@ -153,15 +151,16 @@ RamKernel
         stx     $00             ; VSYNC off (X=0)
         lda     #2
         sta     $01             ; VBLANK
+        inc     $FB             ; FIELD
         lda     $FB
         lsr
-        ldx     #37             ; even: 37 (+ pad line = 38 blank)
+        ldx     #37             ; parity 0: 37
         bcc     .vb
-        dex                     ; odd: 36 (+ pad = 37)
+        inx                     ; parity 1: 38
 .vb     jsr     Play
         stx     $01             ; VBLANK off
         stx     $FC             ; AUDIDX = 0
-        ldx     #7              ; HMOVE pad, $AC
+        ldx     #7              ; HMOVE pad, $A8
 .pad    dex
         bne     .pad
         nop
@@ -169,11 +168,11 @@ RamKernel
         bit     $00
         jmp     $80
 
-Play                            ; $B9
+Play                            ; $B5
         lda     $FC             ; AUDIDX
         lsr
         tay
-        lda     $00D8,y         ; PACK
+        lda     $00D0,y         ; PACK
         bcc     .lo
         lsr
         lsr
@@ -188,10 +187,12 @@ Play                            ; $B9
         rts
 ```
 
+The first VBLANK line is the tightest: `rts` from the VSYNC `Play`, the VBLANK store, the parity test and the longer `Play` path reach its `WSYNC` at about cycle 74 of 76.
+
 #### Edges
 
 - **First field** — pack is zeros until the first swap; first OS/VS/VB after the 6 cart lines is silent if the pack was empty.
-- **Even vs odd** — after an even field 6 cart + 64 RIOT = 70 tail samples play; after an odd one 6 + 62 = 68, dropping the last two.
+- **Even vs odd** — 6 cart lines + 63 RIOT lines (parity 0) or 64 (parity 1) play tail samples; the 64-nibble pack loses its last sample on parity 0.
 - **PAL / long tails** — NTSC is the target. PAL still uses the same RamKernel line counts. Pack is fixed at 64 samples / 32 bytes after the 6 head lines.
 - **Title** — swap packs `audio + visible + 6` in the title buffer; the 6 head lines play title audio at `visible`.
 
